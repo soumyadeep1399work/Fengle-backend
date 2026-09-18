@@ -1,0 +1,165 @@
+# Fengle — Multi-Vendor, Category-First Food Delivery Platform
+
+This file is read automatically by Claude Code at the start of every session.
+Keep it current — it is the single source of truth for business rules and
+architecture decisions so both developers (and both Claude Code sessions)
+build consistent, compatible code without re-explaining context each time.
+
+## What this platform is
+
+Customers order by **food category** ("Bengali", "South Indian", "North
+Indian", etc.), not by restaurant. Each category behaves like one virtual
+kitchen to the customer — **restaurant identity is never shown to the
+customer**, anywhere, at any stage. Behind the scenes, each category is
+fulfilled by one of several partnered restaurants, matched by customer
+location with automatic fallback.
+
+Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
+(#D99A1F) — see the Claude Design flatboards for exact tokens per screen.
+
+## Non-negotiable business rules
+
+- **Category lock**: a customer can order multiple items within ONE category
+  per order. Ordering a second category normally requires a separate order —
+  **except** when the same restaurant serves both categories, in which case
+  the order can be "clubbed" into one bill, one pickup, one delivery.
+- **Clubbed order partial-unavailability**: if some items in a clubbed order
+  become unavailable, drop those items, adjust the bill, refund the
+  difference to the customer's wallet. Do NOT cascade part of a clubbed
+  order to a different restaurant (that implies two pickups for one
+  delivery — out of scope).
+- **Restaurant matching**: nearest restaurant serving the category within a
+  5km radius (admin-configurable per restaurant). If unavailable, cascade to
+  next-nearest, up to a 7km ceiling.
+- **Catalog visibility is location-dependent**: a customer only sees items
+  actually available from an in-range restaurant, not a flat global catalog.
+- **Item creation**: both Admin and Restaurant can add items. No
+  restaurant-exclusive items — the catalog is shared per category.
+- **Restaurant onboarding is manual, via Admin Panel only.** There is no
+  restaurant self-registration flow anywhere in the product. (Riders ARE
+  self-serve — this asymmetry is intentional, don't "fix" it.)
+- **Rider can see restaurant name/location. Customer never can.** This
+  permission reversal is intentional.
+- **No live GPS map tracking in Phase 1.** Delivery status is shown via
+  discrete steps only: Order Placed → Accepted → Picked Up → On the Way →
+  Delivered, pushed as notifications. A one-time ETA estimate is set at
+  pickup and does NOT continuously update. Live GPS tracking is Phase 2.
+- **Rider navigation uses a "Navigate" button that deep-links to Google
+  Maps** — there is no in-app map/turn-by-turn built into the rider panel.
+- **Minimum order value**: ₹50. No maximum.
+- **Cancellation** (policy changed 2026-09-18 — supersedes the earlier
+  "blocked only after Start Preparing" rule): a customer can cancel only
+  within a short buffer window after placing (`ORDER_CANCEL_BUFFER_SECONDS`,
+  default 120s — a placeholder duration, confirm with the client) AND only
+  while the order is still `placed` (restaurant hasn't accepted). The
+  client-side countdown is UX only; `POST /orders/:id/cancel` enforces both
+  conditions server-side and triggers a refund if already paid.
+- **Rating gate**: a customer with a delivered order that has no
+  `restaurant_rating` and `restaurant_rating_skipped = false` is blocked
+  from `POST /orders` (and reorder) until they call `rate-restaurant` or
+  `skip-restaurant-rating` for it. Enforced server-side, not just in the app.
+- **Invoices are issued by the platform, never by the fulfilling
+  restaurant** (customer never learns which kitchen cooked the order).
+  Issuer GSTIN/FSSAI/name in `invoice.service.js` are env-configurable
+  placeholders — the client must supply real values before go-live.
+- **COD reconciliation**: rider collects cash → logged as a rider liability
+  in `wallet_ledger` → netted against rider's commission earnings at
+  settlement (daily/weekly) → running balance shown in rider wallet. The
+  rider must explicitly confirm the exact amount collected at the
+  "Mark Delivered" step for a COD order — this is the trigger that creates
+  the ledger entry. Do not skip this confirmation step in the UI.
+- **Wallet** is shared infrastructure for both customer refunds/credits and
+  rider COD reconciliation — see `wallet_ledger` table (owner_type/owner_id
+  polymorphic pattern).
+
+## Tech stack (do not deviate without updating this file)
+
+- **Backend**: Node.js + Express + MySQL (via Knex query builder, not an ORM)
+- **Customer App**: React Native (Expo), Android first, iOS in Phase 1.5
+  (same codebase — iOS is a build/QA/App-Store-review task, not a rewrite)
+- **Restaurant + Rider Panels**: React Native (Expo + react-native-web) —
+  shared web app, wrapped in a light native shell per platform ONLY for
+  Firebase Cloud Messaging push notifications. Not full native builds.
+- **Admin Panel**: React JS (SPA)
+- **Business Website**: React JS (standalone, separate from the above)
+- **Auth**: OTP + JWT
+- **Payments**: Razorpay, incl. Route for split settlement (subject to RBI
+  eligibility — treat as a pending external dependency, not yet live)
+- **Maps**: Google Maps API for geocoding/distance calc only (NOT live
+  tracking — see above)
+- **Push**: Firebase Cloud Messaging
+- **SMS/OTP**: MSG91 or Fast2SMS (Twilio is ~3x cost, avoid unless needed)
+- **Email**: AWS SES
+- **Storage**: AWS S3
+- **Hosting**: AWS EC2 + MySQL (self-hosted on same instance, or RDS
+  db.t3.micro if managed backups are wanted)
+
+## Repo structure
+
+```
+fengle-backend/
+  src/
+    config/db.js
+    migrations/     — 24 Knex migrations (run `npx knex migrate:latest`)
+    controllers/    — auth, profile, catalog, cart, address, payment, order,
+                      wallet, favorite, notification (customer-facing);
+                      restaurant, rider, admin (portal-facing)
+    routes/         — one router per controller, mounted in routes/index.js
+    services/       — routing (nearest-match/cascade/clubbing), commission,
+                      tax (GST), payment (Razorpay + dev stub), wallet
+                      (ledger), settlement (rider), invoice (data + PDF)
+    middleware/auth.middleware.js
+    utils/          — jwt, otp, sms, geo
+  scripts/create-admin.js   — the only way an admin account is created
+  assets/fonts/             — Noto Sans (invoice PDF; includes the ₹ glyph)
+  docs/API.md               — full endpoint reference (start here)
+  postman/                  — importable collection
+  test_integration.js       — real-MySQL integration suite (run on a fresh DB)
+```
+
+### MySQL schema (all migrated)
+
+`users` (customers; also holds profile photo, `veg_only`, notification
+prefs), `addresses`, `restaurants`, `categories` (prep-time + optional
+min-order override), `restaurant_categories`, `items` (`is_veg`),
+`restaurant_items`, `riders`, `orders` (status machine, GST split
+`cgst_amount`/`sgst_amount`, rider + restaurant rating columns),
+`order_items`, `wallet_ledger`, `favorites`, `device_tokens`,
+`commission_config_history`, `otp_verifications`, `admins`.
+
+Read the migration files before adding new tables — most of what you need
+has a home in this schema already.
+
+## Phase 1 scope boundary (target: Oct 2, 2026, Newtown, Android only)
+
+**In scope**: Customer App (Android), Restaurant Panel, Rider Panel, Admin
+Panel, backend order/routing/clubbing engine, Razorpay integration
+(UPI/card/COD), basic wallet, GST invoicing, status-based delivery updates.
+
+**Explicitly OUT of Phase 1** — do not build these now even if they seem
+easy: iOS app, live GPS map tracking, live chat/ticketing, AI intro-video
+clip, rider bonus engine, 2FA, advanced analytics dashboards, full
+marketing website, restaurant self-item-creation is DEFERRED (Admin-only
+item creation for Phase 1, even though the long-term rule allows both).
+
+If asked to build something on this excluded list, flag it rather than
+just building it — scope creep here directly threatens the Oct 2 date.
+
+## Design reference
+
+Three Claude Design flatboards exist (Customer App, Restaurant Portal,
+Rider Portal) — screens include the "lock kitchen" and "club kitchens"
+bottom sheets that implement the category-lock UX, the status-based order
+tracking screen, and the full-screen "new order"/"new delivery" takeover
+alerts. Match these screens' layout, copy tone, and component patterns
+when building the real UI — don't redesign from scratch.
+
+## Working conventions
+
+- API routes live under `/api/v1/...` (see `src/routes/index.js`)
+- Auth: Bearer JWT, `requireAuth([...types])` middleware restricts by user
+  type (`customer` | `restaurant` | `rider` | `admin`)
+- Money fields are `decimal(10,2)` / `decimal(12,2)` — never use floats for
+  currency anywhere in the stack
+- Restaurants CANNOT self-create via the OTP endpoint — `auth.controller.js`
+  already enforces this; keep that behavior if touching auth code
