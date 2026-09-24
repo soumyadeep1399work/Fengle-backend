@@ -20,6 +20,7 @@ router.post("/:id/reorder", requireAuth(["customer"]), orders.reorder);
 router.post("/:id/accept", requireAuth(["restaurant"]), orders.acceptOrder);
 router.post("/:id/reject", requireAuth(["restaurant"]), orders.rejectOrder);
 router.post("/:id/start-preparing", requireAuth(["restaurant"]), orders.startPreparing);
+router.post("/:id/mark-ready", requireAuth(["restaurant"]), orders.markReady);
 
 // Rider
 router.post("/:id/picked-up", requireAuth(["rider"]), orders.markPickedUp);

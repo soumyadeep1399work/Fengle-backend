@@ -21,6 +21,26 @@ Companion Postman collection: `postman/Fengle-Backend.postman_collection.json` (
 | GET | `/auth/session` | any | — | Validates a persisted token on app boot → `{ user }`. 401 if the token is missing/expired or the account no longer exists. |
 | POST | `/auth/logout` | any | `{ device_token? }` | JWTs are stateless — logout is the client discarding its token. This only deregisters the push `device_token` if one is sent. |
 
+### Dev-only: read the last OTP
+
+`GET /dev/last-otp?phone=<10-digit>` → `{ phone, otp, requestedAt }` (404 if no OTP was requested for that phone since the server started). Lets testers and other tooling fetch the dev OTP without the server console. In-memory only, and the router is **not mounted at all** when `NODE_ENV=production`.
+
+### Dev tools: advance an order / add wallet credit
+
+No Restaurant/Rider panel exists yet, so a placed order stays `placed` forever. These dev-only helpers drive the **real** order handlers (acting as the order's restaurant and assigned rider — ETA, COD collection and state checks all behave as in production). None of them exist in production: the scripts refuse to run and the `/dev` router is not mounted.
+
+```bash
+node scripts/advance-order.js <orderId>                 # ONE step (placed→accepted→picked_up→on_the_way→delivered)
+node scripts/advance-order.js <orderId> --to=delivered  # up to a step (or --all)
+node scripts/add-credit.js <10-digit phone> <amount>    # e.g. 6558899886 500 — the customer must have logged in once
+```
+
+Same thing over HTTP (no auth): `POST /dev/orders/:id/advance` with optional `{ to }` → `{ orderId, status, steps, notes, eta_minutes, rider_id, payment_status }`; `POST /dev/wallet/credit` with `{ phone, amount }` → `{ phone, added, balance }`. Errors: 409 for advance (unknown/cancelled order), 400 for credit. If no rider is free the dev rider (9000000201) is assigned directly. A **delivered order still needs its kitchen rated or skipped** before the customer can place another order (the rating gate applies to dev orders too).
+
+### Dev seed data
+
+`npm run seed` (idempotent; never resets an existing stock toggle) loads the 11 Customer App categories with their 49 items, **7 active dev restaurants** around Newtown, Kolkata (centre 22.58, 88.47 — override with `SEED_CENTER_LAT`/`SEED_CENTER_LNG`), and one active dev rider. Restaurants are deliberately split into pairs so club/lock can be exercised: Bengali↔Chinese, Bengali↔Sweets, North Indian↔Mughlai, Mughlai↔Biryani, South Indian↔Chaat, South Indian↔Tiffin, Thali↔Continental. Any other combination (e.g. Bengali + North Indian) has no shared kitchen and quotes `clubbable:false` (Lock). Dev restaurant login phones are 9000000101–9000000107; dev rider 9000000201.
+
 ## Profile (`/profile`) — customer
 
 | Method | Path | Body | Notes |
@@ -45,12 +65,14 @@ Orders never FK to this table — `POST /orders` snapshots `delivery_lat/lng/add
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
-| GET | `/categories` | public | → `{ categories: [{ id, name, blurb, image_url, prepTimeMinMinutes, prepTimeMaxMinutes, minOrder, clubPartnerIds }] }`. `clubPartnerIds` = other categories sharing ≥1 active restaurant platform-wide — a discovery **hint** only; the real location-aware club decision is `POST /cart/quote`. |
-| POST | `/categories` | admin | `{ name, description?, image_url?, prep_time_min_minutes?, prep_time_max_minutes?, min_order_override? }`. |
+| GET | `/categories` | public | Optional `?lat=&lng=`. → `{ categories: [{ id, name, blurb, image_url, prepTimeMinMinutes, prepTimeMaxMinutes, minOrder, clubPartnerIds }] }`. **Always returns usable values** (kitchen-created categories start with none): `prepTime…` falls back to **30–40** when the category has none, `minOrder` to the global ₹50, and `image_url` to the first dish photo in the category (else `null` — show a placeholder). `blurb` is `null` when there is none. **Without `lat`/`lng`** every active category is returned (unchanged). **With both**, only categories that have at least one available item at an in-range active kitchen are returned (same rule as `GET /categories/:id`), so a brand-new category with nothing in stock never shows as an empty tile; `clubPartnerIds` is then filtered to the categories returned. Passing only one, or a non-number, is a 400. `clubPartnerIds` = other categories sharing ≥1 active restaurant platform-wide — a discovery **hint**; the real location-aware club decision is `POST /cart/quote`. |
+| POST | `/categories` | admin | `{ name, description?, image_url?, prep_time_min_minutes?, prep_time_max_minutes?, min_order_override? }` → 201 `{ category }`. Held to the same duplicate rule as kitchens: an exact duplicate of an existing category (normalized — "Momos" when "Momo" exists, "Chowmein" when "Chow Mein" exists) → **409** `{ code: "category_exists", error, category }`. Admins don't get the fuzzy "similar" warning or the kitchens' strict character rule (seeded names like `Thali / Combos` need `/`). |
 | GET | `/categories/:id?lat=&lng=` | public | Category header + `sections: [{ title: "Popular", items }, { title: "More", items }]`. Popular = top 3 by rating count then average. lat/lng required (location-filtered, 7 km). |
 | GET | `/categories/:categoryId/items?lat=&lng=` | public | Older flat-list shape of the same items. |
+| GET | `/items/popular?lat=&lng=&limit=6` | public | Cross-category "Popular picks" for Home (limit 1–50, default 6). Same location filter and item shape as the other catalog reads, ranked by rating count then average; unrated items are tie-broken by position within their category, so a fresh catalog shows a spread of categories. |
 | GET | `/items/search?q=&veg=&lat=&lng=` | public | Name/description match across all categories, same location filter. `veg=true` → veg items only. |
-| POST | `/items` | admin/restaurant | `{ category_id, name, description?, price, image_url?, is_veg? }`. Restaurants only for categories they're approved for. |
+| POST | `/items` | admin/restaurant | `{ category_id, name, description?, price, image_url?, is_veg? }`. Restaurants only for categories they're approved for (403 otherwise); a restaurant-created item is automatically in stock at that restaurant. **Validation (400 unless noted):** `name` non-empty string ≤150 chars (trimmed); `price` a positive number up to 100000 (a numeric string like `"120.50"` is accepted; `0`, negatives, `""`, `"abc"`, booleans are not); `is_veg` must be a real boolean when sent (default false — the string `"false"` is rejected, not coerced); `description` ≤255 chars; `image_url` an `http(s)://` URL ≤500 chars (use the URL returned by `POST /uploads/image`); unknown/inactive `category_id` → **404**. |
+| PATCH | `/items/:id` | admin/restaurant | Edit any of `{ name, price, is_veg, image_url, description }` → **200** `{ item: <updated row> }` (row shape as `POST /items`; `price` a decimal string). **Same validation as `POST /items`** (shared code): `price` positive ≤100000, `is_veg` strict boolean, `name` 1–150 chars, `image_url` http(s) ≤500 or **`null`/`""` to remove the photo**, `description` ≤255 or `null`; `null` is not allowed for name/price/is_veg. **400** for an empty body / only unknown fields (`is_active`, `id`… are ignored as non-editable). **`category_id` cannot change** — sending a different one is a 400 (sending the item's current one is harmless). **Who:** a restaurant may edit **any** item whose category is in its `restaurant_categories` (same rule as `GET /restaurants/me/menu`), **including admin-seeded items** — otherwise **403**; admin may edit any item. Unknown or inactive item → **404** (checked before the 403). **The item is shared:** the edit shows for every kitchen and every customer. **Existing orders keep their money** — `order_items.unit_price`/`subtotal` and the order's `item_total`/GST/`grand_total` are snapshots taken at placement, and invoices are built from them — and the item's `name` is **snapshotted** onto `order_items.item_name` at placement, so past orders keep the name they were ordered under and a rename never rewrites history (the photo is not snapshotted). New quotes/orders use the new price. Replacing a photo leaves the old uploaded file on disk. |
 | PATCH | `/restaurants/:restaurantId/items/:itemId/availability` | restaurant (self) | `{ is_available }` — the stock toggle. |
 
 Every item payload includes `avgRating` (1 decimal, or `null` if unrated) and `ratingCount`. There's no per-item rating submission — an item's rating is the average `restaurant_rating` over delivered orders containing it (how customers rated the kitchen that cooked it).
@@ -75,7 +97,7 @@ Every item payload includes `avgRating` (1 decimal, or `null` if unrated) and `r
 |---|---|---|---|---|
 | POST | `/orders` | customer | `{ items: [{item_id, quantity}], delivery_lat, delivery_lng, delivery_address, payment_method }` | `payment_method` ∈ `upi`\|`card`\|`netbanking`\|`cod`\|`wallet`. Max 2 categories, min ₹50. **403 `{ error, blocking_order_id }` if the customer has an unresolved kitchen-rating gate** (see below). Routes to nearest capable restaurant; if no single restaurant serves a 2-category cart it splits into two orders (`{ message, orders: [...] }`); 409 if nothing can fulfil it. GST is `cgst_amount`+`sgst_amount` (2.5%+2.5% of `item_total`), included in `grand_total`. `wallet` debits the full amount immediately and marks it paid (402 + auto-cancel if balance is short); `cod` skips payment; others return a `payment` object. |
 | POST | `/orders/:id/confirm-payment` | customer | `{ razorpay_payment_id, razorpay_signature }` | Signature verification auto-succeeds in dev stub. |
-| POST | `/orders/:id/cancel` | customer | — | **Buffer-window rule (policy 2026-09-18):** only while status is `placed` (restaurant hasn't accepted) **and** within `ORDER_CANCEL_BUFFER_SECONDS` (default 120) of placing; else 409. Refunds to wallet if already paid. |
+| POST | `/orders/:id/cancel` | customer | — | **Buffer-window rule (policy 2026-09-18):** only while status is `placed` (restaurant hasn't accepted) **and** within `ORDER_CANCEL_BUFFER_SECONDS` (default **60**, confirmed) of placing; else 409. Drive the countdown from `cancellable_until` (see below), not a client clock. Refunds to wallet if already paid. |
 | POST | `/orders/:id/rate-rider` | customer | `{ rating: 1–5, comment? }` | Only after delivery. A comment is never required server-side (the "prompt when ≤2" is UX only). |
 | POST | `/orders/:id/rate-restaurant` | customer | `{ rating: 1–5, comment? }` | Only after delivery. Clears the rating gate. |
 | POST | `/orders/:id/skip-restaurant-rating` | customer | — | Clears the gate without a rating (still rateable later). |
@@ -86,14 +108,17 @@ Every item payload includes `avgRating` (1 decimal, or `null` if unrated) and `r
 | POST | `/orders/:id/accept` | restaurant | `{ unavailable_item_ids?: [] }` | Only from `placed`. Dropped items reduce `item_total`, GST is recomputed from the new total, and the full `grand_total` delta is refunded to wallet if paid. Auto-assigns the nearest free active rider. |
 | POST | `/orders/:id/reject` | restaurant | — | Cascades to the next candidate restaurant, or cancels + refunds if none remain. |
 | POST | `/orders/:id/start-preparing` | restaurant | — | Only from `accepted`. |
+| POST | `/orders/:id/mark-ready` | restaurant | — | "Mark ready": the food is ready for the rider to collect. Only from `accepted`, else 409 (403 if it isn't your order). Sets `ready_at` (returned as `{ message, ready_at }`) and is **idempotent** — repeat calls keep the first timestamp. A signal only: it does not change `status` and rider pickup isn't blocked on it. `ready_at` appears on the order object (restaurant/rider/customer reads). |
 | POST | `/orders/:id/picked-up` | rider | — | Only from `accepted`. Sets the one-time `eta_minutes`. |
 | POST | `/orders/:id/on-the-way` | rider | — | Only from `picked_up`. |
 | POST | `/orders/:id/delivered` | rider | `{ cod_amount_collected? }` | Only from `on_the_way`. **Required and must exactly equal `grand_total` for COD** — creates the rider's COD wallet liability. |
-| GET | `/orders` | customer/restaurant/rider | — | Own orders, each with `items: [{ name, quantity }]` (confirmed only). Restaurants only see `paid`/`cod` orders. |
-| GET | `/orders/:id` | customer/restaurant/rider/admin | — | Full detail. Adds `cancelled` (bool), `riderRating`, `riderRatingComment`, `restaurantRating`, `restaurantRatingComment`, `restaurantRatingSkipped`, and `rider: { name, phone }` once assigned. |
+| GET | `/orders` | customer/restaurant/rider | — | Own orders. Each row adds `items: [{ item_id, name, quantity, category_id, category_name }]` (confirmed items only; `name` is the snapshot taken at placement), `categories: [{ id, name }]` (two for a clubbed order) and `category_name` (categories joined with " + ", e.g. "Bengali + Chinese (Indo)"). **For a rider (and restaurant/admin) requester only**, each row also has `restaurant_name`, `restaurant_address`, `restaurant_lat`, `restaurant_lng` (the pickup kitchen — CLAUDE.md: riders can see this, customers never can; absent entirely for a customer requester, not just null). Restaurants only see `paid`/`cod` orders. |
+| GET | `/orders/:id` | customer/restaurant/rider/admin | — | Full detail. `items` are the order_items rows **plus** `name` (the name the item had **when ordered** — snapshotted, immune to later renames) and `category_name` (includes dropped items — filter on `status === "confirmed"`); the order also has `categories`, `category_name`, `cancelled` (bool), `riderRating`, `riderRatingComment`, `restaurantRating`, `restaurantRatingComment`, `restaurantRatingSkipped`, and `rider: { name, phone }` once assigned. **For a rider (and restaurant/admin) requester only**, also `restaurant_name`, `restaurant_address`, `restaurant_lat`, `restaurant_lng` — the pickup kitchen, for the rider's "Navigate" deep-link; a customer requester never gets these fields at all. |
 | GET | `/orders/:id/status` | customer/restaurant/rider/admin | — | Lightweight poll target: `{ status, cancelled, eta_minutes, picked_up_at, delivered_at, cancelled_at, rider_assigned }`. |
 
 **Rating gate.** A delivered order with no `restaurant_rating` and `restaurant_rating_skipped = false` blocks every new `POST /orders` (and reorder) with a 403 naming `blocking_order_id`, until `rate-restaurant` or `skip-restaurant-rating` is called for it. This is the real enforcement; the app's prompt is only UX.
+
+**`cancellable_until`** (ISO timestamp) is on every order object returned by `POST /orders` (each order in a split), `POST /orders/:id/reorder`, `GET /orders`, `GET /orders/:id` and `GET /orders/:id/status`: the moment the cancel window closes (`created_at` + 60 s). It is `null` as soon as the order is no longer `placed` (restaurant accepted, cancelled, delivered…), and for a still-`placed` order a timestamp in the past means the window has lapsed. The server is the source of truth: compare it against a server-derived now (e.g. the response `Date` header) rather than trusting the device clock, and let `POST /orders/:id/cancel` be the final arbiter.
 
 Order `status` ∈ `placed`\|`accepted`\|`picked_up`\|`on_the_way`\|`delivered`\|`cancelled`. There is no `refunded` status — the history "REFUNDED" badge maps to `payment_status === "refunded"`.
 
@@ -120,6 +145,47 @@ Order `status` ∈ `placed`\|`accepted`\|`picked_up`\|`on_the_way`\|`delivered`\
 | POST | `/notifications/register-device` | `{ token, platform: 'android'\|'ios' }` | Upserts the FCM token. |
 | PATCH | `/notifications/settings` | any of `{ order_updates, promotions }` | Merges into existing prefs → `{ notification_prefs }`. Storage only — nothing sends pushes yet (see gaps). |
 
+## Image uploads (`/uploads`) — restaurant or admin
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/uploads/image` | `multipart/form-data` with exactly **one file field named `image`**. Accepts **JPEG, PNG or WebP**, identified by the file's actual bytes (the client's Content-Type and file name are ignored, so a renamed text file or an SVG is rejected). Max **2 MB**. → **201** `{ url }` — an **absolute** URL like `http://192.168.1.16:4000/uploads/<uuid>.jpg`, ready to send as `image_url` to `POST /items`. |
+
+Errors: **400** — no file, wrong field name, more than one file, not multipart, empty file, or not a JPEG/PNG/WebP; **413** — larger than 2 MB; **401** — no token; **403** — customer/rider token.
+
+- **Files** are stored on disk under `fengle-backend/uploads/` (gitignored) with a random UUID name — the client's file name is never used — and served publicly (no auth) at `GET /uploads/<name>` with long cache headers, `X-Content-Type-Options: nosniff` and `Cross-Origin-Resource-Policy: cross-origin` (helmet's default `same-origin` would stop Expo web rendering them in an `<img>`). No directory listing.
+- **URL base:** `PUBLIC_BASE_URL` if set (trailing slash is fine), otherwise the request's own protocol + Host. The URL is stored verbatim in `items.image_url`, so **in dev set `PUBLIC_BASE_URL` to an address every device can reach** (e.g. `http://192.168.1.16:4000`): a URL built from an emulator-only host such as `10.0.2.2` won't load on a real phone or in the customer app. Set it in production too (behind a proxy the request host is not the public one).
+- **Production:** disk storage is dev-only. The response shape (`{ url }`) is the only contract — storage moves to S3 by replacing `saveImage` in `src/services/storage.service.js`.
+- Uploaded files are never deleted automatically (replacing an item's photo leaves the old file behind) — cleanup is a later concern.
+
+## Restaurant self-service (`/restaurants/me`) — restaurant
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/restaurants/me` | The logged-in restaurant's profile → `{ restaurant: { id, name, owner_name, phone, email, address, status, categories: [{ id, name }] } }` (categories sorted by name). Never includes `password_hash`; commission rate and radius are admin-managed and not exposed. |
+| GET | `/restaurants/me/menu` | Every **active** item in the restaurant's approved categories (`restaurant_categories`), **including items currently switched off** — the customer catalog hides those, so this is the only way to find one to switch back on. → `{ items: [{ id, name, description, price, image_url, is_veg, category_id, category_name, is_available }] }`, ordered by category name then id. Unlike other item payloads `price` is a **number** here. `is_available` is `false` when there is no `restaurant_items` row (matches routing: no row = not in stock). Toggle with the existing `PATCH /restaurants/:restaurantId/items/:itemId/availability` (it creates the row if missing). |
+| GET | `/restaurants/me/category-options?q=` | The category picker. → `{ categories: [{ id, name, joined }], exact, similar }`. `categories` = **every active category** (or those whose name contains `q`, also matching the normalized name, so `q=momos` finds `Momo`), ordered by name; `joined` = this kitchen already has it. `exact` / `similar` are computed **only when `q` is non-empty** (else `null` / `[]`): `exact` = the category whose normalized name equals the normalized `q`; `similar` = up to **5** close matches, best first, never including `exact`. Independent of the customer catalog, so it still lists categories that have no stock. |
+| POST | `/restaurants/me/categories` | Body **either** `{ category_id }` (join an existing category) **or** `{ name, confirm_not_duplicate? }` (create a new one and join it) — see the subsection below. Both → 201 `{ category: { id, name } }`. |
+
+Both are restaurant-token only (401 without a token, 403 for other user types). `/restaurants/me` is mounted ahead of the catalog routes so "me" is never read as a `:restaurantId`. For orders the Restaurant app uses the shared `GET /orders` (restaurants see only paid/COD orders, with `created_at` = placed time, item names and category names), `GET /orders/:id`, `accept`, `reject`, `start-preparing` and `mark-ready`.
+
+### Categories: kitchens create their own (no admin approval)
+
+Product decision (2026-09-21): a kitchen can add a category itself; nothing is reviewed. The safeguard is **duplicate prevention, enforced on the server** (an app's own checks are only UX): the customer must never see both "Momo" and "Momos". Admin cleanup (rename / merge / deactivate) comes later in the Admin Panel.
+
+`POST /restaurants/me/categories`
+
+- **`{ category_id }`** — join an existing category. 201 `{ category: { id, name } }`; **409** `{ code: "already_joined", error, category }`; **404** unknown or inactive; 400 if not a positive integer.
+- **`{ name }`** — create + join. In order:
+  1. **Validate** → 400 `{ code: "invalid_name", error }`: trimmed and whitespace-collapsed, **2–40 characters**, only letters (any script, e.g. Bengali), digits, spaces and `& ( ) - '`; must contain a letter; must not be nothing but filler words ("Food", "Food Corner"). All-lowercase input is title-cased (`hakka noodles` → `Hakka Noodles`).
+  2. **Exact duplicate** (same normalized name) → **409** `{ code: "category_exists", error, category: { id, name, joined } }`. Never created, and `confirm_not_duplicate` does **not** bypass it — join it with `{ category_id }` instead. If the match is a deactivated category → 409 `{ code: "category_unavailable" }`.
+  3. **Close match** and `confirm_not_duplicate !== true` → **409** `{ code: "similar_categories", error, similar: [{ id, name, joined }] }` (≤5, best first). Resend with `confirm_not_duplicate: true` (a real boolean — the string `"true"` doesn't count) once the kitchen has seen the suggestions.
+  4. **Abuse cap** → **403** `{ code: "category_limit" }` once a kitchen has created `MAX_CATEGORIES_PER_RESTAURANT` (default **10**) categories — with no approval step, a buggy client mustn't be able to flood the shared catalog.
+  5. Otherwise insert and join → **201** `{ category: { id, name } }`. Defaults: no description, photo, prep time or min-order override; active; `created_by_restaurant_id` = the kitchen (for admin cleanup). Two kitchens racing to create the same name: the database's unique indexes let one win; the other gets the same `category_exists` 409.
+- Joining a category does **not** stock any items: they appear in `GET /restaurants/me/menu` as `is_available: false` until switched on.
+
+**What counts as "the same"** (`src/utils/categoryName.js` is the single definition; the API never compares raw names). The name is lowercased, accents stripped (Latin script only — Bengali/Hindi vowel signs are kept), `&` → "and"; filler words dropped (`and food foods item items special specials cuisine dish dishes style corner house`); every word singularized (`momos→momo`, `sweets→sweet`, `sandwiches→sandwich`, `candies→candy`, `biryanis→biryani`); Indian spelling variants folded (`biriyani/briyani→biryani`, `chow mein/chaumin→chowmein`, `tandoori→tandori`, `ee→i`, `oo→u`, `ph→f`, `ss→s`, initial `w→v`); punctuation and spaces removed. So `Momo`/`Momos`/`MOMOS Special`, `Paneer Tikka`/`Panir Tikka`, `Chaat & Snacks`/`Chaat Snack` are one category. **"Close"** = normalized edit distance ≤1 when the shorter name is under 8 chars (≤2 otherwise) **or** one normalized name contains the other (≥3 chars) — e.g. `Mome` vs `Momo`, `Bengali Rolls` vs `Bengali`, `Indian` vs `South Indian`. Stored as `categories.name_normalized` (unique index, backfilled for the seeded ones) as a race-safe backstop; detection recomputes from the name, so an unkeyed legacy row can't let a duplicate through.
+
 ## Restaurants (`/admin/restaurants`) — admin only
 
 | Method | Path | Body | Notes |
@@ -133,9 +199,12 @@ Order `status` ∈ `placed`\|`accepted`\|`picked_up`\|`on_the_way`\|`delivered`\
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
+| GET | `/riders/me` | — | → `{ rider: { id, name, phone, vehicle_type, vehicle_number, status, wallet_balance } }`. `name`/`vehicle_type`/`vehicle_number` are `null` until set — self-serve OTP signup only ever sets `name`, and only if passed on the first verify; the onboarding flow's vehicle step happens after that, via the next endpoint. |
+| PATCH | `/riders/me` | any of `{ name, vehicle_type, vehicle_number }` | Fills in what signup doesn't collect. `name` 1–120 chars (trimmed); `vehicle_type` one of `bike`\|`scooter`\|`bicycle`\|`car` or `null`; `vehicle_number` ≤30 chars or `null` to clear it. `phone` isn't editable (login identity). Empty body → 400. → the updated profile, same shape as `GET /riders/me`. |
 | PATCH | `/riders/me/availability` | `{ status: 'active'\|'inactive' }` | |
 | PATCH | `/riders/me/location` | `{ lat, lng }` | Foreground-only ping. |
-| GET | `/riders/me/orders` | — | Active assigned deliveries. |
+| GET | `/riders/me/orders` | — | Active assigned deliveries, each with `restaurant_name`/`restaurant_address`/`restaurant_lat`/`restaurant_lng` (no items — use `GET /orders/:id` for those). |
+| GET | `/riders/me/rate` | — | → `{ rate_per_km, min_earning_per_delivery }` — the live `RIDER_RATE_PER_KM`/`RIDER_MIN_EARNING_PER_DELIVERY` env values `settleRider()` actually pays with. Exists so a client-side earnings estimate never drifts once these placeholders are confirmed with the client and the env vars change. |
 
 ## Admin (`/admin`) — admin only
 
@@ -151,7 +220,6 @@ Order `status` ∈ `placed`\|`accepted`\|`picked_up`\|`on_the_way`\|`delivered`\
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**
-- Cancellation buffer (120 s) is a placeholder — `ORDER_CANCEL_BUFFER_SECONDS`.
 - Rider earning rate (₹8/km, ₹15/delivery) — `RIDER_RATE_PER_KM` / `RIDER_MIN_EARNING_PER_DELIVERY`.
 - Invoice issuer legal name / GSTIN / FSSAI / address — `INVOICE_ISSUER_*` env vars (currently obvious placeholders).
 

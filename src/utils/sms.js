@@ -5,10 +5,20 @@
  * @param {string} phone - E.164 or 10-digit Indian mobile number
  * @param {string} otp
  */
+// Dev only: last OTP per phone, kept in memory so testers (or another
+// process, via GET /api/v1/dev/last-otp) can read it without needing the
+// server's console. Never populated in production — see the branch below.
+const lastDevOtps = new Map();
+
+function getLastDevOtp(phone) {
+  return lastDevOtps.get(phone) || null;
+}
+
 async function sendOtpSms(phone, otp) {
   if (process.env.NODE_ENV !== "production") {
     // Never actually send in dev — log instead so local testing doesn't burn SMS credits.
     console.log(`[dev-sms] OTP for ${phone}: ${otp}`);
+    lastDevOtps.set(phone, { otp, requestedAt: new Date().toISOString() });
     return { success: true, dev: true };
   }
 
@@ -27,4 +37,4 @@ async function sendOtpSms(phone, otp) {
   return res.json();
 }
 
-module.exports = { sendOtpSms };
+module.exports = { sendOtpSms, getLastDevOtp };

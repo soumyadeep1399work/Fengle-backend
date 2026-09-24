@@ -33,6 +33,17 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   next-nearest, up to a 7km ceiling.
 - **Catalog visibility is location-dependent**: a customer only sees items
   actually available from an in-range restaurant, not a flat global catalog.
+- **Categories are kitchen-creatable, with no admin approval** (decision
+  2026-09-21 — supersedes "categories are admin-only"). Safeguard: duplicate
+  prevention, enforced server-side — the customer must never see "Momo" and
+  "Momos". Names are compared by a normalized key (plural, case, filler words,
+  Indian spelling variants — see `src/utils/categoryName.js`); an exact
+  duplicate is always refused, a close match needs an explicit confirm, and a
+  kitchen can create at most `MAX_CATEGORIES_PER_RESTAURANT` (default 10).
+  Admin rename/merge/deactivate is a later Admin Panel job.
+  A restaurant may also edit any item in a category it carries (shared item —
+  see PATCH /items/:id); order lines snapshot the item name at placement so
+  renames never rewrite order history.
 - **Item creation**: both Admin and Restaurant can add items. No
   restaurant-exclusive items — the catalog is shared per category.
 - **Restaurant onboarding is manual, via Admin Panel only.** There is no
@@ -50,7 +61,7 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
 - **Cancellation** (policy changed 2026-09-18 — supersedes the earlier
   "blocked only after Start Preparing" rule): a customer can cancel only
   within a short buffer window after placing (`ORDER_CANCEL_BUFFER_SECONDS`,
-  default 120s — a placeholder duration, confirm with the client) AND only
+  default 60s — confirmed by the user 2026-09-21) AND only
   while the order is still `placed` (restaurant hasn't accepted). The
   client-side countdown is UX only; `POST /orders/:id/cancel` enforces both
   conditions server-side and triggers a refund if already paid.
@@ -100,7 +111,7 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
 fengle-backend/
   src/
     config/db.js
-    migrations/     — 24 Knex migrations (run `npx knex migrate:latest`)
+    migrations/     — 27 Knex migrations (run `npx knex migrate:latest`)
     controllers/    — auth, profile, catalog, cart, address, payment, order,
                       wallet, favorite, notification (customer-facing);
                       restaurant, rider, admin (portal-facing)
@@ -111,10 +122,15 @@ fengle-backend/
     middleware/auth.middleware.js
     utils/          — jwt, otp, sms, geo
   scripts/create-admin.js   — the only way an admin account is created
+  scripts/seed.js           — dev catalog, 7 dev restaurants, dev rider (npm run seed)
+  scripts/advance-order.js  — dev-only: push an order through its status steps
+  scripts/add-credit.js     — dev-only: add wallet credit to a test customer
   assets/fonts/             — Noto Sans (invoice PDF; includes the ₹ glyph)
+  uploads/                  — dev image uploads (gitignored; S3 in production)
   docs/API.md               — full endpoint reference (start here)
   postman/                  — importable collection
-  test_integration.js       — real-MySQL integration suite (run on a fresh DB)
+  test_integration.js       — real-MySQL integration suite (run on a DEDICATED empty DB,
+                              never the seeded dev DB — see README)
 ```
 
 ### MySQL schema (all migrated)

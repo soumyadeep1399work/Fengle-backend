@@ -4,6 +4,9 @@ const riderController = require("../controllers/rider.controller");
 
 const router = express.Router();
 
+router.get("/me", requireAuth(["rider"]), riderController.getMyProfile);
+router.patch("/me", requireAuth(["rider"]), riderController.updateMyProfile);
+router.get("/me/rate", requireAuth(["rider"]), riderController.getMyRate);
 router.patch("/me/availability", requireAuth(["rider"]), riderController.setAvailability);
 router.patch("/me/location", requireAuth(["rider"]), riderController.updateLocation);
 router.get("/me/orders", requireAuth(["rider"]), riderController.getMyAssignedOrders);

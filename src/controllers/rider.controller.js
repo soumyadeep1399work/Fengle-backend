@@ -1,4 +1,78 @@
 const db = require("../config/db");
+const { RIDER_RATE_PER_KM, MIN_EARNING_PER_DELIVERY } = require("../services/settlement.service");
+
+const VEHICLE_TYPES = ["bike", "scooter", "bicycle", "car"];
+
+/**
+ * GET /riders/me/rate — the live settlement rate, so a client-side earnings
+ * estimate (there's no per-delivery earnings endpoint yet) never silently
+ * drifts from what settleRider() actually pays once these placeholders are
+ * confirmed with the client and the env vars change.
+ */
+async function getMyRate(req, res) {
+  res.json({ rate_per_km: RIDER_RATE_PER_KM, min_earning_per_delivery: MIN_EARNING_PER_DELIVERY });
+}
+
+/**
+ * GET /riders/me — profile + status + wallet balance in one shot, mirroring
+ * GET /restaurants/me. The onboarding flow collects name/vehicle in a step
+ * AFTER the OTP verify that creates the account (which only ever gets a
+ * name, and only if passed on that first verify) — this is what the app
+ * reads back to know whether that step still needs doing (name === null).
+ */
+async function getMyProfile(req, res) {
+  const rider = await db("riders").where({ id: req.auth.id }).first();
+  if (!rider) return res.status(404).json({ error: "Rider not found" });
+  res.json({
+    rider: {
+      id: rider.id,
+      name: rider.name,
+      phone: rider.phone,
+      vehicle_type: rider.vehicle_type,
+      vehicle_number: rider.vehicle_number,
+      status: rider.status,
+      wallet_balance: Number(rider.wallet_balance),
+    },
+  });
+}
+
+/**
+ * PATCH /riders/me
+ * body: any of { name, vehicle_type, vehicle_number }
+ * Fills in what the self-serve OTP signup never collects — the onboarding
+ * step right after first verify. Phone isn't editable (it's the login
+ * identity, same rule as PATCH /profile/me for customers).
+ */
+async function updateMyProfile(req, res) {
+  const { name, vehicle_type, vehicle_number } = req.body || {};
+  const updates = {};
+
+  if (name !== undefined) {
+    if (typeof name !== "string" || !name.trim() || name.trim().length > 120) {
+      return res.status(400).json({ error: "name must be a non-empty string of at most 120 characters" });
+    }
+    updates.name = name.trim();
+  }
+  if (vehicle_type !== undefined) {
+    if (vehicle_type !== null && !VEHICLE_TYPES.includes(vehicle_type)) {
+      return res.status(400).json({ error: `vehicle_type must be one of: ${VEHICLE_TYPES.join(", ")}` });
+    }
+    updates.vehicle_type = vehicle_type;
+  }
+  if (vehicle_number !== undefined) {
+    if (vehicle_number !== null && (typeof vehicle_number !== "string" || vehicle_number.trim().length > 30)) {
+      return res.status(400).json({ error: "vehicle_number must be a string of at most 30 characters" });
+    }
+    updates.vehicle_number = vehicle_number === null ? null : vehicle_number.trim();
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ error: "Send at least one of: name, vehicle_type, vehicle_number" });
+  }
+
+  await db("riders").where({ id: req.auth.id }).update(updates);
+  return getMyProfile(req, res);
+}
 
 /**
  * PATCH /riders/me/availability
@@ -30,12 +104,23 @@ async function updateLocation(req, res) {
   res.json({ message: "Location updated" });
 }
 
+/**
+ * GET /riders/me/orders — currently assigned active deliveries. Bare order
+ * rows (no items) — for the pickup/dropoff screens the shared GET /orders/:id
+ * has both items and the pickup-kitchen contact below; this is a lighter list.
+ */
 async function getMyAssignedOrders(req, res) {
   const orders = await db("orders")
-    .where({ rider_id: req.auth.id })
-    .whereIn("status", ["accepted", "picked_up", "on_the_way"])
-    .orderBy("created_at", "desc");
+    .join("restaurants", "restaurants.id", "orders.restaurant_id")
+    .where("orders.rider_id", req.auth.id)
+    .whereIn("orders.status", ["accepted", "picked_up", "on_the_way"])
+    .orderBy("orders.created_at", "desc")
+    .select(
+      "orders.*",
+      "restaurants.name as restaurant_name", "restaurants.address as restaurant_address",
+      "restaurants.lat as restaurant_lat", "restaurants.lng as restaurant_lng"
+    );
   res.json({ orders });
 }
 
-module.exports = { setAvailability, updateLocation, getMyAssignedOrders };
+module.exports = { getMyProfile, updateMyProfile, getMyRate, setAvailability, updateLocation, getMyAssignedOrders };

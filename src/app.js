@@ -4,6 +4,7 @@ const helmet = require("helmet");
 const morgan = require("morgan");
 
 const routes = require("./routes");
+const { UPLOAD_DIR } = require("./services/storage.service");
 
 const app = express();
 
@@ -12,6 +13,24 @@ app.use(cors());
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Uploaded images (dev: local disk; production would sit behind S3/CDN with the
+// same URLs). helmet's default Cross-Origin-Resource-Policy is same-origin,
+// which would stop the apps (Expo web on another port) rendering these in an
+// <img>, so it's relaxed for this path only. Random file names, no directory
+// listing, no dotfiles.
+app.use(
+  "/uploads",
+  express.static(UPLOAD_DIR, {
+    index: false,
+    dotfiles: "deny",
+    maxAge: "7d",
+    setHeaders: (res) => {
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+    },
+  })
+);
 
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });

@@ -9,9 +9,24 @@ const { haversineDistanceKm } = require("../utils/geo");
 
 const MIN_ORDER_VALUE = 50;
 // How long after placing an order a customer can still cancel it for free —
-// see CLAUDE.md's cancellation policy note (updated 2026-09-18: this buffer
-// rule replaces the earlier "blocked only after Start Preparing" rule).
-const CANCEL_BUFFER_SECONDS = Number(process.env.ORDER_CANCEL_BUFFER_SECONDS) || 120;
+// see CLAUDE.md's cancellation policy note (2026-09-18: this buffer rule
+// replaces the earlier "blocked only after Start Preparing" rule; the 60s
+// value was confirmed by the user on 2026-09-21).
+const CANCEL_BUFFER_SECONDS = Number(process.env.ORDER_CANCEL_BUFFER_SECONDS) || 60;
+
+/**
+ * When the customer's cancel window closes (ISO), so the app can drive its
+ * countdown from the server. null once the order can no longer be cancelled
+ * (restaurant accepted, cancelled, delivered...) — matches cancelOrder's
+ * rule of "still `placed` AND within the buffer". A timestamp in the past
+ * for a still-`placed` order just means the window has lapsed.
+ */
+function cancellableUntil(order) {
+  if (order.status !== "placed") return null;
+  return new Date(new Date(order.created_at).getTime() + CANCEL_BUFFER_SECONDS * 1000).toISOString();
+}
+
+const withCancelInfo = (order) => ({ ...order, cancellable_until: cancellableUntil(order) });
 
 /**
  * Server-side enforcement of the "resolve your last kitchen rating before
@@ -75,6 +90,7 @@ async function placeOrder(req, res) {
   const cartItems = items.map((i) => ({
     itemId: i.item_id,
     categoryId: itemById[i.item_id].category_id,
+    name: itemById[i.item_id].name, // snapshotted onto order_items so later renames don't rewrite history
     quantity: i.quantity,
     unitPrice: Number(itemById[i.item_id].price),
   }));
@@ -106,7 +122,7 @@ async function placeOrder(req, res) {
     });
     const result = await withPaymentOrder(order, payment_method);
     if (result.error) return res.status(result.status).json({ error: result.error });
-    return res.status(201).json(result);
+    return res.status(201).json({ ...result, order: withCancelInfo(result.order) });
   }
 
   // No single restaurant could fulfil the full (possibly clubbed) cart.
@@ -128,7 +144,7 @@ async function placeOrder(req, res) {
       }
       return res.status(201).json({
         message: "These items are being sent as two separate orders since no single kitchen could prepare both.",
-        orders: results,
+        orders: results.map((r) => ({ ...r, order: withCancelInfo(r.order) })),
       });
     }
   }
@@ -202,6 +218,7 @@ async function createOrderForRestaurant({ customerId, restaurant, distanceKm, ca
       cartItems.map((i) => ({
         order_id: orderId,
         item_id: i.itemId,
+        item_name: i.name,
         category_id: i.categoryId,
         quantity: i.quantity,
         unit_price: i.unitPrice,
@@ -379,6 +396,26 @@ async function startPreparing(req, res) {
 
   await db("orders").where({ id }).update({ preparation_started_at: new Date() });
   res.json({ message: "Preparation started" });
+}
+
+/**
+ * POST /orders/:id/mark-ready — the restaurant's "Mark ready" button: food is
+ * ready for the rider to collect. A signal only (sets ready_at) — it doesn't
+ * change `status` and rider pickup isn't blocked on it. Idempotent: calling it
+ * again keeps the original timestamp.
+ */
+async function markReady(req, res) {
+  const { id } = req.params;
+  const order = await db("orders").where({ id }).first();
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  if (Number(order.restaurant_id) !== Number(req.auth.id)) return res.status(403).json({ error: "Not your order" });
+  if (order.status !== "accepted") return res.status(409).json({ error: "Order must be accepted (and not yet picked up) to be marked ready" });
+
+  if (!order.ready_at) await db("orders").where({ id }).update({ ready_at: new Date() });
+  // Re-read so the response is exactly what's stored (TIMESTAMP columns keep
+  // whole seconds) — otherwise the first call and every later one would differ.
+  const { ready_at } = await db("orders").where({ id }).select("ready_at").first();
+  res.json({ message: "Marked ready", ready_at: new Date(ready_at).toISOString() });
 }
 
 /**
@@ -573,6 +610,22 @@ async function markDelivered(req, res) {
 // Reads
 // ---------------------------------------------------------------------------
 
+/**
+ * Pickup-kitchen name/address/coords for the requester's order view — the
+ * business rule ("rider can see restaurant name/location, customer never
+ * can") is enforced right here, not left to callers to remember. Restaurants
+ * and admins get it too (never restricted for them); customers get {}.
+ */
+function restaurantContactFields(requesterType, restaurant) {
+  if (requesterType === "customer" || !restaurant) return {};
+  return {
+    restaurant_name: restaurant.name,
+    restaurant_address: restaurant.address,
+    restaurant_lat: restaurant.lat,
+    restaurant_lng: restaurant.lng,
+  };
+}
+
 async function getOrder(req, res) {
   const { id } = req.params;
   const order = await db("orders").where({ id }).first();
@@ -586,12 +639,21 @@ async function getOrder(req, res) {
     type === "admin";
   if (!isParty) return res.status(403).json({ error: "Not authorized to view this order" });
 
-  const items = await db("order_items").where({ order_id: id });
+  const items = await db("order_items")
+    .join("items", "items.id", "order_items.item_id")
+    .join("categories", "categories.id", "order_items.category_id")
+    .where("order_items.order_id", id)
+    .orderBy("order_items.id")
+    .select("order_items.*", db.raw("COALESCE(order_items.item_name, items.name) as name"), "categories.name as category_name");
+  const categories = distinctCategories(items);
   const rider = order.rider_id ? await db("riders").where({ id: order.rider_id }).select("name", "phone").first() : null;
+  const restaurant = await db("restaurants").where({ id: order.restaurant_id }).select("name", "address", "lat", "lng").first();
 
   res.json({
     order: {
-      ...order,
+      ...withCancelInfo(order),
+      categories,
+      category_name: categories.map((c) => c.name).join(" + "),
       cancelled: order.status === "cancelled",
       riderRating: order.rider_rating,
       riderRatingComment: order.rider_rating_comment,
@@ -599,6 +661,7 @@ async function getOrder(req, res) {
       restaurantRatingComment: order.restaurant_rating_comment,
       restaurantRatingSkipped: Boolean(order.restaurant_rating_skipped),
       rider: rider ? { name: rider.name, phone: rider.phone } : null,
+      ...restaurantContactFields(type, restaurant),
     },
     items,
   });
@@ -626,6 +689,7 @@ async function getOrderStatus(req, res) {
   res.json({
     status: order.status,
     cancelled: order.status === "cancelled",
+    cancellable_until: cancellableUntil(order),
     eta_minutes: order.eta_minutes,
     picked_up_at: order.picked_up_at,
     delivered_at: order.delivered_at,
@@ -813,15 +877,48 @@ async function listMyOrders(req, res) {
     ? await db("order_items")
         .join("items", "items.id", "order_items.item_id")
         .whereIn("order_items.order_id", orderIds)
+        .join("categories", "categories.id", "order_items.category_id")
         .andWhere("order_items.status", "confirmed")
-        .select("order_items.order_id", "order_items.quantity", "items.name")
+        .orderBy("order_items.id")
+        .select(
+          "order_items.order_id", "order_items.item_id", "order_items.quantity", "order_items.category_id",
+          db.raw("COALESCE(order_items.item_name, items.name) as name"), "categories.name as category_name"
+        )
     : [];
   const itemsByOrderId = {};
   for (const row of orderItemRows) {
-    (itemsByOrderId[row.order_id] ||= []).push({ name: row.name, quantity: row.quantity });
+    (itemsByOrderId[row.order_id] ||= []).push({
+      item_id: row.item_id, name: row.name, quantity: row.quantity,
+      category_id: row.category_id, category_name: row.category_name,
+    });
   }
 
-  res.json({ orders: orders.map((o) => ({ ...o, items: itemsByOrderId[o.id] || [] })) });
+  const restaurantIds = [...new Set(orders.map((o) => o.restaurant_id).filter(Boolean))];
+  const restaurantById = type === "customer" || restaurantIds.length === 0
+    ? {}
+    : Object.fromEntries(
+        (await db("restaurants").whereIn("id", restaurantIds).select("id", "name", "address", "lat", "lng")).map((r) => [r.id, r])
+      );
+
+  res.json({
+    orders: orders.map((o) => {
+      const items = itemsByOrderId[o.id] || [];
+      const categories = distinctCategories(items);
+      return {
+        ...withCancelInfo(o), items, categories, category_name: categories.map((c) => c.name).join(" + "),
+        ...restaurantContactFields(type, restaurantById[o.restaurant_id]),
+      };
+    }),
+  });
+}
+
+/** Distinct categories in an order's items, in first-seen order — a clubbed order has two. */
+function distinctCategories(items) {
+  const seen = new Map();
+  for (const i of items) {
+    if (!seen.has(i.category_id)) seen.set(i.category_id, { id: i.category_id, name: i.category_name });
+  }
+  return [...seen.values()];
 }
 
 module.exports = {
@@ -829,6 +926,7 @@ module.exports = {
   confirmPayment,
   acceptOrder,
   startPreparing,
+  markReady,
   rejectOrder,
   cancelOrder,
   autoAssignRider,

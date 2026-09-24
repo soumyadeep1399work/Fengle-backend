@@ -92,6 +92,10 @@
     {
       "key": "device_token",
       "value": "fcm-dev-token-123"
+    },
+    {
+      "key": "uploaded_image_url",
+      "value": ""
     }
   ],
   "item": [
@@ -112,6 +116,97 @@
                 "health"
               ]
             }
+          }
+        },
+        {
+          "name": "Dev: Last OTP",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/dev/last-otp?phone={{customer_phone}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "dev",
+                "last-otp"
+              ],
+              "query": [
+                {
+                  "key": "phone",
+                  "value": "{{customer_phone}}"
+                }
+              ]
+            },
+            "description": "Dev only (not mounted in production). Returns the last OTP requested for this phone since the server started."
+          }
+        },
+        {
+          "name": "Dev: Advance Order One Step",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/dev/orders/{{order_id}}/advance",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "dev",
+                "orders",
+                "{{order_id}}",
+                "advance"
+              ]
+            },
+            "description": "Dev only. Body {\"to\":\"delivered\"} runs to that step. Drives the real restaurant/rider handlers."
+          }
+        },
+        {
+          "name": "Dev: Add Wallet Credit",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"{{customer_phone}}\",\n  \"amount\": 500\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/dev/wallet/credit",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "dev",
+                "wallet",
+                "credit"
+              ]
+            },
+            "description": "Dev only. The customer must have logged in once."
           }
         }
       ]
@@ -888,6 +983,38 @@
                 }
               ]
             }
+          }
+        },
+        {
+          "name": "Popular Items (Home)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/items/popular?lat=22.58&lng=88.47&limit=6",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "items",
+                "popular"
+              ],
+              "query": [
+                {
+                  "key": "lat",
+                  "value": "22.58"
+                },
+                {
+                  "key": "lng",
+                  "value": "88.47"
+                },
+                {
+                  "key": "limit",
+                  "value": "6"
+                }
+              ]
+            },
+            "description": "Cross-category Popular picks for Home."
           }
         }
       ]
@@ -2285,6 +2412,73 @@
       "name": "Riders",
       "item": [
         {
+          "name": "Get My Rider Profile",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{rider_token}}"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/riders/me",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "riders",
+                "me"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Update My Rider Profile",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{rider_token}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Rahul Kumar\",\n  \"vehicle_type\": \"bike\",\n  \"vehicle_number\": \"WB02AB1234\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/riders/me",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "riders",
+                "me"
+              ]
+            },
+            "description": "Fills in name/vehicle collected in the onboarding step after OTP signup. Any of name, vehicle_type (bike|scooter|bicycle|car), vehicle_number (null clears it)."
+          }
+        },
+        {
           "name": "Set Availability",
           "request": {
             "method": "PATCH",
@@ -2510,6 +2704,301 @@
               ]
             },
             "description": "No scheduled job exists — this is the only way settlement runs today. Get rider_id_to_settle from GET /admin/riders."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Restaurant App",
+      "item": [
+        {
+          "name": "Get My Restaurant",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{restaurant_token}}"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/restaurants/me",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "restaurants",
+                "me"
+              ]
+            },
+            "description": "Profile + approved categories."
+          }
+        },
+        {
+          "name": "Get My Menu (incl. switched-off items)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{restaurant_token}}"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/restaurants/me/menu",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "restaurants",
+                "me",
+                "menu"
+              ]
+            },
+            "description": "Every active item in approved categories with is_available. Toggle via PATCH availability (Catalog folder)."
+          }
+        },
+        {
+          "name": "Mark Order Ready",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{restaurant_token}}"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/orders/{{order_id}}/mark-ready",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "orders",
+                "{{order_id}}",
+                "mark-ready"
+              ]
+            },
+            "description": "Only from accepted. Idempotent. Signal for the rider; does not change status."
+          }
+        },
+        {
+          "name": "Upload Item Photo",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201) { pm.collectionVariables.set(\"uploaded_image_url\", pm.response.json().url); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{restaurant_token}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "image",
+                  "type": "file",
+                  "src": []
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/uploads/image",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "uploads",
+                "image"
+              ]
+            },
+            "description": "multipart/form-data, one file field named image (JPEG/PNG/WebP, max 2 MB). Returns { url } — saved to {{uploaded_image_url}} to use as image_url in POST /items."
+          }
+        },
+        {
+          "name": "Edit Item",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{restaurant_token}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"price\": 275,\n  \"name\": \"Shorshe Ilish\",\n  \"is_veg\": false,\n  \"image_url\": \"{{uploaded_image_url}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/items/{{item_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "items",
+                "{{item_id}}"
+              ]
+            },
+            "description": "Any of name, price, is_veg, image_url (null removes the photo), description. category_id cannot change. Restaurants can edit any item in a category they carry, incl. admin-seeded (shared item)."
+          }
+        },
+        {
+          "name": "Category Options (picker)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{restaurant_token}}"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/restaurants/me/category-options?q=momos",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "restaurants",
+                "me",
+                "category-options"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "momos"
+                }
+              ]
+            },
+            "description": "All active categories (joined flag) + exact and similar matches for q. exact/similar only when q is non-empty."
+          }
+        },
+        {
+          "name": "Create Category (kitchen)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{restaurant_token}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Momos\",\n  \"confirm_not_duplicate\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/restaurants/me/categories",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "restaurants",
+                "me",
+                "categories"
+              ]
+            },
+            "description": "409 category_exists (never created), 409 similar_categories (resend with confirm_not_duplicate:true), 400 invalid_name, 403 category_limit, 201 { category }."
+          }
+        },
+        {
+          "name": "Join Category (kitchen)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{restaurant_token}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"category_id\": \"{{category_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/restaurants/me/categories",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "restaurants",
+                "me",
+                "categories"
+              ]
+            },
+            "description": "Join an existing category. 409 already_joined, 404 unknown/inactive."
           }
         }
       ]

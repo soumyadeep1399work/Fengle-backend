@@ -9,7 +9,8 @@ this API is built against.
 ```bash
 cp .env.example .env    # fill in DB credentials at minimum
 npm install
-npm run migrate         # runs all 24 migrations
+npm run migrate         # runs all 27 migrations
+npm run seed            # dev catalog, restaurants and rider (idempotent)
 npm run dev              # starts on PORT (default 4000)
 ```
 
@@ -29,9 +30,15 @@ engine, wallet/COD flow, and settlement. Run it after migrating:
 node test_integration.js
 ```
 
-Should print `41 passed, 0 failed` (as of this commit — update this number if
+Should print `184 passed, 0 failed` (as of this commit — update this number if
 you add more). The script is not idempotent (fixed phone numbers, no teardown), so
-run it against a fresh/rolled-back DB: `npx knex migrate:rollback --all && npx knex migrate:latest`.
+run it against a **dedicated, empty** database — never your seeded dev DB (the seed and the test both create a "Bengali" category). DB_NAME from the environment overrides .env:
+
+```bash
+# once: CREATE DATABASE food_delivery_test;
+DB_NAME=food_delivery_test npx knex migrate:rollback --all && DB_NAME=food_delivery_test npx knex migrate:latest
+DB_NAME=food_delivery_test node test_integration.js
+```
 
 ## API surface
 
