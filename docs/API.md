@@ -138,12 +138,26 @@ Order `status` ∈ `placed`\|`accepted`\|`picked_up`\|`on_the_way`\|`delivered`\
 | POST | `/favorites/:itemId` | Idempotent (re-favoriting isn't an error). |
 | DELETE | `/favorites/:itemId` | |
 
-## Notifications (`/notifications`) — customer
+## Notifications (`/notifications`)
 
-| Method | Path | Body | Notes |
+| Method | Path | Auth | Body | Notes |
+|---|---|---|---|---|
+| POST | `/notifications/register-device` | customer/restaurant/rider | `{ token, platform: 'android'\|'ios' }` | `token` is the device's **Expo push token** (`ExponentPushToken[…]`). Upserts for the caller's own account, and first removes the same token from any other account (a phone only gets pushes for whoever is logged in on it). `POST /auth/logout { device_token }` unregisters it. |
+| PATCH | `/notifications/settings` | customer | any of `{ order_updates, promotions }` | Merges into existing prefs → `{ notification_prefs }`. `order_updates: false` stops the customer's order pushes. |
+
+**Sending** (`src/services/push.service.js` + `src/services/orderNotifications.service.js`): pushes go through the **Expo Push Service** (`exp.host`), which delivers via FCM using the FCM V1 key uploaded to EAS (Firebase project `fengle-1a2b3`). The server has no Firebase SDK and no extra dependency. Every message uses Android channel `orders` and carries `data: { type, orderId }`. Sending is fire-and-forget after the response (a failure is only logged), and tokens Expo reports as `DeviceNotRegistered` are deleted. If `EXPO_ACCESS_TOKEN` is set in the env, it's sent as a bearer token.
+
+| Event | To | `data.type` | Message |
 |---|---|---|---|
-| POST | `/notifications/register-device` | `{ token, platform: 'android'\|'ios' }` | Upserts the FCM token. |
-| PATCH | `/notifications/settings` | any of `{ order_updates, promotions }` | Merges into existing prefs → `{ notification_prefs }`. Storage only — nothing sends pushes yet (see gaps). |
+| Order becomes visible to the kitchen (COD/wallet at placement, online payment confirmed, or re-routed after a reject) | restaurant | `new_order` | "New order #id": item count, total, COD flag |
+| Rider auto-assigned when the kitchen accepts | rider | `new_delivery` | "New delivery #id": pickup kitchen name, cash to collect |
+| Accepted | customer | `order_update` | "Order confirmed" (plus a wallet-refund line if items were dropped) |
+| Picked up | customer | `order_update` | "Out for delivery" with the one-time ETA |
+| On the way | customer | `order_update` | "On the way" |
+| Delivered | customer | `order_update` | "Delivered" and a prompt to rate |
+| Cancelled because no kitchen could take it | customer | `order_update` | "Order cancelled" (plus a refund line) |
+
+Customer pushes never name the kitchen. A customer's own cancellation sends nothing.
 
 ## Image uploads (`/uploads`) — restaurant or admin
 
@@ -224,7 +238,7 @@ Product decision (2026-09-21): a kitchen can add a category itself; nothing is r
 - Invoice issuer legal name / GSTIN / FSSAI / address — `INVOICE_ISSUER_*` env vars (currently obvious placeholders).
 
 **Not built**
-- **Push notifications are never actually sent** — device tokens and prefs are stored, but there's no FCM sender, so order-status changes don't notify anyone yet (the design promises "every step arrives as a notification").
+- **Push notifications: sending is live (2026-09-27)** via the Expo Push Service (see Notifications). Still missing: tapping a push doesn't open the order in the apps yet, promotional pushes, and reading Expo's delivery receipts (only the immediate send tickets are checked).
 - **Rider phone is unmasked** on `GET /orders/:id/rider` — needs a telephony proxy before real riders handle real customer numbers.
 - **No saved payment methods** (saved cards / UPI handles) and **no direct server-side card charging** against live Razorpay.
 - **No promotional credits** (welcome credit, late-delivery goodwill) — the ledger has no such reasons; only `order_payment` / `order_refund`.

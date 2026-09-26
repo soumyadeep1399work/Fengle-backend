@@ -4,9 +4,8 @@ const notifications = require("../controllers/notification.controller");
 
 const router = express.Router();
 
-router.use(requireAuth(["customer"]));
-
-router.post("/register-device", notifications.registerDevice);
-router.patch("/settings", notifications.updateSettings);
+// Every app registers its device for push; only customers have on/off settings.
+router.post("/register-device", requireAuth(["customer", "restaurant", "rider"]), notifications.registerDevice);
+router.patch("/settings", requireAuth(["customer"]), notifications.updateSettings);
 
 module.exports = router;

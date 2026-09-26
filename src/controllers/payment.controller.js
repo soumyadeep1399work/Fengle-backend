@@ -1,6 +1,8 @@
 const db = require("../config/db");
 const payment = require("../services/payment.service");
 const wallet = require("../services/wallet.service");
+const { notifyLater } = require("../services/push.service");
+const orderPush = require("../services/orderNotifications.service");
 
 /**
  * GET /payments/methods
@@ -92,6 +94,7 @@ async function chargeCard(req, res) {
 
   await db("orders").where({ id: order.id }).update({ payment_status: "paid" });
   const updated = await db("orders").where({ id: order.id }).first();
+  if (updated.status === "placed") notifyLater(() => orderPush.newOrderForRestaurant(order.id)); // now visible to the kitchen
   res.json({ order: updated, payment: { status: "captured", dev_stub: true } });
 }
 

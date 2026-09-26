@@ -6,6 +6,8 @@ const wallet = require("../services/wallet.service");
 const { computeTax } = require("../services/tax.service");
 const invoice = require("../services/invoice.service");
 const { haversineDistanceKm } = require("../utils/geo");
+const { notifyLater } = require("../services/push.service");
+const orderPush = require("../services/orderNotifications.service");
 
 const MIN_ORDER_VALUE = 50;
 // How long after placing an order a customer can still cancel it for free —
@@ -122,6 +124,7 @@ async function placeOrder(req, res) {
     });
     const result = await withPaymentOrder(order, payment_method);
     if (result.error) return res.status(result.status).json({ error: result.error });
+    notifyRestaurantIfVisible(result.order);
     return res.status(201).json({ ...result, order: withCancelInfo(result.order) });
   }
 
@@ -142,6 +145,7 @@ async function placeOrder(req, res) {
         }
         results.push(result);
       }
+      results.forEach((r) => notifyRestaurantIfVisible(r.order));
       return res.status(201).json({
         message: "These items are being sent as two separate orders since no single kitchen could prepare both.",
         orders: results.map((r) => ({ ...r, order: withCancelInfo(r.order) })),
@@ -274,6 +278,12 @@ async function withPaymentOrder(order, paymentMethod) {
   return { order, payment: paymentOrder };
 }
 
+// A kitchen only sees paid or COD orders, so an online-payment order is
+// announced to it later, from confirmPayment.
+function notifyRestaurantIfVisible(order) {
+  if (orderPush.isVisibleToRestaurant(order)) notifyLater(() => orderPush.newOrderForRestaurant(order.id));
+}
+
 /**
  * Undoes a successful wallet debit for one order in a clubbed-fallback split
  * when its sibling order's payment fails — keeps the pair atomic from the
@@ -317,6 +327,10 @@ async function confirmPayment(req, res) {
     razorpay_payment_id,
   });
 
+  // Paid now, so the kitchen can see it. Skip if it was already paid (a retry).
+  if (order.payment_status !== "paid" && order.status === "placed") {
+    notifyLater(() => orderPush.newOrderForRestaurant(order.id));
+  }
   res.json({ message: "Payment confirmed" });
 }
 
@@ -343,8 +357,8 @@ async function acceptOrder(req, res) {
   if (Number(order.restaurant_id) !== Number(restaurantId)) return res.status(403).json({ error: "Not your order" });
   if (order.status !== "placed") return res.status(409).json({ error: `Cannot accept an order in status '${order.status}'` });
 
+  let refundAmount = 0;
   await db.transaction(async (trx) => {
-    let refundAmount = 0;
 
     if (unavailable_item_ids.length > 0) {
       const orderItems = await trx("order_items").where({ order_id: id }).whereIn("item_id", unavailable_item_ids);
@@ -378,6 +392,7 @@ async function acceptOrder(req, res) {
   });
 
   await autoAssignRider(id);
+  notifyLater(() => orderPush.orderAccepted(id, order.payment_status === "paid" ? refundAmount : 0));
 
   const updated = await db("orders").where({ id }).first();
   res.json({ order: updated });
@@ -452,6 +467,7 @@ async function rejectOrder(req, res) {
       cascade_attempts: (order.cascade_attempts || 1) + 1,
       status: "placed", // re-enters the queue for the new restaurant
     });
+    notifyRestaurantIfVisible(order);
     return res.json({ message: "Order reassigned to next available restaurant", reassigned: true });
   }
 
@@ -463,6 +479,7 @@ async function rejectOrder(req, res) {
       await trx("orders").where({ id }).update({ payment_status: "refunded" });
     }
   });
+  notifyLater(() => orderPush.orderCancelledBySystem(id));
   res.json({ message: "No further restaurants available — order cancelled and refunded if paid", reassigned: false });
 }
 
@@ -536,6 +553,7 @@ async function autoAssignRider(orderId) {
     .sort((a, b) => a.distanceKm - b.distanceKm)[0];
 
   await db("orders").where({ id: orderId }).update({ rider_id: nearest.rider.id });
+  notifyLater(() => orderPush.riderAssigned(orderId));
   return nearest.rider.id;
 }
 
@@ -553,6 +571,7 @@ async function markPickedUp(req, res) {
   const etaMinutes = Math.max(5, Math.round((distanceKm / AVG_SPEED_KMPH) * 60));
 
   await db("orders").where({ id }).update({ status: "picked_up", picked_up_at: new Date(), eta_minutes: etaMinutes });
+  notifyLater(() => orderPush.orderPickedUp(id));
   res.json({ message: "Marked picked up", eta_minutes: etaMinutes });
 }
 
@@ -564,6 +583,7 @@ async function markOnTheWay(req, res) {
   if (order.status !== "picked_up") return res.status(409).json({ error: "Order must be picked up first" });
 
   await db("orders").where({ id }).update({ status: "on_the_way" });
+  notifyLater(() => orderPush.orderOnTheWay(id));
   res.json({ message: "Marked on the way" });
 }
 
@@ -603,6 +623,7 @@ async function markDelivered(req, res) {
     }
   });
 
+  notifyLater(() => orderPush.orderDelivered(id));
   res.json({ message: "Marked delivered" });
 }
 

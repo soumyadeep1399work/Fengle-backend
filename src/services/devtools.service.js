@@ -10,6 +10,8 @@
 const db = require("../config/db");
 const orderController = require("../controllers/order.controller");
 const wallet = require("./wallet.service");
+const { notifyLater } = require("./push.service");
+const orderPush = require("./orderNotifications.service");
 
 const STEP_ORDER = ["placed", "accepted", "picked_up", "on_the_way", "delivered"];
 const DEV_RIDER_PHONE = "9000000201"; // same rider scripts/seed.js creates
@@ -40,6 +42,7 @@ async function ensureRider(orderId) {
     rider = { id };
   }
   await db("orders").where({ id: orderId }).update({ rider_id: rider.id });
+  notifyLater(() => orderPush.riderAssigned(orderId));
   return db("orders").where({ id: orderId }).first();
 }
 
