@@ -95,6 +95,14 @@ async function verifyOtp(req, res) {
     userRow = await db(table).where({ id }).first();
   }
 
+  // Admin-imposed block: a blocked customer or a suspended rider/restaurant
+  // must not be able to log back in (Admin Panel decision 2026-09-27). The
+  // OTP itself is still consumed above — it just doesn't buy a session.
+  const isBlocked = userType === "customer" ? userRow.status === "blocked" : userRow.status === "suspended";
+  if (isBlocked) {
+    return res.status(403).json({ error: "Your account has been suspended. Contact support." });
+  }
+
   const token = signToken({ id: userRow.id, type: userType });
 
   return res.json({

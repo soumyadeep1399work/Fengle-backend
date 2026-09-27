@@ -8,7 +8,9 @@ const router = express.Router();
 // endpoint exists anywhere in this router (confirmed business rule).
 router.post("/", requireAuth(["admin"]), restaurantController.onboardRestaurant);
 router.get("/", requireAuth(["admin"]), restaurantController.listRestaurants);
+router.get("/:id", requireAuth(["admin"]), restaurantController.getRestaurantDetail);
 router.patch("/:id", requireAuth(["admin"]), restaurantController.updateRestaurant);
 router.post("/:id/categories", requireAuth(["admin"]), restaurantController.addRestaurantCategory);
+router.delete("/:id/categories/:categoryId", requireAuth(["admin"]), restaurantController.removeRestaurantCategory);
 
 module.exports = router;

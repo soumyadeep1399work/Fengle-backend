@@ -1,6 +1,14 @@
 const db = require("../config/db");
 const { normalizeCategoryName, findSimilar, validateCategoryName } = require("../utils/categoryName");
 const categoryService = require("../services/category.service");
+const { paginationParams } = require("../utils/pagination");
+
+// Never password_hash — every admin-facing restaurant read goes through this
+// column list rather than select("*")/first() on the raw table.
+const RESTAURANT_PUBLIC_COLUMNS = [
+  "id", "name", "owner_name", "phone", "email", "address", "lat", "lng",
+  "radius_km", "commission_rate_percent", "status", "onboarded_by", "created_at", "updated_at",
+];
 
 /**
  * POST /admin/restaurants — the ONLY way a restaurant enters the system.
@@ -38,15 +46,27 @@ async function onboardRestaurant(req, res) {
       category_ids.map((categoryId) => ({ restaurant_id: restaurantId, category_id: categoryId }))
     );
 
-    return trx("restaurants").where({ id: restaurantId }).first();
+    return trx("restaurants").where({ id: restaurantId }).select(RESTAURANT_PUBLIC_COLUMNS).first();
   });
 
   res.status(201).json({ restaurant: result });
 }
 
+/** GET /admin/restaurants?page=&limit= — each row includes its order_count. */
 async function listRestaurants(req, res) {
-  const restaurants = await db("restaurants").select("*").orderBy("name");
-  res.json({ restaurants });
+  const { page, limit, offset } = paginationParams(req);
+
+  const { n: total } = await db("restaurants").count({ n: "*" }).first();
+  const restaurants = await db("restaurants").select(RESTAURANT_PUBLIC_COLUMNS).orderBy("name").limit(limit).offset(offset);
+
+  const ids = restaurants.map((r) => r.id);
+  const orderCountRows = ids.length ? await db("orders").whereIn("restaurant_id", ids).select("restaurant_id").count({ n: "*" }).groupBy("restaurant_id") : [];
+  const orderCountById = Object.fromEntries(orderCountRows.map((r) => [r.restaurant_id, Number(r.n)]));
+
+  res.json({
+    restaurants: restaurants.map((r) => ({ ...r, order_count: orderCountById[r.id] || 0 })),
+    page, limit, total: Number(total),
+  });
 }
 
 /**
@@ -56,6 +76,10 @@ async function listRestaurants(req, res) {
 async function updateRestaurant(req, res) {
   const { id } = req.params;
   const { radius_km, commission_rate_percent, status, name, address, lat, lng } = req.body;
+
+  if (status && !["active", "inactive", "suspended"].includes(status)) {
+    return res.status(400).json({ error: "status must be 'active', 'inactive' or 'suspended'" });
+  }
 
   const updates = {};
   if (radius_km != null) updates.radius_km = radius_km;
@@ -82,7 +106,7 @@ async function updateRestaurant(req, res) {
     });
   }
 
-  const restaurant = await db("restaurants").where({ id }).first();
+  const restaurant = await db("restaurants").where({ id }).select(RESTAURANT_PUBLIC_COLUMNS).first();
   res.json({ restaurant });
 }
 
@@ -95,6 +119,48 @@ async function addRestaurantCategory(req, res) {
 
   await db("restaurant_categories").insert({ restaurant_id: id, category_id });
   res.status(201).json({ message: "Category added" });
+}
+
+/** DELETE /admin/restaurants/:id/categories/:categoryId */
+async function removeRestaurantCategory(req, res) {
+  const { id, categoryId } = req.params;
+  const deleted = await db("restaurant_categories").where({ restaurant_id: id, category_id: categoryId }).delete();
+  if (!deleted) return res.status(404).json({ error: "This restaurant does not serve that category" });
+  res.json({ message: "Category removed" });
+}
+
+/**
+ * GET /admin/restaurants/:id — detail: categories, order count, average
+ * rating (from delivered orders' restaurant_rating, same source item ratings
+ * use), and commission-rate change history.
+ */
+async function getRestaurantDetail(req, res) {
+  const { id } = req.params;
+  const restaurant = await db("restaurants").where({ id }).select(RESTAURANT_PUBLIC_COLUMNS).first();
+  if (!restaurant) return res.status(404).json({ error: "Restaurant not found" });
+
+  const categories = await db("restaurant_categories")
+    .join("categories", "categories.id", "restaurant_categories.category_id")
+    .where("restaurant_categories.restaurant_id", id)
+    .orderBy("categories.name")
+    .select("categories.id", "categories.name");
+
+  const [{ n: orderCount }] = await db("orders").where({ restaurant_id: id }).count({ n: "*" });
+  const ratingRow = await db("orders")
+    .where({ restaurant_id: id })
+    .whereNotNull("restaurant_rating")
+    .select(db.raw("AVG(restaurant_rating) as avg"), db.raw("COUNT(*) as n"))
+    .first();
+
+  const commissionHistory = await db("commission_config_history").where({ restaurant_id: id }).orderBy("created_at", "desc");
+
+  res.json({
+    restaurant,
+    categories,
+    order_count: Number(orderCount),
+    rating: { avg: ratingRow.avg != null ? Number(Number(ratingRow.avg).toFixed(1)) : null, count: Number(ratingRow.n) },
+    commission_config_history: commissionHistory,
+  });
 }
 
 /**
@@ -312,6 +378,6 @@ async function addMyCategory(req, res) {
 }
 
 module.exports = {
-  onboardRestaurant, listRestaurants, updateRestaurant, addRestaurantCategory,
+  onboardRestaurant, listRestaurants, updateRestaurant, addRestaurantCategory, removeRestaurantCategory, getRestaurantDetail,
   getMyRestaurant, getMyMenu, getCategoryOptions, addMyCategory,
 };

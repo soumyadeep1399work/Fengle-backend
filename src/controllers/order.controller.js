@@ -81,6 +81,14 @@ async function placeOrder(req, res) {
   const customerId = req.auth.id;
   const { items, delivery_lat, delivery_lng, delivery_address, payment_method } = req.body;
 
+  // Admin-blocked customers can still be holding a valid (not-yet-expired)
+  // token, so the login gate alone isn't enough — check again at the point
+  // that actually costs the platform money.
+  const customer = await db("users").where({ id: customerId }).first();
+  if (!customer || customer.status === "blocked") {
+    return res.status(403).json({ error: "Your account has been suspended. Contact support." });
+  }
+
   const pendingRatingOrderId = await findPendingRatingGateOrderId(customerId);
   if (pendingRatingOrderId) {
     return res.status(403).json({
@@ -998,4 +1006,5 @@ module.exports = {
   getOrderInvoicePdf,
   reorder,
   listMyOrders,
+  scrubDeliveryOtp,
 };

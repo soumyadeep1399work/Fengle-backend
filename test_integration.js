@@ -128,7 +128,7 @@ async function main() {
 
   let deliverRes = fakeRes();
   await orderController.markDelivered(
-    fakeReq({ cod_amount_collected: Number(orderBeforeDeliver.grand_total) }, { id: orderId }, { id: riderId, type: "rider" }),
+    fakeReq({ cod_amount_collected: Number(orderBeforeDeliver.grand_total), delivery_otp: orderBeforeDeliver.delivery_otp }, { id: orderId }, { id: riderId, type: "rider" }),
     deliverRes
   );
   check("marked delivered", deliverRes.body.message === "Marked delivered");
@@ -326,7 +326,7 @@ async function main() {
   const order3AfterAccept = await db("orders").where({ id: order3Id }).first();
   await orderController.markPickedUp(fakeReq({}, { id: order3Id }, { id: order3AfterAccept.rider_id, type: "rider" }), fakeRes());
   await orderController.markOnTheWay(fakeReq({}, { id: order3Id }, { id: order3AfterAccept.rider_id, type: "rider" }), fakeRes());
-  await orderController.markDelivered(fakeReq({}, { id: order3Id }, { id: order3AfterAccept.rider_id, type: "rider" }), fakeRes());
+  await orderController.markDelivered(fakeReq({ delivery_otp: order3AfterAccept.delivery_otp }, { id: order3Id }, { id: order3AfterAccept.rider_id, type: "rider" }), fakeRes());
   let rateRes = fakeRes();
   await orderController.rateRestaurant(fakeReq({ rating: 4, comment: "Good food" }, { id: order3Id }, { id: customerId, type: "customer" }), rateRes);
   check("restaurant rated after delivery", rateRes.body.restaurantRating === 4);
@@ -401,6 +401,10 @@ async function main() {
   const wrongRest = fakeRes();
   await orderController.markReady(fakeReq({}, { id: readyOrderId }, { id: readyOrderRestId === restA ? restB : restA, type: "restaurant" }), wrongRest);
   check("another restaurant can't mark it ready (403)", wrongRest.statusCode === 403);
+  // readyOrderId is left stuck 'accepted' (its job here is done) — with only
+  // one real rider fixture in this whole file, that would permanently starve
+  // every later autoAssignRider call. Free it now (same fix as Tests 7 and 18).
+  await db("orders").where({ id: readyOrderId }).update({ status: "cancelled", cancelled_at: new Date(), rider_id: null });
 
   console.log("\n--- Test 15: POST /items validation (restaurant adds a menu item with a photo URL) ---");
   const catalogCtl = require("./src/controllers/catalog.controller");
@@ -452,7 +456,8 @@ async function main() {
   check("echoing the item's own category_id is harmless", (await editItem(fishCurryId, { category_id: bengaliCatId, price: "250" })).statusCode === undefined);
   check("changing category_id is refused (400)", (await editItem(fishCurryId, { category_id: southIndianCatId })).statusCode === 400);
   check("empty body is refused (400)", (await editItem(fishCurryId, {})).statusCode === 400);
-  check("body with only non-editable fields is refused (400)", (await editItem(fishCurryId, { is_active: false, id: 5 })).statusCode === 400);
+  check("body with only a truly non-editable field ('id') is refused (400)", (await editItem(fishCurryId, { id: 5 })).statusCode === 400);
+  check("a restaurant sending is_active gets 403, not the generic 400 (admin-only field)", (await editItem(fishCurryId, { is_active: false })).statusCode === 403);
   check("same validation as create: price 0 -> 400", (await editItem(fishCurryId, { price: 0 })).statusCode === 400);
   check("same validation as create: price null -> 400", (await editItem(fishCurryId, { price: null })).statusCode === 400);
   check('same validation as create: is_veg "true" string -> 400', (await editItem(fishCurryId, { is_veg: "true" })).statusCode === 400);
@@ -670,6 +675,11 @@ async function main() {
   const assignedRes = fakeRes();
   await riderCtl.getMyAssignedOrders(fakeReq({}, {}, { id: riderForContact, type: "rider" }), assignedRes);
   check("GET /riders/me/orders also carries the restaurant's name/address", assignedRes.body.orders.find((o) => o.id === contactOrderId).restaurant_name === restaurantRow.name);
+  // This order is left stuck 'accepted' on purpose above (its job was just to
+  // prove the contact-field checks) — but that keeps riderForContact "busy"
+  // forever for autoAssignRider's purposes, and there's only one rider with
+  // known coordinates in this fixture set. Free it now, same fix as Test 7.
+  await db("orders").where({ id: contactOrderId }).update({ status: "cancelled", cancelled_at: new Date(), rider_id: null });
 
   console.log("\n--- Test 19: rider self-service — GET/PATCH /riders/me (name/vehicle collected after OTP signup) ---");
   const getRiderProfile = async (auth = { id: riderId, type: "rider" }) => { const r = fakeRes(); await riderCtl.getMyProfile(fakeReq({}, {}, auth), r); return r; };
@@ -710,6 +720,198 @@ async function main() {
   await riderCtl.getMyRate(fakeReq({}, {}, { id: riderId, type: "rider" }), riderRateRes);
   check("rate matches what settleRider() actually uses",
     riderRateRes.body.rate_per_km === settlementSvc.RIDER_RATE_PER_KM && riderRateRes.body.min_earning_per_delivery === settlementSvc.MIN_EARNING_PER_DELIVERY);
+
+  console.log("\n--- Test 21: delivery_otp is required and checked on markDelivered ---");
+  const otpOrderRes = fakeRes();
+  await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "cod" }, {}, { id: customerId, type: "customer" }), otpOrderRes);
+  const otpOrder = otpOrderRes.body.order;
+  check("a freshly placed order has a 4-digit delivery_otp", /^\d{4}$/.test(otpOrder.delivery_otp || ""));
+  await orderController.acceptOrder(fakeReq({}, { id: otpOrder.id }, { id: restA, type: "restaurant" }), fakeRes());
+  const otpOrderAfterAccept = await db("orders").where({ id: otpOrder.id }).first();
+  await orderController.markPickedUp(fakeReq({}, { id: otpOrder.id }, { id: otpOrderAfterAccept.rider_id, type: "rider" }), fakeRes());
+  await orderController.markOnTheWay(fakeReq({}, { id: otpOrder.id }, { id: otpOrderAfterAccept.rider_id, type: "rider" }), fakeRes());
+  const wrongOtpRes = fakeRes();
+  await orderController.markDelivered(fakeReq({ cod_amount_collected: Number(otpOrderAfterAccept.grand_total), delivery_otp: "0000" }, { id: otpOrder.id }, { id: otpOrderAfterAccept.rider_id, type: "rider" }), wrongOtpRes);
+  check("wrong delivery_otp is rejected (400), order stays on_the_way", wrongOtpRes.statusCode === 400 && (await db("orders").where({ id: otpOrder.id }).first()).status === "on_the_way");
+  const rightOtpRes = fakeRes();
+  await orderController.markDelivered(fakeReq({ cod_amount_collected: Number(otpOrderAfterAccept.grand_total), delivery_otp: otpOrderAfterAccept.delivery_otp }, { id: otpOrder.id }, { id: otpOrderAfterAccept.rider_id, type: "rider" }), rightOtpRes);
+  check("correct delivery_otp delivers the order", rightOtpRes.statusCode === undefined && (await db("orders").where({ id: otpOrder.id }).first()).status === "delivered");
+  await orderController.skipRestaurantRating(fakeReq({}, { id: otpOrder.id }, { id: customerId, type: "customer" }), fakeRes());
+
+  console.log("\n--- Test 22: admin-imposed suspension blocks login and (for a customer) ordering ---");
+  const adminController = require("./src/controllers/admin.controller");
+  const adminCustomersCtl = require("./src/controllers/adminCustomers.controller");
+  const adminCategoriesCtl = require("./src/controllers/adminCategories.controller");
+  const authController = require("./src/controllers/auth.controller");
+  const otpUtils = require("./src/utils/otp");
+
+  const [blockableCustomerId] = await db("users").insert({ name: "Blockable", phone: "8100000001", status: "active" });
+  const blockRes = fakeRes();
+  await adminCustomersCtl.updateCustomerStatus(fakeReq({ status: "blocked" }, { id: blockableCustomerId }, adminAuth), blockRes);
+  check("PATCH /admin/customers/:id blocks a customer", blockRes.body.customer.status === "blocked");
+
+  // Real OTP hash (not a stub) so verifyOtp actually reaches the status check
+  // rather than failing on OTP verification first — this is the login-block path itself, not a proxy for it.
+  const realCustomerOtp = "1234";
+  await db("otp_verifications").insert({ phone: "8100000001", otp_hash: await otpUtils.hashOtp(realCustomerOtp), purpose: "login", expires_at: new Date(Date.now() + 60000), verified: false, attempt_count: 0 });
+  const blockedLoginRes = fakeRes();
+  await authController.verifyOtp(fakeReq({ phone: "8100000001", otp: realCustomerOtp, purpose: "login" }, {}, {}), blockedLoginRes);
+  check("a blocked customer with the CORRECT OTP still can't log in (403)", blockedLoginRes.statusCode === 403);
+
+  const blockedOrderRes = fakeRes();
+  await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "cod" }, {}, { id: blockableCustomerId, type: "customer" }), blockedOrderRes);
+  check("a blocked customer's own already-issued token still can't place an order (403)", blockedOrderRes.statusCode === 403);
+
+  const [suspendableRiderId] = await db("riders").insert({ name: "Suspendable", phone: "8500000097", status: "active" });
+  const suspendRes = fakeRes();
+  await adminController.updateRiderStatus(fakeReq({ status: "suspended" }, { id: suspendableRiderId }, adminAuth), suspendRes);
+  check("PATCH /admin/riders/:id suspends a rider, and the response never includes password_hash", suspendRes.body.rider.status === "suspended" && suspendRes.body.rider.password_hash === undefined);
+  const getRiderNoHashRes = fakeRes();
+  await adminController.getRider(fakeReq({}, { id: suspendableRiderId }, adminAuth), getRiderNoHashRes);
+  check("GET /admin/riders/:id also never includes password_hash", getRiderNoHashRes.body.rider.password_hash === undefined);
+
+  const realRiderOtp = "5678";
+  await db("otp_verifications").insert({ phone: "8500000097", otp_hash: await otpUtils.hashOtp(realRiderOtp), purpose: "rider_login", expires_at: new Date(Date.now() + 60000), verified: false, attempt_count: 0 });
+  const suspendedRiderLoginRes = fakeRes();
+  await authController.verifyOtp(fakeReq({ phone: "8500000097", otp: realRiderOtp, purpose: "rider_login" }, {}, {}), suspendedRiderLoginRes);
+  check("a suspended rider with the CORRECT OTP still can't log in (403)", suspendedRiderLoginRes.statusCode === 403);
+
+  console.log("\n--- Test 23: Admin Panel — orders (list/detail/cancel/reassign), never leaking delivery_otp ---");
+  const adminOrdersCtl = require("./src/controllers/adminOrders.controller");
+  const listAdminOrders = async (query) => { const r = fakeRes(); await adminOrdersCtl.listOrders({ query, auth: adminAuth }, r); return r; };
+  const getAdminOrder = async (id) => { const r = fakeRes(); await adminOrdersCtl.getOrder(fakeReq({}, { id }, adminAuth), r); return r; };
+
+  const l1 = await listAdminOrders({ restaurant_id: String(restA) });
+  check("GET /admin/orders?restaurant_id= filters correctly and has total/pagination", l1.body.orders.every((o) => o.restaurant_id === restA) && typeof l1.body.total === "number" && l1.body.page === 1);
+  check("list rows carry customer_name/phone, category_names, item_count", l1.body.orders.length > 0 && l1.body.orders[0].customer_name && Array.isArray(l1.body.orders[0].category_names) && l1.body.orders[0].item_count > 0);
+  const lq = await listAdminOrders({ q: String(orderId) });
+  check("q= matches by numeric order id", lq.body.orders.some((o) => o.id === orderId));
+  check("bad status filter -> 400", (await listAdminOrders({ status: "bogus" })).statusCode === 400);
+
+  const d1 = await getAdminOrder(orderId);
+  check("GET /admin/orders/:id nests customer+restaurant+rider+items+wallet_ledger as siblings of order, and never leaks delivery_otp", d1.body.order.delivery_otp === undefined && d1.body.customer.phone && d1.body.restaurant.name && Array.isArray(d1.body.items) && Array.isArray(d1.body.wallet_ledger));
+
+  const newOrderForCancel = fakeRes();
+  await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "upi" }, {}, { id: customerId, type: "customer" }), newOrderForCancel);
+  const cancelTargetId = newOrderForCancel.body.order.id;
+  await db("orders").where({ id: cancelTargetId }).update({ payment_status: "paid" });
+  const custBalBeforeAdminCancel = await wallet.getBalance("customer", customerId);
+  const adminCancelRes = fakeRes();
+  await adminOrdersCtl.cancelOrder(fakeReq({ reason: "Duplicate order" }, { id: cancelTargetId }, adminAuth), adminCancelRes);
+  check("admin cancel works even outside the customer's own buffer window, refunds if paid, and doesn't leak delivery_otp",
+    adminCancelRes.body.order.status === "cancelled" && adminCancelRes.body.order.payment_status === "refunded" &&
+    adminCancelRes.body.order.cancel_reason === "Duplicate order" && adminCancelRes.body.order.cancelled_by === "admin" &&
+    adminCancelRes.body.order.delivery_otp === undefined);
+  check("the refund actually landed in the wallet", (await wallet.getBalance("customer", customerId)) - custBalBeforeAdminCancel > 0);
+  check("cancelling an already-cancelled order -> 409", (await adminOrdersCtl.cancelOrder(fakeReq({}, { id: cancelTargetId }, adminAuth), fakeRes())).statusCode === 409);
+
+  const reassignOrderRes = fakeRes();
+  await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "cod" }, {}, { id: customerId, type: "customer" }), reassignOrderRes);
+  const reassignOrderId = reassignOrderRes.body.order.id;
+  await orderController.acceptOrder(fakeReq({}, { id: reassignOrderId }, { id: restA, type: "restaurant" }), fakeRes());
+  const [secondRiderId] = await db("riders").insert({ name: "Second Rider", phone: "8500000098", status: "active", last_known_lat: 22.58, last_known_lng: 88.47 });
+  const reassignRes = fakeRes();
+  await adminOrdersCtl.reassignRider(fakeReq({ rider_id: secondRiderId }, { id: reassignOrderId }, adminAuth), reassignRes);
+  check("admin reassign-rider updates rider_id and doesn't leak delivery_otp", reassignRes.body.order.rider_id === secondRiderId && reassignRes.body.order.delivery_otp === undefined);
+  check("reassigning to an inactive rider is refused (400)", (await adminOrdersCtl.reassignRider(fakeReq({ rider_id: suspendableRiderId }, { id: reassignOrderId }, adminAuth), fakeRes())).statusCode === 400);
+
+  console.log("\n--- Test 24: Admin Panel — riders, restaurants, categories, items lists ---");
+  const listAdminRiders = async (query) => { const r = fakeRes(); await adminController.listRiders({ query, auth: adminAuth }, r); return r; };
+  const ridersActive = await listAdminRiders({ status: "active", limit: "200" });
+  check("GET /admin/riders?status=active&limit=200 (the reassign picker's own call shape) works and excludes the suspended rider", ridersActive.body.riders.every((r) => r.id !== suspendableRiderId) && ridersActive.body.limit === 200);
+  check("rider rows carry cod_liability_outstanding / unsettled_delivery_count, never password_hash", ridersActive.body.riders.every((r) => r.password_hash === undefined) && typeof ridersActive.body.riders[0].cod_liability_outstanding === "number");
+
+  const listRestaurantsRes = fakeRes();
+  await restaurantController.listRestaurants({ query: {} }, listRestaurantsRes);
+  check("GET /admin/restaurants never leaks password_hash and has order_count/total", listRestaurantsRes.body.restaurants.every((r) => r.password_hash === undefined) && typeof listRestaurantsRes.body.restaurants[0].order_count === "number" && typeof listRestaurantsRes.body.total === "number");
+  const restDetailRes = fakeRes();
+  await restaurantController.getRestaurantDetail(fakeReq({}, { id: restA }, adminAuth), restDetailRes);
+  check("GET /admin/restaurants/:id has categories/order_count/rating/commission_config_history and no password_hash", restDetailRes.body.restaurant.password_hash === undefined && Array.isArray(restDetailRes.body.categories) && typeof restDetailRes.body.order_count === "number" && Array.isArray(restDetailRes.body.commission_config_history));
+
+  const rmCatRes = fakeRes();
+  await restaurantController.removeRestaurantCategory(fakeReq({}, { id: restB, categoryId: southIndianCatId }, adminAuth), rmCatRes);
+  check("DELETE /admin/restaurants/:id/categories/:categoryId removes it", rmCatRes.statusCode === undefined || rmCatRes.body.message === "Category removed");
+  check("...and it's actually gone", !(await db("restaurant_categories").where({ restaurant_id: restB, category_id: southIndianCatId }).first()));
+  check("removing it again -> 404", (await (async () => { const r = fakeRes(); await restaurantController.removeRestaurantCategory(fakeReq({}, { id: restB, categoryId: southIndianCatId }, adminAuth), r); return r; })()).statusCode === 404);
+  await db("restaurant_categories").insert({ restaurant_id: restB, category_id: southIndianCatId }); // restore — later tests route clubbed carts through Restaurant B
+
+  const listAdminCategories = fakeRes();
+  await adminCategoriesCtl.listCategories({ query: {}, auth: adminAuth }, listAdminCategories);
+  check("GET /admin/categories has item_count/restaurant_count and pagination total", listAdminCategories.body.categories.find((c) => c.name === "Bengali").item_count > 0 && typeof listAdminCategories.body.total === "number");
+
+  const listAdminItems = fakeRes();
+  await adminCategoriesCtl.listItems({ query: { limit: "1" } }, listAdminItems);
+  check("GET /admin/items respects limit= (was previously ignored)", listAdminItems.body.items.length === 1 && listAdminItems.body.limit === 1);
+
+  console.log("\n--- Test 25: Admin Panel — category rename dedupe + merge ---");
+  const [dupCatId] = await db("categories").insert({ name: "Bengali Delicacies", name_normalized: require("./src/utils/categoryName").normalizeCategoryName("Bengali Delicacies") });
+  const renameClashRes = fakeRes();
+  await adminCategoriesCtl.updateCategory(fakeReq({ name: "Bengalis" }, { id: dupCatId }, adminAuth), renameClashRes); // normalizes to the exact same key as "Bengali" (plural)
+  check("admin rename into an existing category's key is refused (409 category_exists)", renameClashRes.statusCode === 409 && renameClashRes.body.code === "category_exists");
+  const renameOkRes = fakeRes();
+  await adminCategoriesCtl.updateCategory(fakeReq({ name: "Bengali Sweets Corner" }, { id: dupCatId }, adminAuth), renameOkRes);
+  check("a genuinely distinct rename succeeds", renameOkRes.statusCode === undefined || renameOkRes.body.category);
+
+  const [mergeSourceId] = await db("categories").insert({ name: "Momos Test", name_normalized: "momotest" });
+  const [mergeItemId] = await db("items").insert({ category_id: mergeSourceId, name: "Steamed Momo Test", price: 90, created_by_type: "admin" });
+  await db("restaurant_categories").insert({ restaurant_id: restA, category_id: mergeSourceId }); // restA already has Bengali — the merge target
+  const mergeRes = fakeRes();
+  await adminCategoriesCtl.mergeCategories(fakeReq({ into_category_id: bengaliCatId }, { id: mergeSourceId }, adminAuth), mergeRes);
+  check("merge moves the item to the target category", (await db("items").where({ id: mergeItemId }).first()).category_id === bengaliCatId);
+  check("merge dedupes restaurant_categories (restA already had Bengali) instead of creating a duplicate row", Number((await db("restaurant_categories").where({ restaurant_id: restA, category_id: bengaliCatId }).count({ n: "*" }).first()).n) === 1);
+  check("the source category is deactivated, not deleted", (await db("categories").where({ id: mergeSourceId }).first()).is_active === 0);
+  const postMergeDup = await addCat({ name: "Momos Test" }, restAuth); // reusing the addCat() helper from Test 17 — same merged-away name
+  check("creating a category with the now-merged-away name is refused, not silently allowed (409 category_unavailable)", postMergeDup.statusCode === 409 && postMergeDup.body.code === "category_unavailable");
+
+  console.log("\n--- Test 26: Admin Panel — customers list/detail/status/wallet-credit/export ---");
+  const listCust = async (query) => { const r = fakeRes(); await adminCustomersCtl.listCustomers({ query, auth: adminAuth }, r); return r; };
+  const custList = await listCust({});
+  check("GET /admin/customers has order_count/total_spent/promo_opt_in per row", custList.body.customers.some((c) => c.id === customerId && c.order_count > 0 && typeof c.promo_opt_in === "boolean"));
+
+  const custDetailRes = fakeRes();
+  await adminCustomersCtl.getCustomer(fakeReq({}, { id: customerId }, adminAuth), custDetailRes);
+  check("GET /admin/customers/:id has orders + wallet_ledger, and order rows never leak delivery_otp", Array.isArray(custDetailRes.body.orders) && custDetailRes.body.orders.length > 0 && custDetailRes.body.orders.every((o) => o.delivery_otp === undefined) && Array.isArray(custDetailRes.body.wallet_ledger));
+
+  const custBalBeforeCredit = await wallet.getBalance("customer", customerId);
+  const creditRes = fakeRes();
+  await adminCustomersCtl.creditCustomerWallet(fakeReq({ amount: 75, notes: "Goodwill" }, { id: customerId }, adminAuth), creditRes);
+  check("wallet-credit adds exactly the given amount via manual_adjustment", Math.abs((await wallet.getBalance("customer", customerId)) - custBalBeforeCredit - 75) < 0.01);
+  check("wallet-credit rejects a non-positive amount (400)", (await (async () => { const r = fakeRes(); await adminCustomersCtl.creditCustomerWallet(fakeReq({ amount: -5 }, { id: customerId }, adminAuth), r); return r; })()).statusCode === 400);
+
+  // CSV export: injection safety + campaign filters + blocked-customer exclusion.
+  const [csvCustomerId] = await db("users").insert({
+    name: '=cmd|"/c calc"!A1', phone: "8100000002", email: "csv@test.com", status: "active",
+    notification_prefs: JSON.stringify({ promotions: true }),
+  });
+  await db("orders").insert({
+    customer_id: csvCustomerId, restaurant_id: restA, status: "delivered", delivery_lat: 22.58, delivery_lng: 88.46,
+    delivery_address: "x", item_total: 100, grand_total: 100, payment_method: "cod", payment_status: "paid", delivered_at: new Date(),
+  });
+  const csvRes1 = { headers: {}, setHeader(k, v) { this.headers[k] = v; }, send(body) { this.body = body; } };
+  await adminCustomersCtl.exportCustomersCsv({ query: {} }, csvRes1);
+  const csvLines = csvRes1.body.split("\r\n");
+  check("CSV has a header row and the malicious name is neutralized against formula injection", csvLines[0] === "name,phone,email,order_count,total_spent,last_order_at,created_at" && csvLines.some((l) => l.startsWith('"\'=cmd')));
+  check("the blocked customer is never in the export even without any status filter passed", !csvRes1.body.includes("Blockable"));
+  const csvRes2 = { headers: {}, setHeader(k, v) { this.headers[k] = v; }, send(body) { this.body = body; } };
+  await adminCustomersCtl.exportCustomersCsv({ query: { status: "blocked" } }, csvRes2); // even an explicit attempt is ignored
+  check("passing status=blocked to export.csv does NOT surface blocked customers", !csvRes2.body.includes("Blockable"));
+  const csvRes3 = { headers: {}, setHeader(k, v) { this.headers[k] = v; }, send(body) { this.body = body; } };
+  await adminCustomersCtl.exportCustomersCsv({ query: { min_orders: "1" } }, csvRes3);
+  check("min_orders filter works on the export", csvRes3.body.includes("csv@test.com"));
+  const csvRes4 = { headers: {}, setHeader(k, v) { this.headers[k] = v; }, send(body) { this.body = body; } };
+  await adminCustomersCtl.exportCustomersCsv({ query: { max_orders: "0" } }, csvRes4);
+  check("max_orders=0 (never ordered) excludes the customer who just ordered", !csvRes4.body.includes("csv@test.com"));
+  check("CSV response headers are set correctly", csvRes1.headers["Content-Type"].includes("text/csv") && csvRes1.headers["Content-Disposition"].includes("attachment"));
+
+  console.log("\n--- Test 27: Admin Panel — dashboard + settlements ---");
+  const dashRes = fakeRes();
+  await adminController.dashboardSummary({}, dashRes);
+  check("dashboard keeps the original fields and adds today/last7Days/statusCounts", typeof dashRes.body.totalOrders === "number" && typeof dashRes.body.today.orders === "number" && Array.isArray(dashRes.body.last7Days) && dashRes.body.last7Days.length === 7 && typeof dashRes.body.statusCounts.delivered === "number");
+
+  await settlement.settleRider(secondRiderId).catch(() => {}); // may be 0 orders, that's fine — just exercising the settlements list below
+  const settlementsRes = fakeRes();
+  await adminController.listSettlements({ query: {} }, settlementsRes);
+  check("GET /admin/settlements returns a paginated ledger-backed list", Array.isArray(settlementsRes.body.settlements) && typeof settlementsRes.body.total === "number");
 
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);

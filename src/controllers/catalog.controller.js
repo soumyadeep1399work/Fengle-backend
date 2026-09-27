@@ -398,7 +398,9 @@ async function updateItem(req, res) {
   const { id: actorId, type } = req.auth;
   const body = req.body || {};
 
-  const item = await db("items").where({ id, is_active: true }).first();
+  // Restaurants only ever act on live items; admin also needs to find an
+  // already-hidden item in order to un-hide it.
+  const item = await db("items").where({ id }).modify((qb) => { if (type !== "admin") qb.andWhere("is_active", true); }).first();
   if (!item) return res.status(404).json({ error: "Item not found" });
 
   if (type === "restaurant") {
@@ -413,12 +415,19 @@ async function updateItem(req, res) {
   }
 
   const EDITABLE = ["name", "price", "is_veg", "image_url", "description"];
-  if (!EDITABLE.some((key) => body[key] !== undefined)) {
-    return res.status(400).json({ error: `Send at least one of: ${EDITABLE.join(", ")}` });
+  if (type === "admin" && body.is_active !== undefined) {
+    if (typeof body.is_active !== "boolean") return res.status(400).json({ error: "is_active must be true or false" });
+  } else if (body.is_active !== undefined) {
+    return res.status(403).json({ error: "Only admin can change is_active" });
+  }
+  const editableKeys = type === "admin" ? [...EDITABLE, "is_active"] : EDITABLE;
+  if (!editableKeys.some((key) => body[key] !== undefined)) {
+    return res.status(400).json({ error: `Send at least one of: ${editableKeys.join(", ")}` });
   }
 
   const validated = validateItemFields(body, { partial: true });
   if (validated.error) return res.status(400).json({ error: validated.error });
+  if (type === "admin" && body.is_active !== undefined) validated.fields.is_active = body.is_active;
 
   await db("items").where({ id }).update({ ...validated.fields, updated_at: db.fn.now() });
   res.json({ item: await db("items").where({ id }).first() });

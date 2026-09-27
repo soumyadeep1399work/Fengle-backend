@@ -233,6 +233,67 @@ Product decision (2026-09-21): a kitchen can add a category itself; nothing is r
 
 ---
 
+## Admin Panel (`/admin/*`) — admin only
+
+All list endpoints accept `?page=&limit=` (default limit 50, max 200) and return `{ ..., page, limit, total }`. Money fields in list/detail rows are numbers, not decimal strings, unless noted. None of these ever return `password_hash` or `delivery_otp` — every read goes through an explicit column list or the shared `scrubDeliveryOtp`.
+
+### Dashboard
+
+`GET /admin/dashboard` → `{ totalOrders, pendingOrders, activeRestaurants, activeRiders, statusCounts: {placed,accepted,...}, restaurantsByStatus: {active,inactive,suspended}, ridersByStatus: {...}, today: { orders, gmv }, last7Days: [{date:'YYYY-MM-DD', orders, gmv}] }`. `last7Days` is always exactly 7 points, oldest first, zero-filled for quiet days — never a variable-length array. GMV = sum of `grand_total` on **delivered** orders only.
+
+### Orders
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/admin/orders?status=&q=&restaurant_id=&rider_id=&from=&to=&payment_method=` | `q` matches the order id (numeric) or a customer phone substring. `from`/`to` are ISO dates on `created_at`. Rows: `customer_id/name/phone`, `restaurant_id/name`, `rider_id/name`, `category_names` (array), `item_count`. |
+| GET | `/admin/orders/:id` | `{ order, customer: {id,name,phone,email,status}, restaurant: {id,name,phone,address,status}\|null, rider: {id,name,phone,status}\|null, items, wallet_ledger }` — siblings of `order`, not nested inside it. `items` = order_items rows + `name`/`category_name`. No `accepted_at`/`on_the_way_at` (known gap — only `picked_up_at`/`delivered_at`/`cancelled_at` exist). |
+| POST | `/admin/orders/:id/cancel` | body `{ reason? }`. Works at any pre-delivered/cancelled status, bypassing the customer's own 60s buffer rule. Sets `cancel_reason`, `cancelled_by: "admin"`; refunds to wallet if paid. 409 if already delivered/cancelled. |
+| POST | `/admin/orders/:id/reassign-rider` | body `{ rider_id }`. Only while `accepted`\|`picked_up`\|`on_the_way`; new rider must be `active`. |
+
+### Riders
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/admin/riders?q=&status=` | Rows add `cod_liability_outstanding` (positive magnitude of a negative `wallet_balance`, else 0), `unsettled_delivery_count`, `last_active_at` (`riders.updated_at` — a proxy: bumped by the availability toggle and location ping, not literally "last delivery"). |
+| GET | `/admin/riders/:id` | `{ rider: {...+ cod_liability_outstanding, unsettled_delivery_count}, wallet_ledger, orders }`. `orders` is the same row shape as `GET /admin/orders` list rows (via a shared helper), filtered to this rider. |
+| PATCH | `/admin/riders/:id` | body `{ status: 'active'\|'inactive'\|'suspended' }`. Suspended is already blocked from new auto-assignment (`autoAssignRider` only considers `active`) and from logging back in (see below). |
+| POST | `/admin/riders/:riderId/settle` | Unchanged — manual settlement trigger (no cron yet). |
+| GET | `/admin/settlements?rider_id=` | Settlement history straight from `wallet_ledger` (`settlement_payout`/`settlement_deduction` rows), joined with rider name/phone. |
+
+### Restaurants
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/admin/restaurants` | Now paginated; each row adds `order_count`. |
+| GET | `/admin/restaurants/:id` | `{ restaurant, categories: [{id,name}], order_count, rating: {avg, count}, commission_config_history }`. `rating` is the average `restaurant_rating` over this restaurant's delivered orders (same source as item ratings). |
+| PATCH | `/admin/restaurants/:id` | Unchanged, now with real `status` validation (`active`\|`inactive`\|`suspended`). A commission-rate change already wrote `commission_config_history`; routing already skips non-`active` restaurants — both confirmed, not new. |
+| POST | `/admin/restaurants/:id/categories` | Unchanged — add a served category. |
+| DELETE | `/admin/restaurants/:id/categories/:categoryId` | Remove a served category. 404 if it wasn't serving it. |
+
+### Categories & items
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/admin/categories` | Every category incl. inactive, paginated, each with `item_count`, `restaurant_count`, `created_by_restaurant_id`/`_name` (null = admin/seed). |
+| PATCH | `/admin/categories/:id` | body: any of `{ name, is_active, description, image_url, prep_time_min_minutes, prep_time_max_minutes, min_order_override }`. A rename goes through the same exact-duplicate check kitchens are held to (409 `category_exists` if it'd collide with another category's normalized name) — no fuzzy/"similar" warning for admin renames, only the hard exact-match block. |
+| POST | `/admin/categories/:id/merge` | body `{ into_category_id }`. The "Momo vs Momos" cleanup CLAUDE.md assigns here: moves every item and every restaurant's serving-relationship to the target (de-duplicating `restaurant_categories` rather than violating its unique constraint), then deactivates the source. **Does not rewrite `order_items.category_id`** — past orders keep the category they were placed under, same principle as the item-name snapshot. A category merged away stays blocked from re-creation (409 `category_unavailable`) — the existing dedupe check already covers this, no special-casing needed. |
+| GET | `/admin/items?category_id=&q=` | Paginated (previously ignored `limit` — fixed), includes inactive items. |
+| PATCH | `/items/:id` | (Existing endpoint, shared with restaurants.) Now also accepts `is_active` **for admin only** — a restaurant sending it gets 403, not silently ignored. Also now allows finding/editing an already-inactive item (needed to un-hide it), which restaurants still can't do. |
+
+### Customers
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/admin/customers?q=&status=&promo_opt_in=&min_orders=&max_orders=&inactive_days=&ordered_category_id=` | Rows: `order_count`, `total_spent` (delivered orders only), `last_order_at`, `promo_opt_in` (boolean; derived from `notification_prefs.promotions`, default true). Accepts the **same campaign filters as the export** (see below) so a preview count matches what exporting would give — `promo_opt_in` here has no default (only filters when passed), unlike the export. |
+| GET | `/admin/customers/:id` | `{ customer: {...+stats}, orders, wallet_ledger }`. `orders` uses the same shared row shape as `GET /admin/orders` (never a raw `select *`, so no `delivery_otp` leak). |
+| PATCH | `/admin/customers/:id` | body `{ status: 'active'\|'blocked' }`. Blocked = no login (`auth.controller.js`) and no ordering (`POST /orders` re-checks status even against an already-issued token). |
+| POST | `/admin/customers/:id/wallet-credit` | body `{ amount, notes? }`. Goodwill credit, ledger reason `manual_adjustment`. |
+| GET | `/admin/customers/export.csv` | Same filters, **plus `max_orders`** (new — `max_orders=0` means "never ordered"). `promo_opt_in` **defaults to `"1"`** here (opted-in only) unless explicitly set to `"0"`. **A blocked customer is excluded unconditionally** — even an explicit `status=blocked` on this endpoint is ignored, since this file is meant to be uploaded to a marketing tool. Columns: name, phone, email, order_count, total_spent, last_order_at, created_at. Cells are escaped against CSV/formula injection (a leading `= + - @` gets a neutralizing prefix) since names/emails are user-entered. |
+
+### Login/ordering enforcement (not an endpoint — a cross-cutting rule)
+
+A **blocked customer** or a **suspended rider/restaurant** cannot get a new session (`POST /auth/otp/verify` returns 403 even with the correct OTP) and, for a customer specifically, cannot place an order even on an already-issued token (`POST /orders` re-checks `users.status`). A suspended rider was already excluded from new auto-assignment (routing only considers `status: 'active'` riders); this closes the login-side gap that let a suspended/blocked account keep using a token issued before the change.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**
@@ -240,6 +301,7 @@ Product decision (2026-09-21): a kitchen can add a category itself; nothing is r
 - Invoice issuer legal name / GSTIN / FSSAI / address — `INVOICE_ISSUER_*` env vars (currently obvious placeholders).
 
 **Not built**
+- Dashboard/order/rider "Admin Panel" reads are all correctness-tested, but the customer campaign filters (`GET /admin/customers`) paginate **in-memory after the promo_opt_in JS filter** (it reads a JSON column that isn't cheaply filterable in SQL) — fine at current scale, would need revisiting if the customer base grows large.
 - **Push notifications: sending is live (2026-09-27)**, direct to FCM (see Notifications). iOS needs an APNs key added in Firebase before iPhones can receive (Phase 1.5). Still missing: tapping a push doesn't open the order in the apps yet, promotional pushes, and reading Expo's delivery receipts (only the immediate send tickets are checked).
 - **Rider phone is unmasked** on `GET /orders/:id/rider` — needs a telephony proxy before real riders handle real customer numbers.
 - **No saved payment methods** (saved cards / UPI handles) and **no direct server-side card charging** against live Razorpay.

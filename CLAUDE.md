@@ -89,6 +89,19 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
 - **Wallet** is shared infrastructure for both customer refunds/credits and
   rider COD reconciliation — see `wallet_ledger` table (owner_type/owner_id
   polymorphic pattern).
+- **Account suspension** (added 2026-09-27, Admin Panel): a **blocked**
+  customer (`users.status`) or a **suspended** rider/restaurant
+  (`riders`/`restaurants.status`) cannot get a new session — `POST
+  /auth/otp/verify` returns 403 even with the correct OTP. A blocked
+  customer additionally can't place an order even on an already-issued
+  token (`POST /orders` re-checks `users.status`, not just login).
+- **Category merge/rename cleanup is an Admin Panel job**
+  (`POST /admin/categories/:id/merge`, `PATCH /admin/categories/:id`) — the
+  actual tool referenced by the "kitchen-creatable categories" bullet above.
+  A merge moves items and restaurant-serving relationships to the target and
+  deactivates the source; it deliberately does **not** rewrite
+  `order_items.category_id` on past orders (same "never rewrite history"
+  principle as the item-name snapshot).
 
 ## Tech stack (do not deviate without updating this file)
 
@@ -118,10 +131,11 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
 fengle-backend/
   src/
     config/db.js
-    migrations/     — 27 Knex migrations (run `npx knex migrate:latest`)
+    migrations/     — 29 Knex migrations (run `npx knex migrate:latest`)
     controllers/    — auth, profile, catalog, cart, address, payment, order,
                       wallet, favorite, notification (customer-facing);
-                      restaurant, rider, admin (portal-facing)
+                      restaurant, rider, admin + adminOrders/adminCustomers/
+                      adminCategories (portal-facing)
     routes/         — one router per controller, mounted in routes/index.js
     services/       — routing (nearest-match/cascade/clubbing), commission,
                       tax (GST), payment (Razorpay + dev stub), wallet
@@ -162,8 +176,13 @@ Panel, backend order/routing/clubbing engine, Razorpay integration
 **Explicitly OUT of Phase 1** — do not build these now even if they seem
 easy: iOS app, live GPS map tracking, live chat/ticketing, AI intro-video
 clip, rider bonus engine, 2FA, advanced analytics dashboards, full
-marketing website, restaurant self-item-creation is DEFERRED (Admin-only
-item creation for Phase 1, even though the long-term rule allows both).
+marketing website.
+
+(Stale note removed 2026-09-27: this used to say restaurant item-creation
+was Admin-only for Phase 1. It isn't — restaurants have always been able to
+create AND edit items, per the "Item creation" and "Categories are
+kitchen-creatable" bullets above; that line contradicted the actual
+confirmed rule and the shipped code.)
 
 If asked to build something on this excluded list, flag it rather than
 just building it — scope creep here directly threatens the Oct 2 date.
