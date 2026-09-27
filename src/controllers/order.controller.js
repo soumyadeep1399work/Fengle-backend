@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const db = require("../config/db");
 const routing = require("../services/routing.service");
 const commission = require("../services/commission.service");
@@ -29,6 +30,23 @@ function cancellableUntil(order) {
 }
 
 const withCancelInfo = (order) => ({ ...order, cancellable_until: cancellableUntil(order) });
+
+// 4-digit code shown to the customer and read aloud to the rider at drop-off —
+// see the "delivery_otp" column/migration and markDelivered below.
+function generateDeliveryOtp() {
+  return String(crypto.randomInt(0, 10000)).padStart(4, "0");
+}
+
+/**
+ * The delivery code is how the customer proves to the rider it's really
+ * their order — it must never reach a restaurant, rider, or admin view of the
+ * same order (they're the ones who have to ask the customer for it).
+ */
+function scrubDeliveryOtp(orderFields, requesterType) {
+  if (requesterType === "customer") return orderFields;
+  const { delivery_otp, ...rest } = orderFields;
+  return rest;
+}
 
 /**
  * Server-side enforcement of the "resolve your last kitchen rating before
@@ -216,6 +234,7 @@ async function createOrderForRestaurant({ customerId, restaurant, distanceKm, ca
       grand_total: grandTotal,
       payment_method: paymentMethod,
       payment_status: "pending",
+      delivery_otp: generateDeliveryOtp(),
     });
 
     await trx("order_items").insert(
@@ -589,16 +608,25 @@ async function markOnTheWay(req, res) {
 
 /**
  * POST /orders/:id/delivered
- * body: { cod_amount_collected? } — REQUIRED for COD orders (CLAUDE.md: this
- * confirmation is the trigger that creates the wallet_ledger entry).
+ * body: { delivery_otp, cod_amount_collected? }
+ * delivery_otp is REQUIRED and must match the code the customer was shown —
+ * the rider only ever gets it by asking the customer in person (never from
+ * any API response). cod_amount_collected is REQUIRED for COD orders
+ * (CLAUDE.md: this confirmation is the trigger that creates the wallet_ledger
+ * entry). Orders placed before the delivery_otp column existed have none
+ * stored, so the code check is skipped for those rather than blocking them.
  */
 async function markDelivered(req, res) {
   const { id } = req.params;
-  const { cod_amount_collected } = req.body;
+  const { cod_amount_collected, delivery_otp } = req.body;
   const order = await db("orders").where({ id }).first();
   if (!order) return res.status(404).json({ error: "Order not found" });
   if (Number(order.rider_id) !== Number(req.auth.id)) return res.status(403).json({ error: "Not your assigned delivery" });
   if (order.status !== "on_the_way") return res.status(409).json({ error: "Order must be on the way first" });
+
+  if (order.delivery_otp && String(delivery_otp ?? "").trim() !== String(order.delivery_otp)) {
+    return res.status(400).json({ error: "Incorrect delivery code. Please confirm the code with the customer before marking this delivered." });
+  }
 
   if (order.payment_method === "cod") {
     if (cod_amount_collected == null) {
@@ -671,19 +699,22 @@ async function getOrder(req, res) {
   const restaurant = await db("restaurants").where({ id: order.restaurant_id }).select("name", "address", "lat", "lng").first();
 
   res.json({
-    order: {
-      ...withCancelInfo(order),
-      categories,
-      category_name: categories.map((c) => c.name).join(" + "),
-      cancelled: order.status === "cancelled",
-      riderRating: order.rider_rating,
-      riderRatingComment: order.rider_rating_comment,
-      restaurantRating: order.restaurant_rating,
-      restaurantRatingComment: order.restaurant_rating_comment,
-      restaurantRatingSkipped: Boolean(order.restaurant_rating_skipped),
-      rider: rider ? { name: rider.name, phone: rider.phone } : null,
-      ...restaurantContactFields(type, restaurant),
-    },
+    order: scrubDeliveryOtp(
+      {
+        ...withCancelInfo(order),
+        categories,
+        category_name: categories.map((c) => c.name).join(" + "),
+        cancelled: order.status === "cancelled",
+        riderRating: order.rider_rating,
+        riderRatingComment: order.rider_rating_comment,
+        restaurantRating: order.restaurant_rating,
+        restaurantRatingComment: order.restaurant_rating_comment,
+        restaurantRatingSkipped: Boolean(order.restaurant_rating_skipped),
+        rider: rider ? { name: rider.name, phone: rider.phone } : null,
+        ...restaurantContactFields(type, restaurant),
+      },
+      type
+    ),
     items,
   });
 }
@@ -925,10 +956,13 @@ async function listMyOrders(req, res) {
     orders: orders.map((o) => {
       const items = itemsByOrderId[o.id] || [];
       const categories = distinctCategories(items);
-      return {
-        ...withCancelInfo(o), items, categories, category_name: categories.map((c) => c.name).join(" + "),
-        ...restaurantContactFields(type, restaurantById[o.restaurant_id]),
-      };
+      return scrubDeliveryOtp(
+        {
+          ...withCancelInfo(o), items, categories, category_name: categories.map((c) => c.name).join(" + "),
+          ...restaurantContactFields(type, restaurantById[o.restaurant_id]),
+        },
+        type
+      );
     }),
   });
 }

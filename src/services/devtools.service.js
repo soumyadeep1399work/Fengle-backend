@@ -79,7 +79,9 @@ async function advanceOrder(orderId, { to } = {}) {
     } else if (from === "picked_up") {
       await call(orderController.markOnTheWay, { params: { id: order.id }, auth: { id: order.rider_id, type: "rider" } });
     } else if (from === "on_the_way") {
-      const body = order.payment_method === "cod" ? { cod_amount_collected: Number(order.grand_total) } : {};
+      // A trusted dev tool with direct DB access, so it can read the delivery
+      // code itself rather than needing it typed in — a real rider can't.
+      const body = { delivery_otp: order.delivery_otp, ...(order.payment_method === "cod" ? { cod_amount_collected: Number(order.grand_total) } : {}) };
       await call(orderController.markDelivered, { params: { id: order.id }, body, auth: { id: order.rider_id, type: "rider" } });
     }
 

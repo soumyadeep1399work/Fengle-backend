@@ -73,6 +73,13 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   restaurant** (customer never learns which kitchen cooked the order).
   Issuer GSTIN/FSSAI/name in `invoice.service.js` are env-configurable
   placeholders — the client must supply real values before go-live.
+- **Delivery confirmation OTP** (added 2026-09-27): every order gets a 4-digit
+  `delivery_otp` generated at placement, shown to the customer only (never to
+  the restaurant, rider, or admin via any read endpoint — a rider gets it only
+  by asking the customer in person at drop-off). `POST /orders/:id/delivered`
+  requires it and rejects a mismatch with 400; orders placed before this
+  feature shipped have no stored code and skip the check. A reorder is a new
+  order with its own fresh code.
 - **COD reconciliation**: rider collects cash → logged as a rider liability
   in `wallet_ledger` → netted against rider's commission earnings at
   settlement (daily/weekly) → running balance shown in rider wallet. The
