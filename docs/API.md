@@ -142,10 +142,10 @@ Order `status` ∈ `placed`\|`accepted`\|`picked_up`\|`on_the_way`\|`delivered`\
 
 | Method | Path | Auth | Body | Notes |
 |---|---|---|---|---|
-| POST | `/notifications/register-device` | customer/restaurant/rider | `{ token, platform: 'android'\|'ios' }` | `token` is the device's **Expo push token** (`ExponentPushToken[…]`). Upserts for the caller's own account, and first removes the same token from any other account (a phone only gets pushes for whoever is logged in on it). `POST /auth/logout { device_token }` unregisters it. |
+| POST | `/notifications/register-device` | customer/restaurant/rider | `{ token, platform: 'android'\|'ios' }` | `token` is the device's **native FCM registration token** (what the apps send). An Expo push token (`ExponentPushToken[…]`) is also accepted and sent via Expo. Upserts for the caller's own account, and first removes the same token from any other account (a phone only gets pushes for whoever is logged in on it). `POST /auth/logout { device_token }` unregisters it. |
 | PATCH | `/notifications/settings` | customer | any of `{ order_updates, promotions }` | Merges into existing prefs → `{ notification_prefs }`. `order_updates: false` stops the customer's order pushes. |
 
-**Sending** (`src/services/push.service.js` + `src/services/orderNotifications.service.js`): pushes go through the **Expo Push Service** (`exp.host`), which delivers via FCM using the FCM V1 key uploaded to EAS (Firebase project `fengle-1a2b3`). The server has no Firebase SDK and no extra dependency. Every message uses Android channel `orders` and carries `data: { type, orderId }`. Sending is fire-and-forget after the response (a failure is only logged), and tokens Expo reports as `DeviceNotRegistered` are deleted. If `EXPO_ACCESS_TOKEN` is set in the env, it's sent as a bearer token.
+**Sending** (`src/services/push.service.js` + `src/services/orderNotifications.service.js`): pushes go **straight to Firebase Cloud Messaging** (HTTP v1 API, Firebase project `fengle-1a2b3`). The server authenticates with the service-account JSON at `FCM_SERVICE_ACCOUNT_FILE` (kept in the gitignored `secrets/` folder) by signing an OAuth JWT with Node's `crypto`, so there's no Firebase SDK and no extra dependency. If the variable is unset, FCM pushes are skipped with a warning. Any Expo-format tokens go through the Expo Push Service instead (optional `EXPO_ACCESS_TOKEN`). Every message uses Android channel `orders` and carries `data: { type, orderId }` (string values). Sending is fire-and-forget after the response (a failure is only logged), and tokens FCM reports as `UNREGISTERED`/invalid (or Expo as `DeviceNotRegistered`) are deleted.
 
 | Event | To | `data.type` | Message |
 |---|---|---|---|
@@ -238,7 +238,7 @@ Product decision (2026-09-21): a kitchen can add a category itself; nothing is r
 - Invoice issuer legal name / GSTIN / FSSAI / address — `INVOICE_ISSUER_*` env vars (currently obvious placeholders).
 
 **Not built**
-- **Push notifications: sending is live (2026-09-27)** via the Expo Push Service (see Notifications). Still missing: tapping a push doesn't open the order in the apps yet, promotional pushes, and reading Expo's delivery receipts (only the immediate send tickets are checked).
+- **Push notifications: sending is live (2026-09-27)**, direct to FCM (see Notifications). iOS needs an APNs key added in Firebase before iPhones can receive (Phase 1.5). Still missing: tapping a push doesn't open the order in the apps yet, promotional pushes, and reading Expo's delivery receipts (only the immediate send tickets are checked).
 - **Rider phone is unmasked** on `GET /orders/:id/rider` — needs a telephony proxy before real riders handle real customer numbers.
 - **No saved payment methods** (saved cards / UPI handles) and **no direct server-side card charging** against live Razorpay.
 - **No promotional credits** (welcome credit, late-delivery goodwill) — the ledger has no such reasons; only `order_payment` / `order_refund`.
