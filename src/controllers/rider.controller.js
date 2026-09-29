@@ -1,5 +1,7 @@
 const db = require("../config/db");
 const { RIDER_RATE_PER_KM, MIN_EARNING_PER_DELIVERY } = require("../services/settlement.service");
+const { CURRENT_AGREEMENT_VERSION, agreementRequired } = require("../utils/agreement");
+const storage = require("../services/storage.service");
 
 const VEHICLE_TYPES = ["bike", "scooter", "bicycle", "car"];
 
@@ -32,8 +34,42 @@ async function getMyProfile(req, res) {
       vehicle_number: rider.vehicle_number,
       status: rider.status,
       wallet_balance: Number(rider.wallet_balance),
+      agreementRequired: agreementRequired(rider),
     },
   });
+}
+
+/**
+ * POST /riders/me/accept-agreement — same contract as the restaurant
+ * counterpart (POST /restaurants/me/accept-agreement): multipart field
+ * `selfie` + `agreement_version` (409 on mismatch), server clock only.
+ */
+async function acceptRiderAgreement(req, res) {
+  if (!req.file) {
+    return res.status(400).json({ error: "A selfie file is required (multipart/form-data, field name 'selfie')" });
+  }
+  const version = Number(req.body.agreement_version);
+  if (!Number.isInteger(version)) {
+    return res.status(400).json({ error: "agreement_version is required and must be an integer" });
+  }
+  if (version !== CURRENT_AGREEMENT_VERSION) {
+    return res.status(409).json({ error: `agreement_version mismatch — current version is ${CURRENT_AGREEMENT_VERSION}` });
+  }
+
+  const ext = storage.detectImageType(req.file.buffer);
+  if (!ext) {
+    return res.status(400).json({ error: "Only JPEG, PNG or WebP images are accepted" });
+  }
+
+  const selfiePath = await storage.saveAgreementSelfie(req.file.buffer, ext);
+  const acceptedAt = new Date();
+  await db("riders").where({ id: req.auth.id }).update({
+    agreement_accepted_at: acceptedAt,
+    agreement_version: version,
+    agreement_selfie_path: selfiePath,
+  });
+
+  res.json({ agreementAcceptedAt: acceptedAt.toISOString() });
 }
 
 /**
@@ -123,4 +159,4 @@ async function getMyAssignedOrders(req, res) {
   res.json({ orders });
 }
 
-module.exports = { getMyProfile, updateMyProfile, getMyRate, setAvailability, updateLocation, getMyAssignedOrders };
+module.exports = { getMyProfile, updateMyProfile, getMyRate, setAvailability, updateLocation, getMyAssignedOrders, acceptRiderAgreement };

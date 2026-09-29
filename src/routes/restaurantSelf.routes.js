@@ -1,5 +1,6 @@
 const express = require("express");
 const { requireAuth } = require("../middleware/auth.middleware");
+const { parseSelfie } = require("../middleware/selfieUpload.middleware");
 const restaurantController = require("../controllers/restaurant.controller");
 
 const router = express.Router();
@@ -12,5 +13,6 @@ router.get("/me", requireAuth(["restaurant"]), restaurantController.getMyRestaur
 router.get("/me/menu", requireAuth(["restaurant"]), restaurantController.getMyMenu);
 router.get("/me/category-options", requireAuth(["restaurant"]), restaurantController.getCategoryOptions);
 router.post("/me/categories", requireAuth(["restaurant"]), restaurantController.addMyCategory);
+router.post("/me/accept-agreement", requireAuth(["restaurant"]), parseSelfie, restaurantController.acceptRestaurantAgreement);
 
 module.exports = router;

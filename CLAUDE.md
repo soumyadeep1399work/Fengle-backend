@@ -102,6 +102,21 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   deactivates the source; it deliberately does **not** rewrite
   `order_items.category_id` on past orders (same "never rewrite history"
   principle as the item-name snapshot).
+- **In-app agreement + selfie verification** (added 2026-09-29, client
+  request): on top of the physical signed agreement, a restaurant/rider must
+  accept an in-app agreement with a live selfie before their app unlocks its
+  main screens (`agreementRequired` on `GET /restaurants/me`/`GET /riders/me`;
+  accepted via `POST .../me/accept-agreement`). Applies **only to accounts
+  onboarded from the migration onward** — every pre-existing row was
+  backfilled as already-accepted in the same migration, so seeded/dev
+  accounts and everyone onboarded before 2026-09-29 are permanently exempt.
+  No paid face-match/liveness API (out of scope for Oct 2) — the selfie is
+  just an evidentiary trail an admin reviews by eye via
+  `GET /admin/{restaurants,riders}/:id/agreement-selfie`, stored at an
+  internal path that's never a public URL like catalog photos. This is a
+  client-side/app gate plus an admin audit trail, **not** a server-side block
+  on order-accept or rider-assignment — see `docs/API.md` if that needs
+  tightening later.
 
 ## Tech stack (do not deviate without updating this file)
 
@@ -131,7 +146,7 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
 fengle-backend/
   src/
     config/db.js
-    migrations/     — 29 Knex migrations (run `npx knex migrate:latest`)
+    migrations/     — 30 Knex migrations (run `npx knex migrate:latest`)
     controllers/    — auth, profile, catalog, cart, address, payment, order,
                       wallet, favorite, notification (customer-facing);
                       restaurant, rider, admin + adminOrders/adminCustomers/
@@ -139,9 +154,10 @@ fengle-backend/
     routes/         — one router per controller, mounted in routes/index.js
     services/       — routing (nearest-match/cascade/clubbing), commission,
                       tax (GST), payment (Razorpay + dev stub), wallet
-                      (ledger), settlement (rider), invoice (data + PDF)
-    middleware/auth.middleware.js
-    utils/          — jwt, otp, sms, geo
+                      (ledger), settlement (rider), invoice (data + PDF),
+                      storage (uploads + agreement selfies, disk/S3)
+    middleware/     — auth, selfieUpload (multer for accept-agreement)
+    utils/          — jwt, otp, sms, geo, agreement (CURRENT_AGREEMENT_VERSION)
   scripts/create-admin.js   — the only way an admin account is created
   scripts/seed.js           — dev catalog, 7 dev restaurants, dev rider (npm run seed)
   scripts/advance-order.js  — dev-only: push an order through its status steps

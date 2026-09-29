@@ -20,6 +20,7 @@ router.post("/orders/:id/reassign-rider", adminOrders.reassignRider);
 // Riders
 router.get("/riders", adminController.listRiders);
 router.get("/riders/:id", adminController.getRider);
+router.get("/riders/:id/agreement-selfie", adminController.getRiderAgreementSelfie);
 router.patch("/riders/:id", adminController.updateRiderStatus);
 router.post("/riders/:riderId/settle", adminController.settleRider);
 router.get("/settlements", adminController.listSettlements);

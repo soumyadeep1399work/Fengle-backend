@@ -22,6 +22,13 @@ const crypto = require("crypto");
 const UPLOAD_DIR = path.join(__dirname, "../../uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
+// Agreement selfies are never public (a person's face, not a catalog photo)
+// — this directory is NOT mounted by app.js's express.static, unlike
+// UPLOAD_DIR. Only the admin streaming endpoint (adminOrders-adjacent
+// controllers) reads from here, and only after requireAuth(['admin']).
+const AGREEMENT_SELFIE_DIR = path.join(__dirname, "../../agreement-selfies");
+fs.mkdirSync(AGREEMENT_SELFIE_DIR, { recursive: true });
+
 const CONTENT_TYPE = { jpg: "image/jpeg", png: "image/png", webp: "image/webp" };
 
 let s3Client = null;
@@ -75,4 +82,61 @@ async function saveImage(buffer, ext) {
   return { name, publicPath: `/uploads/${name}` };
 }
 
-module.exports = { UPLOAD_DIR, detectImageType, saveImage };
+/**
+ * Saves an agreement selfie outside the public upload path. Returns the
+ * value to store verbatim in agreement_selfie_path — a bare filename on disk,
+ * an S3 key (prefixed "agreement-selfies/") in S3 mode. Never a URL: nothing
+ * downstream should be able to construct a public link from this value.
+ *
+ * NOTE: in S3 mode this bucket's policy grants public s3:GetObject on every
+ * key (see AWS deployment notes) — namespacing under a prefix keeps it out
+ * of the public catalog-image listing/UI, but an attacker who somehow
+ * learned the random key could still fetch it directly from S3. Revisit
+ * (e.g. a second, non-public bucket) if this needs to be airtight.
+ */
+async function saveAgreementSelfie(buffer, ext) {
+  const name = `${crypto.randomUUID()}.${ext}`;
+  const bucket = process.env.AWS_S3_BUCKET;
+
+  if (bucket) {
+    const { PutObjectCommand } = require("@aws-sdk/client-s3");
+    const key = `agreement-selfies/${name}`;
+    await getS3Client().send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: buffer,
+        ContentType: CONTENT_TYPE[ext] || "application/octet-stream",
+      })
+    );
+    return key;
+  }
+
+  await fs.promises.writeFile(path.join(AGREEMENT_SELFIE_DIR, name), buffer, { flag: "wx" });
+  return name;
+}
+
+/**
+ * Reads back a value saveAgreementSelfie() produced, for the admin streaming
+ * endpoint. storedPath always originates from our own DB column (never taken
+ * from a request path param at read time), so there's no path-traversal
+ * surface here despite the plain path.join.
+ */
+async function readAgreementSelfie(storedPath) {
+  const bucket = process.env.AWS_S3_BUCKET;
+  const ext = path.extname(storedPath).slice(1);
+  const contentType = CONTENT_TYPE[ext] || "application/octet-stream";
+
+  if (bucket) {
+    const { GetObjectCommand } = require("@aws-sdk/client-s3");
+    const result = await getS3Client().send(new GetObjectCommand({ Bucket: bucket, Key: storedPath }));
+    const chunks = [];
+    for await (const chunk of result.Body) chunks.push(chunk);
+    return { buffer: Buffer.concat(chunks), contentType: result.ContentType || contentType };
+  }
+
+  const buffer = await fs.promises.readFile(path.join(AGREEMENT_SELFIE_DIR, storedPath));
+  return { buffer, contentType };
+}
+
+module.exports = { UPLOAD_DIR, detectImageType, saveImage, saveAgreementSelfie, readAgreementSelfie };

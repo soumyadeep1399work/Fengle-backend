@@ -178,10 +178,11 @@ Errors: **400** — no file, wrong field name, more than one file, not multipart
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/restaurants/me` | The logged-in restaurant's profile → `{ restaurant: { id, name, owner_name, phone, email, address, status, categories: [{ id, name }] } }` (categories sorted by name). Never includes `password_hash`; commission rate and radius are admin-managed and not exposed. |
+| GET | `/restaurants/me` | The logged-in restaurant's profile → `{ restaurant: { id, name, owner_name, phone, email, address, status, categories: [{ id, name }], agreementRequired } }` (categories sorted by name). Never includes `password_hash`; commission rate and radius are admin-managed and not exposed. |
 | GET | `/restaurants/me/menu` | Every **active** item in the restaurant's approved categories (`restaurant_categories`), **including items currently switched off** — the customer catalog hides those, so this is the only way to find one to switch back on. → `{ items: [{ id, name, description, price, image_url, is_veg, category_id, category_name, is_available }] }`, ordered by category name then id. Unlike other item payloads `price` is a **number** here. `is_available` is `false` when there is no `restaurant_items` row (matches routing: no row = not in stock). Toggle with the existing `PATCH /restaurants/:restaurantId/items/:itemId/availability` (it creates the row if missing). |
 | GET | `/restaurants/me/category-options?q=` | The category picker. → `{ categories: [{ id, name, joined }], exact, similar }`. `categories` = **every active category** (or those whose name contains `q`, also matching the normalized name, so `q=momos` finds `Momo`), ordered by name; `joined` = this kitchen already has it. `exact` / `similar` are computed **only when `q` is non-empty** (else `null` / `[]`): `exact` = the category whose normalized name equals the normalized `q`; `similar` = up to **5** close matches, best first, never including `exact`. Independent of the customer catalog, so it still lists categories that have no stock. |
 | POST | `/restaurants/me/categories` | Body **either** `{ category_id }` (join an existing category) **or** `{ name, confirm_not_duplicate? }` (create a new one and join it) — see the subsection below. Both → 201 `{ category: { id, name } }`. |
+| POST | `/restaurants/me/accept-agreement` | `multipart/form-data`: file field `selfie` (jpeg/png/webp by magic bytes, 2MB cap — same rules as `POST /uploads/image`) + field `agreement_version` (the version the app is showing). See "In-app agreement + selfie verification" below. |
 
 Both are restaurant-token only (401 without a token, 403 for other user types). `/restaurants/me` is mounted ahead of the catalog routes so "me" is never read as a `:restaurantId`. For orders the Restaurant app uses the shared `GET /orders` (restaurants see only paid/COD orders, with `created_at` = placed time, item names and category names), `GET /orders/:id`, `accept`, `reject`, `start-preparing` and `mark-ready`.
 
@@ -215,12 +216,13 @@ Product decision (2026-09-21): a kitchen can add a category itself; nothing is r
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| GET | `/riders/me` | — | → `{ rider: { id, name, phone, vehicle_type, vehicle_number, status, wallet_balance } }`. `name`/`vehicle_type`/`vehicle_number` are `null` until set — self-serve OTP signup only ever sets `name`, and only if passed on the first verify; the onboarding flow's vehicle step happens after that, via the next endpoint. |
+| GET | `/riders/me` | — | → `{ rider: { id, name, phone, vehicle_type, vehicle_number, status, wallet_balance, agreementRequired } }`. `name`/`vehicle_type`/`vehicle_number` are `null` until set — self-serve OTP signup only ever sets `name`, and only if passed on the first verify; the onboarding flow's vehicle step happens after that, via the next endpoint. |
 | PATCH | `/riders/me` | any of `{ name, vehicle_type, vehicle_number }` | Fills in what signup doesn't collect. `name` 1–120 chars (trimmed); `vehicle_type` one of `bike`\|`scooter`\|`bicycle`\|`car` or `null`; `vehicle_number` ≤30 chars or `null` to clear it. `phone` isn't editable (login identity). Empty body → 400. → the updated profile, same shape as `GET /riders/me`. |
 | PATCH | `/riders/me/availability` | `{ status: 'active'\|'inactive' }` | |
 | PATCH | `/riders/me/location` | `{ lat, lng }` | Foreground-only ping. |
 | GET | `/riders/me/orders` | — | Active assigned deliveries, each with `restaurant_name`/`restaurant_address`/`restaurant_lat`/`restaurant_lng` (no items — use `GET /orders/:id` for those). |
 | GET | `/riders/me/rate` | — | → `{ rate_per_km, min_earning_per_delivery }` — the live `RIDER_RATE_PER_KM`/`RIDER_MIN_EARNING_PER_DELIVERY` env values `settleRider()` actually pays with. Exists so a client-side earnings estimate never drifts once these placeholders are confirmed with the client and the env vars change. |
+| POST | `/riders/me/accept-agreement` | `multipart/form-data`, same contract as `POST /restaurants/me/accept-agreement` above. | See "In-app agreement + selfie verification" below. |
 
 ## Admin (`/admin`) — admin only
 
@@ -254,8 +256,9 @@ All list endpoints accept `?page=&limit=` (default limit 50, max 200) and return
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/admin/riders?q=&status=` | Rows add `cod_liability_outstanding` (positive magnitude of a negative `wallet_balance`, else 0), `unsettled_delivery_count`, `last_active_at` (`riders.updated_at` — a proxy: bumped by the availability toggle and location ping, not literally "last delivery"). |
-| GET | `/admin/riders/:id` | `{ rider: {...+ cod_liability_outstanding, unsettled_delivery_count}, wallet_ledger, orders }`. `orders` is the same row shape as `GET /admin/orders` list rows (via a shared helper), filtered to this rider. |
+| GET | `/admin/riders?q=&status=` | Rows add `cod_liability_outstanding` (positive magnitude of a negative `wallet_balance`, else 0), `unsettled_delivery_count`, `last_active_at` (`riders.updated_at` — a proxy: bumped by the availability toggle and location ping, not literally "last delivery"), `agreementAcceptedAt`, `agreementVersion`. |
+| GET | `/admin/riders/:id` | `{ rider: {...+ cod_liability_outstanding, unsettled_delivery_count, agreementAcceptedAt, agreementVersion}, wallet_ledger, orders }`. `orders` is the same row shape as `GET /admin/orders` list rows (via a shared helper), filtered to this rider. |
+| GET | `/admin/riders/:id/agreement-selfie` | Streams the raw selfie bytes (`Content-Type` set from the stored image, no wrapper JSON). 404 `{ error }` if this rider never accepted in-app (exempt seed/dev row, or hasn't onboarded since the feature shipped). See "In-app agreement + selfie verification" below. |
 | PATCH | `/admin/riders/:id` | body `{ status: 'active'\|'inactive'\|'suspended' }`. Suspended is already blocked from new auto-assignment (`autoAssignRider` only considers `active`) and from logging back in (see below). |
 | POST | `/admin/riders/:riderId/settle` | Unchanged — manual settlement trigger (no cron yet). |
 | GET | `/admin/settlements?rider_id=` | Settlement history straight from `wallet_ledger` (`settlement_payout`/`settlement_deduction` rows), joined with rider name/phone. |
@@ -264,8 +267,9 @@ All list endpoints accept `?page=&limit=` (default limit 50, max 200) and return
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/admin/restaurants` | Now paginated; each row adds `order_count`. |
-| GET | `/admin/restaurants/:id` | `{ restaurant, categories: [{id,name}], order_count, rating: {avg, count}, commission_config_history }`. `rating` is the average `restaurant_rating` over this restaurant's delivered orders (same source as item ratings). |
+| GET | `/admin/restaurants` | Now paginated; each row adds `order_count`, `agreementAcceptedAt`, `agreementVersion`. |
+| GET | `/admin/restaurants/:id` | `{ restaurant, categories: [{id,name}], order_count, rating: {avg, count}, commission_config_history }`. `restaurant` includes `agreementAcceptedAt`/`agreementVersion`. `rating` is the average `restaurant_rating` over this restaurant's delivered orders (same source as item ratings). |
+| GET | `/admin/restaurants/:id/agreement-selfie` | Streams the raw selfie bytes (`Content-Type` set from the stored image, no wrapper JSON). 404 `{ error }` if this restaurant never accepted in-app (exempt seed/dev row, or hasn't onboarded since the feature shipped). See "In-app agreement + selfie verification" below. |
 | PATCH | `/admin/restaurants/:id` | Unchanged, now with real `status` validation (`active`\|`inactive`\|`suspended`). A commission-rate change already wrote `commission_config_history`; routing already skips non-`active` restaurants — both confirmed, not new. |
 | POST | `/admin/restaurants/:id/categories` | Unchanged — add a served category. |
 | DELETE | `/admin/restaurants/:id/categories/:categoryId` | Remove a served category. 404 if it wasn't serving it. |
@@ -294,11 +298,23 @@ All list endpoints accept `?page=&limit=` (default limit 50, max 200) and return
 
 A **blocked customer** or a **suspended rider/restaurant** cannot get a new session (`POST /auth/otp/verify` returns 403 even with the correct OTP) and, for a customer specifically, cannot place an order even on an already-issued token (`POST /orders` re-checks `users.status`). A suspended rider was already excluded from new auto-assignment (routing only considers `status: 'active'` riders); this closes the login-side gap that let a suspended/blocked account keep using a token issued before the change.
 
+## In-app agreement + selfie verification (added 2026-09-29)
+
+On top of the physical signed agreement, restaurants and riders must accept an in-app agreement with a live selfie proving it was the actual owner/rider who accepted it. **Applies to accounts onboarded from the migration onward only** — every pre-existing `restaurants`/`riders` row was backfilled (`agreement_accepted_at = created_at`, `agreement_version = CURRENT_AGREEMENT_VERSION`) in the same migration that added the columns, so seeded/dev accounts are permanently exempt without a separate flag. No paid face-match/liveness API (out of scope before Oct 2) — camera-only capture (client-enforced, not server-checked) plus this server-recorded timestamp is the evidentiary trail; an admin reviews the selfie by eye via the streaming endpoints above.
+
+- **Signal each app needs**: `GET /restaurants/me` / `GET /riders/me` → `agreementRequired: boolean`, true when `agreement_accepted_at IS NULL` or `agreement_version < CURRENT_AGREEMENT_VERSION`. Bumping the `CURRENT_AGREEMENT_VERSION` env var re-gates every account whose stored version is behind, with no data migration needed.
+- **Accepting**: `POST /restaurants/me/accept-agreement` / `POST /riders/me/accept-agreement` — multipart field `selfie` (jpeg/png/webp by magic bytes, 2MB cap) + field `agreement_version` (the version the app is currently showing). **409** if that doesn't match `CURRENT_AGREEMENT_VERSION` (blocks a stale app build from accepting an outdated version). 400 if the file or version field is missing/malformed. On success: 200 `{ agreementAcceptedAt }` (ISO string) — the timestamp is always the **server's own clock**, never anything the client sends.
+- **Storage**: the selfie is saved to `agreement_selfie_path` — an **internal path, never a public URL**. Disk mode: a dedicated `agreement-selfies/` directory that (unlike `uploads/`) is never mounted by `express.static`. S3 mode: key-prefixed `agreement-selfies/` in the same bucket as catalog photos — **note this bucket's policy grants public `s3:GetObject` on every key**, so this is "never linked anywhere" rather than cryptographically private; revisit with a second, non-public bucket if that needs to be airtight.
+- **Reviewing**: `GET /admin/restaurants/:id/agreement-selfie` / `GET /admin/riders/:id/agreement-selfie` (admin-only) stream the image bytes directly (never a redirect to a public URL) — see the Restaurants/Riders tables above. `agreementAcceptedAt`/`agreementVersion` are included on the corresponding list/detail endpoints for a review queue.
+- **Not enforced server-side on other endpoints** — this is deliberately an app-level gate (per the client's spec: fully blocks the Restaurant/Rider app's main screens client-side) plus an admin audit trail, not a backend block on order-accept/rider-assignment/etc. A restaurant or rider that hasn't accepted yet can still be routed orders/deliveries by the backend today; flag it if the client wants that tightened later.
+- Both apps' in-app agreement **text is a placeholder** — same status as the invoice issuer fields, needs real legal copy from the client before launch.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**
 - Rider earning rate (₹8/km, ₹15/delivery) — `RIDER_RATE_PER_KM` / `RIDER_MIN_EARNING_PER_DELIVERY`.
 - Invoice issuer legal name / GSTIN / FSSAI / address — `INVOICE_ISSUER_*` env vars (currently obvious placeholders).
+- Restaurant/rider in-app agreement text (both apps have TODO(client) placeholder copy — see "In-app agreement + selfie verification" above).
 
 **Not built**
 - Dashboard/order/rider "Admin Panel" reads are all correctness-tested, but the customer campaign filters (`GET /admin/customers`) paginate **in-memory after the promo_opt_in JS filter** (it reads a JSON column that isn't cheaply filterable in SQL) — fine at current scale, would need revisiting if the customer base grows large.

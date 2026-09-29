@@ -913,6 +913,95 @@ async function main() {
   await adminController.listSettlements({ query: {} }, settlementsRes);
   check("GET /admin/settlements returns a paginated ledger-backed list", Array.isArray(settlementsRes.body.settlements) && typeof settlementsRes.body.total === "number");
 
+  console.log("\n--- Test 28: In-app agreement + owner/rider selfie verification ---");
+  // restA/restB/riderId were all INSERTed by this script's own Seeding step,
+  // i.e. after the agreement-fields migration already ran on an empty table
+  // — so unlike a real pre-existing account, they're never backfilled and
+  // start gated exactly like a brand-new onboarding would.
+  const TEST_JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]); // detectImageType needs >= 12 bytes
+  const fakeStreamRes = () => {
+    const r = { headers: {} };
+    r.set = (k, v) => { r.headers[k] = v; return r; };
+    r.status = (code) => { r.statusCode = code; return r; };
+    r.json = (payload) => { r.body = payload; return r; };
+    r.send = (payload) => { r.body = payload; return r; };
+    return r;
+  };
+
+  const freshRestMe = fakeRes();
+  await restaurantController.getMyRestaurant(fakeReq({}, {}, restAuth), freshRestMe);
+  check("a restaurant onboarded after the migration starts gated (agreementRequired: true)", freshRestMe.body.restaurant.agreementRequired === true);
+
+  const noFileRes = fakeRes();
+  await restaurantController.acceptRestaurantAgreement(fakeReq({ agreement_version: "1" }, {}, restAuth), noFileRes);
+  check("accept-agreement without a file -> 400", noFileRes.statusCode === 400);
+
+  const wrongVersionRes = fakeRes();
+  await restaurantController.acceptRestaurantAgreement({ ...fakeReq({ agreement_version: "99" }, {}, restAuth), file: { buffer: TEST_JPEG } }, wrongVersionRes);
+  check("accept-agreement with the wrong version -> 409 (stale app build can't accept an outdated version)", wrongVersionRes.statusCode === 409);
+
+  const badImageRes = fakeRes();
+  await restaurantController.acceptRestaurantAgreement({ ...fakeReq({ agreement_version: "1" }, {}, restAuth), file: { buffer: Buffer.from("not an image") } }, badImageRes);
+  check("accept-agreement with non-image bytes -> 400", badImageRes.statusCode === 400);
+
+  const agreementAcceptRes = fakeRes();
+  await restaurantController.acceptRestaurantAgreement({ ...fakeReq({ agreement_version: "1" }, {}, restAuth), file: { buffer: TEST_JPEG } }, agreementAcceptRes);
+  check("accept-agreement succeeds and returns agreementAcceptedAt (server clock, not client-supplied)", agreementAcceptRes.statusCode === undefined && typeof agreementAcceptRes.body.agreementAcceptedAt === "string");
+
+  const restMeAfter = fakeRes();
+  await restaurantController.getMyRestaurant(fakeReq({}, {}, restAuth), restMeAfter);
+  check("GET /restaurants/me flips to agreementRequired: false after accepting", restMeAfter.body.restaurant.agreementRequired === false);
+
+  const adminRestList = fakeRes();
+  await restaurantController.listRestaurants({ query: {} }, adminRestList);
+  const restARow = adminRestList.body.restaurants.find((r) => r.id === restA);
+  check("GET /admin/restaurants exposes agreementAcceptedAt/agreementVersion", restARow.agreementAcceptedAt != null && restARow.agreementVersion === 1);
+
+  const adminRestDetail = fakeRes();
+  await restaurantController.getRestaurantDetail(fakeReq({}, { id: restA }, adminAuth), adminRestDetail);
+  check("GET /admin/restaurants/:id exposes agreementAcceptedAt/agreementVersion", adminRestDetail.body.restaurant.agreementVersion === 1);
+
+  const selfieRes = fakeStreamRes();
+  await restaurantController.getRestaurantAgreementSelfie(fakeReq({}, { id: restA }, adminAuth), selfieRes);
+  check("GET /admin/restaurants/:id/agreement-selfie streams the exact stored bytes with an image content-type", Buffer.isBuffer(selfieRes.body) && selfieRes.body.equals(TEST_JPEG) && selfieRes.headers["Content-Type"] === "image/jpeg");
+
+  const noSelfieRes = fakeStreamRes();
+  await restaurantController.getRestaurantAgreementSelfie(fakeReq({}, { id: restB }, adminAuth), noSelfieRes);
+  check("GET /admin/restaurants/:id/agreement-selfie 404s for a restaurant that never accepted", noSelfieRes.statusCode === 404);
+
+  // Same contract, rider side.
+  const freshRiderMe = fakeRes();
+  await riderCtl.getMyProfile(fakeReq({}, {}, { id: riderId, type: "rider" }), freshRiderMe);
+  check("a rider onboarded after the migration starts gated (agreementRequired: true)", freshRiderMe.body.rider.agreementRequired === true);
+
+  const riderWrongVersionRes = fakeRes();
+  await riderCtl.acceptRiderAgreement({ ...fakeReq({ agreement_version: "2" }, {}, { id: riderId, type: "rider" }), file: { buffer: TEST_JPEG } }, riderWrongVersionRes);
+  check("rider accept-agreement with the wrong version -> 409", riderWrongVersionRes.statusCode === 409);
+
+  const riderAcceptRes = fakeRes();
+  await riderCtl.acceptRiderAgreement({ ...fakeReq({ agreement_version: "1" }, {}, { id: riderId, type: "rider" }), file: { buffer: TEST_JPEG } }, riderAcceptRes);
+  check("rider accept-agreement succeeds and returns agreementAcceptedAt", riderAcceptRes.statusCode === undefined && typeof riderAcceptRes.body.agreementAcceptedAt === "string");
+
+  const riderMeAfter = fakeRes();
+  await riderCtl.getMyProfile(fakeReq({}, {}, { id: riderId, type: "rider" }), riderMeAfter);
+  check("GET /riders/me flips to agreementRequired: false after accepting", riderMeAfter.body.rider.agreementRequired === false);
+
+  const listAdminRidersAgreement = await listAdminRiders({});
+  const riderRow = listAdminRidersAgreement.body.riders.find((r) => r.id === riderId);
+  check("GET /admin/riders exposes agreementAcceptedAt/agreementVersion", riderRow.agreementAcceptedAt != null && riderRow.agreementVersion === 1);
+
+  const adminRiderDetail = fakeRes();
+  await adminController.getRider(fakeReq({}, { id: riderId }, adminAuth), adminRiderDetail);
+  check("GET /admin/riders/:id exposes agreementAcceptedAt/agreementVersion", adminRiderDetail.body.rider.agreementVersion === 1);
+
+  const riderSelfieRes = fakeStreamRes();
+  await adminController.getRiderAgreementSelfie(fakeReq({}, { id: riderId }, adminAuth), riderSelfieRes);
+  check("GET /admin/riders/:id/agreement-selfie streams the exact stored bytes", Buffer.isBuffer(riderSelfieRes.body) && riderSelfieRes.body.equals(TEST_JPEG));
+
+  const riderNoSelfieRes = fakeStreamRes();
+  await adminController.getRiderAgreementSelfie(fakeReq({}, { id: secondRiderId }, adminAuth), riderNoSelfieRes);
+  check("GET /admin/riders/:id/agreement-selfie 404s for a rider that never accepted", riderNoSelfieRes.statusCode === 404);
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

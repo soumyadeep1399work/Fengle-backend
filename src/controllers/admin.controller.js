@@ -2,6 +2,7 @@ const db = require("../config/db");
 const settlement = require("../services/settlement.service");
 const { paginationParams } = require("../utils/pagination");
 const { listOrdersForOwner } = require("./adminOrders.controller");
+const storage = require("../services/storage.service");
 
 // Never password_hash — every admin-facing rider read goes through this
 // column list rather than select("*")/first() on the raw table.
@@ -49,7 +50,10 @@ async function listRiders(req, res) {
     .orderBy("created_at", "desc")
     .limit(limit)
     .offset(offset)
-    .select("id", "name", "phone", "status", "wallet_balance", "vehicle_type", "vehicle_number", "updated_at", "created_at");
+    .select(
+      "id", "name", "phone", "status", "wallet_balance", "vehicle_type", "vehicle_number", "updated_at", "created_at",
+      "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion"
+    );
 
   const riderIds = riders.map((r) => r.id);
   const unsettledRows = riderIds.length
@@ -65,6 +69,7 @@ async function listRiders(req, res) {
       unsettled_delivery_count: unsettledByRider[r.id] || 0,
       vehicle_type: r.vehicle_type, vehicle_number: r.vehicle_number,
       last_active_at: r.updated_at, created_at: r.created_at,
+      agreementAcceptedAt: r.agreementAcceptedAt, agreementVersion: r.agreementVersion,
     })),
     page, limit, total: Number(total),
   });
@@ -80,7 +85,7 @@ async function getRider(req, res) {
   const { id } = req.params;
   const rider = await db("riders")
     .where({ id })
-    .select(RIDER_PUBLIC_COLUMNS)
+    .select(...RIDER_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion")
     .first();
   if (!rider) return res.status(404).json({ error: "Rider not found" });
 
@@ -98,6 +103,23 @@ async function getRider(req, res) {
     wallet_ledger: walletLedger,
     orders,
   });
+}
+
+/**
+ * GET /admin/riders/:id/agreement-selfie — admin-only, streams the raw image
+ * bytes (never a public URL — see storage.service.js). 404 if this rider
+ * never accepted in-app (exempt seed/dev rider, or not onboarded since the
+ * feature shipped).
+ */
+async function getRiderAgreementSelfie(req, res) {
+  const { id } = req.params;
+  const rider = await db("riders").where({ id }).select("agreement_selfie_path").first();
+  if (!rider || !rider.agreement_selfie_path) {
+    return res.status(404).json({ error: "No agreement selfie on file" });
+  }
+  const { buffer, contentType } = await storage.readAgreementSelfie(rider.agreement_selfie_path);
+  res.set("Content-Type", contentType);
+  res.send(buffer);
 }
 
 /**
@@ -198,5 +220,5 @@ async function dashboardSummary(req, res) {
 
 module.exports = {
   settleRider, listRiders, getRider, updateRiderStatus, listSettlements,
-  dashboardSummary,
+  dashboardSummary, getRiderAgreementSelfie,
 };

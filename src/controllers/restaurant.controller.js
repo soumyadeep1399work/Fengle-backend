@@ -2,6 +2,8 @@ const db = require("../config/db");
 const { normalizeCategoryName, findSimilar, validateCategoryName } = require("../utils/categoryName");
 const categoryService = require("../services/category.service");
 const { paginationParams } = require("../utils/pagination");
+const { CURRENT_AGREEMENT_VERSION, agreementRequired } = require("../utils/agreement");
+const storage = require("../services/storage.service");
 
 // Never password_hash — every admin-facing restaurant read goes through this
 // column list rather than select("*")/first() on the raw table.
@@ -57,7 +59,11 @@ async function listRestaurants(req, res) {
   const { page, limit, offset } = paginationParams(req);
 
   const { n: total } = await db("restaurants").count({ n: "*" }).first();
-  const restaurants = await db("restaurants").select(RESTAURANT_PUBLIC_COLUMNS).orderBy("name").limit(limit).offset(offset);
+  const restaurants = await db("restaurants")
+    .select(...RESTAURANT_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion")
+    .orderBy("name")
+    .limit(limit)
+    .offset(offset);
 
   const ids = restaurants.map((r) => r.id);
   const orderCountRows = ids.length ? await db("orders").whereIn("restaurant_id", ids).select("restaurant_id").count({ n: "*" }).groupBy("restaurant_id") : [];
@@ -136,7 +142,10 @@ async function removeRestaurantCategory(req, res) {
  */
 async function getRestaurantDetail(req, res) {
   const { id } = req.params;
-  const restaurant = await db("restaurants").where({ id }).select(RESTAURANT_PUBLIC_COLUMNS).first();
+  const restaurant = await db("restaurants")
+    .where({ id })
+    .select(...RESTAURANT_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion")
+    .first();
   if (!restaurant) return res.status(404).json({ error: "Restaurant not found" });
 
   const categories = await db("restaurant_categories")
@@ -189,8 +198,62 @@ async function getMyRestaurant(req, res) {
       address: restaurant.address,
       status: restaurant.status,
       categories,
+      agreementRequired: agreementRequired(restaurant),
     },
   });
+}
+
+/**
+ * POST /restaurants/me/accept-agreement — multipart/form-data, field `selfie`
+ * (jpeg/png/webp, 2MB cap — see selfieUpload.middleware.js) + field
+ * `agreement_version` (the version the app is showing; 409 if it doesn't
+ * match CURRENT_AGREEMENT_VERSION, so a stale app build can't accept an
+ * outdated version). agreement_accepted_at is always the server's own clock,
+ * never anything the client sends.
+ */
+async function acceptRestaurantAgreement(req, res) {
+  if (!req.file) {
+    return res.status(400).json({ error: "A selfie file is required (multipart/form-data, field name 'selfie')" });
+  }
+  const version = Number(req.body.agreement_version);
+  if (!Number.isInteger(version)) {
+    return res.status(400).json({ error: "agreement_version is required and must be an integer" });
+  }
+  if (version !== CURRENT_AGREEMENT_VERSION) {
+    return res.status(409).json({ error: `agreement_version mismatch — current version is ${CURRENT_AGREEMENT_VERSION}` });
+  }
+
+  const ext = storage.detectImageType(req.file.buffer);
+  if (!ext) {
+    return res.status(400).json({ error: "Only JPEG, PNG or WebP images are accepted" });
+  }
+
+  const selfiePath = await storage.saveAgreementSelfie(req.file.buffer, ext);
+  const acceptedAt = new Date();
+  await db("restaurants").where({ id: req.auth.id }).update({
+    agreement_accepted_at: acceptedAt,
+    agreement_version: version,
+    agreement_selfie_path: selfiePath,
+  });
+
+  res.json({ agreementAcceptedAt: acceptedAt.toISOString() });
+}
+
+/**
+ * GET /admin/restaurants/:id/agreement-selfie — admin-only, streams the raw
+ * image bytes (never a public URL — see storage.service.js). 404 if this
+ * restaurant never accepted in-app (exempt seed/dev rows, or not onboarded
+ * since the feature shipped).
+ */
+async function getRestaurantAgreementSelfie(req, res) {
+  const { id } = req.params;
+  const restaurant = await db("restaurants").where({ id }).select("agreement_selfie_path").first();
+  if (!restaurant || !restaurant.agreement_selfie_path) {
+    return res.status(404).json({ error: "No agreement selfie on file" });
+  }
+  const { buffer, contentType } = await storage.readAgreementSelfie(restaurant.agreement_selfie_path);
+  res.set("Content-Type", contentType);
+  res.send(buffer);
 }
 
 /**
@@ -380,4 +443,5 @@ async function addMyCategory(req, res) {
 module.exports = {
   onboardRestaurant, listRestaurants, updateRestaurant, addRestaurantCategory, removeRestaurantCategory, getRestaurantDetail,
   getMyRestaurant, getMyMenu, getCategoryOptions, addMyCategory,
+  acceptRestaurantAgreement, getRestaurantAgreementSelfie,
 };
