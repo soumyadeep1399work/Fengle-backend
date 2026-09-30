@@ -14,6 +14,7 @@ const paymentRoutes = require("./payment.routes");
 const favoriteRoutes = require("./favorite.routes");
 const notificationRoutes = require("./notification.routes");
 const uploadRoutes = require("./upload.routes");
+const couponRoutes = require("./coupon.routes");
 
 const router = express.Router();
 
@@ -32,6 +33,7 @@ router.use("/payments", paymentRoutes);
 router.use("/favorites", favoriteRoutes);
 router.use("/notifications", notificationRoutes);
 router.use("/uploads", uploadRoutes);
+router.use("/coupons", couponRoutes);
 
 if (process.env.NODE_ENV !== "production") {
   router.use("/dev", require("./dev.routes"));

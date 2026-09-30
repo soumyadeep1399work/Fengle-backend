@@ -38,17 +38,27 @@ function buildInvoiceNumber(order) {
  * drift between the two.
  */
 function buildInvoiceData(order, customer) {
+  const lines = [
+    { description: "Restaurant service (food items)", amount: Number(order.item_total) },
+    { description: "Packaging", amount: 0 },
+    { description: "Platform fee", amount: 0 },
+  ];
+  // GST is charged on the full, pre-discount item_total (see coupon.service.js)
+  // — the coupon is a platform-funded promo applied after tax, so it only
+  // shows up here as its own line; invoiceTotal below already nets it since
+  // grand_total was computed that way at order placement.
+  const couponDiscount = Number(order.coupon_discount_amount || 0);
+  if (couponDiscount > 0) {
+    lines.push({ description: `Coupon discount${order.coupon_code ? ` (${order.coupon_code})` : ""}`, amount: -couponDiscount });
+  }
+
   return {
     invoiceNumber: buildInvoiceNumber(order),
     orderId: order.id,
     date: order.created_at,
     issuer: ISSUER,
     billedTo: { name: customer.name, address: order.delivery_address },
-    lines: [
-      { description: "Restaurant service (food items)", amount: Number(order.item_total) },
-      { description: "Packaging", amount: 0 },
-      { description: "Platform fee", amount: 0 },
-    ],
+    lines,
     taxableValue: Number(order.item_total),
     cgstAmount: Number(order.cgst_amount),
     sgstAmount: Number(order.sgst_amount),

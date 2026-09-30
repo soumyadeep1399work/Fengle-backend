@@ -82,7 +82,7 @@ Every item payload includes `avgRating` (1 decimal, or `null` if unrated) and `r
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/cart/quote` | `{ items: [{item_id, quantity}], delivery_lat, delivery_lng }` | Server-computed pricing **and the club/lock check** for the Lock/Club kitchen sheets — call it with the *proposed* cart (including "what if I add this item from another category"). Never persists, never reveals restaurant identity. Response: `{ valid, minOrderOk, categoryIds, clubbable, isClubbed, itemTotal, deliveryFee, cgstAmount, sgstAmount, grandTotal, reason }`. `clubbable:false` (no single kitchen nearby can serve the whole cart) → show the Lock sheet; that response has no price fields. 400 only for malformed input / >2 categories. |
+| POST | `/cart/quote` | `{ items: [{item_id, quantity}], delivery_lat, delivery_lng, coupon_code? }` | Server-computed pricing **and the club/lock check** for the Lock/Club kitchen sheets — call it with the *proposed* cart (including "what if I add this item from another category"). Never persists, never reveals restaurant identity. Response: `{ valid, minOrderOk, categoryIds, clubbable, isClubbed, itemTotal, deliveryFee, cgstAmount, sgstAmount, couponDiscount, couponError, grandTotal, reason }`. `clubbable:false` (no single kitchen nearby can serve the whole cart) → show the Lock sheet; that response has no price/coupon fields. `couponDiscount` is 0 and `couponError` a reason string whenever `coupon_code` doesn't apply (invalid/expired/ineligible/below its own min order/limit already used) — `grandTotal` already nets a valid discount, the app doesn't recompute. See "Coupons" below. 400 only for malformed input / >2 categories. |
 
 ## Payments (`/payments`) — customer
 
@@ -96,7 +96,7 @@ Every item payload includes `avgRating` (1 decimal, or `null` if unrated) and `r
 
 | Method | Path | Auth | Body | Notes |
 |---|---|---|---|---|
-| POST | `/orders` | customer | `{ items: [{item_id, quantity}], delivery_lat, delivery_lng, delivery_address, payment_method }` | `payment_method` ∈ `upi`\|`card`\|`netbanking`\|`cod`\|`wallet`. Max 2 categories, min ₹50. **403 `{ error, blocking_order_id }` if the customer has an unresolved kitchen-rating gate** (see below). Routes to nearest capable restaurant; if no single restaurant serves a 2-category cart it splits into two orders (`{ message, orders: [...] }`); 409 if nothing can fulfil it. GST is `cgst_amount`+`sgst_amount` (2.5%+2.5% of `item_total`), included in `grand_total`. `wallet` debits the full amount immediately and marks it paid (402 + auto-cancel if balance is short); `cod` skips payment; others return a `payment` object. |
+| POST | `/orders` | customer | `{ items: [{item_id, quantity}], delivery_lat, delivery_lng, delivery_address, payment_method, coupon_code? }` | `payment_method` ∈ `upi`\|`card`\|`netbanking`\|`cod`\|`wallet`. Max 2 categories, min ₹50. **403 `{ error, blocking_order_id }` if the customer has an unresolved kitchen-rating gate** (see below). Routes to nearest capable restaurant; if no single restaurant serves a 2-category cart it splits into two orders (`{ message, orders: [...] }`) — **a coupon is never applied to a split order** (message says so); 409 if nothing can fulfil it. GST is `cgst_amount`+`sgst_amount` (2.5%+2.5% of `item_total`), included in `grand_total`. An invalid/expired/ineligible/limit-exceeded `coupon_code` never blocks placement — the order object gains `couponError` (a reason string) and simply isn't discounted; a valid one sets `coupon_id`/`coupon_code`/`coupon_discount_amount` and nets the discount into `grand_total`. See "Coupons" below. `wallet` debits the full amount immediately and marks it paid (402 + auto-cancel if balance is short); `cod` skips payment; others return a `payment` object. |
 | POST | `/orders/:id/confirm-payment` | customer | `{ razorpay_payment_id, razorpay_signature }` | Signature verification auto-succeeds in dev stub. |
 | POST | `/orders/:id/cancel` | customer | — | **Buffer-window rule (policy 2026-09-18):** only while status is `placed` (restaurant hasn't accepted) **and** within `ORDER_CANCEL_BUFFER_SECONDS` (default **60**, confirmed) of placing; else 409. Drive the countdown from `cancellable_until` (see below), not a client clock. Refunds to wallet if already paid. |
 | POST | `/orders/:id/rate-rider` | customer | `{ rating: 1–5, comment? }` | Only after delivery. A comment is never required server-side (the "prompt when ≤2" is UX only). |
@@ -132,6 +132,14 @@ Order `status` ∈ `placed`\|`accepted`\|`picked_up`\|`on_the_way`\|`delivered`\
 | GET | `/wallet/balance` | `{ balance }`. |
 | GET | `/wallet/ledger?limit=&offset=` | `{ ledger: [...] }`, newest first. `reason` ∈ `cod_collected`\|`settlement_payout`\|`settlement_deduction`\|`order_refund`\|`order_payment`\|`manual_adjustment`. |
 | GET | `/wallet/me` | Combined `{ balance, history }` (kept for the Rider Portal). |
+
+## Coupons (`/coupons`) — customer
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/coupons/mine` | Every currently active, in-date coupon this customer is eligible for (per its `target_type` — see below), **excluding one that's globally exhausted** (`total_usage_limit` reached by anyone). → `{ coupons: [{ id, code, title, description, discount_type, discount_value, max_discount_amount, min_order_value, valid_until, already_used }] }`. `already_used` means this customer is already at their own `usage_limit_per_user` for that coupon (default 1) — the row is still returned (so the app can show it as spent), not hidden. |
+
+See "Coupons" below (full targeting/discount/limits contract, shared by this, `POST /cart/quote`, and `POST /orders`) and the Admin Panel's own Coupons subsection for `POST`/`GET`/`PATCH /admin/coupons`.
 
 ## Favorites (`/favorites`) — customer
 
@@ -295,6 +303,14 @@ All list endpoints accept `?page=&limit=` (default limit 50, max 200) and return
 | POST | `/admin/customers/:id/wallet-credit` | body `{ amount, notes? }`. Goodwill credit, ledger reason `manual_adjustment`. |
 | GET | `/admin/customers/export.csv` | Same filters, **plus `max_orders`** (new — `max_orders=0` means "never ordered"). `promo_opt_in` **defaults to `"1"`** here (opted-in only) unless explicitly set to `"0"`. **A blocked customer is excluded unconditionally** — even an explicit `status=blocked` on this endpoint is ignored, since this file is meant to be uploaded to a marketing tool. Columns: name, phone, email, order_count, total_spent, last_order_at, created_at. Cells are escaped against CSV/formula injection (a leading `= + - @` gets a neutralizing prefix) since names/emails are user-entered. |
 
+### Coupons
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| POST | `/admin/coupons` | `{ code, title, description?, discount_type, discount_value, max_discount_amount?, min_order_value?, target_type?, target_meta?, usage_limit_per_user?, total_usage_limit?, valid_from?, valid_until?, is_active? }` | `code` is upper-cased on save, must be unique (409 otherwise). `discount_type` ∈ `flat`\|`percent`; `target_type` ∈ `all`(default)\|`new_users`\|`inactive_users`\|`selected_users` — `selected_users` requires `target_meta: { phones: [...] }` (400 without it); `inactive_users` reads `target_meta.days` (default 30). Defaults: `min_order_value` 0, `usage_limit_per_user` 1, `total_usage_limit` unlimited, `is_active` true. **If created active and already in its valid window, fans a push out** to every eligible-by-`target_type` customer who hasn't turned "Offers & news" (`notification_prefs.promotions`) off — title/body from the coupon, `data: { type: "coupon" }` (the apps deep-link a tap straight to the Coupons screen). A later `PATCH` never re-triggers this, even flipping `is_active` false→true. |
+| GET | `/admin/coupons?page=&limit=` | — | Every coupon (incl. inactive/expired), paginated, each with `redemption_count` (from `coupon_redemptions`, all customers combined). |
+| PATCH | `/admin/coupons/:id` | Any of the creatable fields above | Edit or just toggle `is_active`. Renaming `code` is safe — past orders keep their own `coupon_code` snapshot (see "Coupons" below), so this never rewrites order history. 409 if the new code collides with a different coupon. |
+
 ### Login/ordering enforcement (not an endpoint — a cross-cutting rule)
 
 A **blocked customer** or a **suspended rider/restaurant** cannot get a new session (`POST /auth/otp/verify` returns 403 even with the correct OTP) and, for a customer specifically, cannot place an order even on an already-issued token (`POST /orders` re-checks `users.status`). A suspended rider was already excluded from new auto-assignment (routing only considers `status: 'active'` riders); this closes the login-side gap that let a suspended/blocked account keep using a token issued before the change.
@@ -320,6 +336,19 @@ On top of the physical signed agreement, restaurants and riders must accept an i
 - Not enforced server-side on order placement — same app-level-gate posture as the restaurant/rider feature.
 - Terms text is a placeholder, same status as the other placeholder copy noted above.
 
+## Coupons (added 2026-09-30)
+
+Coupons are never "for everyone" by default — every coupon has a `target_type`, set by the admin at creation. `src/services/coupon.service.js` is the single place the eligibility/limit/discount logic lives, shared by `GET /coupons/mine`, `POST /cart/quote`, and `POST /orders` (and, in bulk form, the admin creation-push fan-out) — a code can never be judged valid in one of those and invalid in another.
+
+- **Targeting** (`target_type`): `all` (everyone); `new_users` (zero orders ever, of any status — even a cancelled one counts as "not new" anymore, a documented assumption); `inactive_users` (no order — any status — in `target_meta.days` days, default 30; this also covers a customer with zero orders ever, since "no order in N days" is vacuously true for them too); `selected_users` (`target_meta.phones`, an explicit list the admin pastes in).
+- **Discount math**: `flat` is a straight rupee amount; `percent` applies to `item_total` (the food subtotal, not delivery/tax), capped by `max_discount_amount` if set. Either way the discount is capped at `item_total` — a coupon can never zero out delivery fee or tax. **GST is computed on the full, pre-discount `item_total`** — the discount is a platform-funded promo applied after tax, not a menu-price cut, so it also never reduces a restaurant's `commission_amount`. None of this is client-confirmed; it's a documented default.
+- **Validation order** (`validateCoupon`): code exists → `is_active` → within `valid_from`/`valid_until` → cart meets the coupon's own `min_order_value` → `total_usage_limit` not exhausted (global) → this customer not at their own `usage_limit_per_user` (default 1) → eligible per `target_type`. Usage limits are checked **before** eligibility on purpose — redeeming a `new_users` coupon gives the customer their first order, which would otherwise flip their own eligibility to false and report the less specific "not eligible" instead of "already used" on a second attempt with the same code.
+- **Applying it**: `POST /cart/quote` and `POST /orders` both take an optional `coupon_code`. An invalid/expired/ineligible/limit-exceeded code **never blocks the cart or the order** — it just isn't discounted, with the reason surfaced as `couponError` (quote) or `order.couponError` (placement, order still 201s). A coupon is **not** applied when a clubbed cart falls back to two separate orders (`attemptClubbedFallbackSplit`) — no single obvious order to attach one discount to; the placement response's `message` says so when a code was sent.
+- **Persistence**: a successful redemption sets `orders.coupon_id`/`coupon_code`/`coupon_discount_amount` and writes a `coupon_redemptions` row (usage-limit enforcement + audit trail). `coupon_code` is a **snapshot** — same "never rewrite history" principle as the item-name snapshot, so a later coupon rename/edit never changes what an old order shows. `grand_total` already nets the discount at every point it's computed, including the two places that existed **before** this feature and recompute it later: `acceptOrder`'s dropped-unavailable-item recompute, and `rejectOrder`'s cascade-reassignment recompute — both now subtract `coupon_discount_amount` too.
+- **Cancelling voids the redemption**: customer cancel, admin cancel, and the reject-cascade "nobody else can take it" cancel path all delete the order's `coupon_redemptions` row, freeing the coupon up again — a cancelled order never actually delivered its discount, so it shouldn't burn one of the customer's uses.
+- **Invoice**: a redeemed order's `GET /orders/:id/invoice` (and PDF) gets an extra `"Coupon discount (CODE)"` line with a negative amount; `invoiceTotal` already nets it since `grand_total` was computed that way at placement.
+- **Not enforced server-side beyond redemption bookkeeping** — same app-level posture as the two agreement features above: this doesn't add any new order-placement blocking rule beyond what's described here.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**
@@ -329,11 +358,14 @@ On top of the physical signed agreement, restaurants and riders must accept an i
 
 **Not built**
 - Dashboard/order/rider "Admin Panel" reads are all correctness-tested, but the customer campaign filters (`GET /admin/customers`) paginate **in-memory after the promo_opt_in JS filter** (it reads a JSON column that isn't cheaply filterable in SQL) — fine at current scale, would need revisiting if the customer base grows large.
-- **Push notifications: sending is live (2026-09-27)**, direct to FCM (see Notifications). iOS needs an APNs key added in Firebase before iPhones can receive (Phase 1.5). Still missing: tapping a push doesn't open the order in the apps yet, promotional pushes, and reading Expo's delivery receipts (only the immediate send tickets are checked).
+- **Push notifications: sending is live (2026-09-27)**, direct to FCM (see Notifications); **promotional pushes shipped 2026-09-30** with the coupon system (`sendPromoBroadcast` in `push.service.js`, gated on `notification_prefs.promotions` — a different toggle from order-update pushes' `order_updates`). iOS needs an APNs key added in Firebase before iPhones can receive (Phase 1.5). Still missing: tapping an order-update push doesn't open the order in the apps yet, and reading Expo's delivery receipts (only the immediate send tickets are checked).
 - **Both calling directions are unmasked real phone numbers** — rider's phone on `GET /orders/:id/rider` (customer→rider), and now customer's phone via `customer_phone` on `GET /orders`/`GET /orders/:id` (rider→customer) — needs a telephony proxy before real numbers are exchanged either way.
 - **No saved payment methods** (saved cards / UPI handles) and **no direct server-side card charging** against live Razorpay.
 - **No promotional credits** (welcome credit, late-delivery goodwill) — the ledger has no such reasons; only `order_payment` / `order_refund`.
 - **No hybrid payment** (credits + UPI/card on one order) — `wallet` is all-or-nothing.
+- **`GET /coupons/mine` does one eligibility check per candidate coupon** (a DB round trip or two each) rather than a single batched query — fine while the number of live coupons stays small (this is an admin-curated list, not user-generated), would need revisiting if that assumption stops holding.
+- **A coupon is never applied to a clubbed cart's fallback split into two orders** — a deliberate scope cut, not an oversight; see "Coupons" above.
+- Coupon discount math (percent applies to `item_total`, GST computed pre-discount, discount capped at `item_total`) is a documented default, **not confirmed by the client** — revisit if it doesn't match their expectation once real coupons go live.
 - **JWT logout is client-side only** (no token blocklist).
 - No `accepted_at` / `on_the_way_at` timestamps on orders (tracking shows times only for placed/picked-up/delivered/cancelled).
 - No Razorpay webhook; no rate-limiting or body-size limits; no scheduled rider-settlement job; admin analytics beyond dashboard counts.

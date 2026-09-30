@@ -5,6 +5,7 @@ const commission = require("../services/commission.service");
 const payment = require("../services/payment.service");
 const wallet = require("../services/wallet.service");
 const { computeTax } = require("../services/tax.service");
+const couponService = require("../services/coupon.service");
 const invoice = require("../services/invoice.service");
 const { haversineDistanceKm } = require("../utils/geo");
 const { notifyLater } = require("../services/push.service");
@@ -79,7 +80,7 @@ async function findPendingRatingGateOrderId(customerId) {
  */
 async function placeOrder(req, res) {
   const customerId = req.auth.id;
-  const { items, delivery_lat, delivery_lng, delivery_address, payment_method } = req.body;
+  const { items, delivery_lat, delivery_lng, delivery_address, payment_method, coupon_code } = req.body;
 
   // Admin-blocked customers can still be holding a valid (not-yet-expired)
   // token, so the login gate alone isn't enough — check again at the point
@@ -142,19 +143,24 @@ async function placeOrder(req, res) {
   const { match, cascadeAttempts } = await routing.findRestaurantForCart(routingInput);
 
   if (match) {
-    const order = await createOrderForRestaurant({
+    const { order, couponError } = await createOrderForRestaurant({
       customerId, restaurant: match.restaurant, distanceKm: match.distanceKm,
       cartItems, deliveryLat: delivery_lat, deliveryLng: delivery_lng,
       deliveryAddress: delivery_address, paymentMethod: payment_method,
-      isClubbed: categoryIds.length === 2, cascadeAttempts,
+      isClubbed: categoryIds.length === 2, cascadeAttempts, couponCode: coupon_code,
     });
     const result = await withPaymentOrder(order, payment_method);
     if (result.error) return res.status(result.status).json({ error: result.error });
     notifyRestaurantIfVisible(result.order);
-    return res.status(201).json({ ...result, order: withCancelInfo(result.order) });
+    const responseOrder = withCancelInfo(result.order);
+    if (couponError) responseOrder.couponError = couponError; // order still placed — an invalid code just doesn't discount it
+    return res.status(201).json({ ...result, order: responseOrder });
   }
 
-  // No single restaurant could fulfil the full (possibly clubbed) cart.
+  // No single restaurant could fulfil the full (possibly clubbed) cart. A
+  // coupon (if any) is deliberately NOT applied to a clubbed fallback split —
+  // there's no single obvious order to attach one discount to, and this path
+  // is already a rare edge case (see CLAUDE.md).
   if (categoryIds.length === 2) {
     const orders = await attemptClubbedFallbackSplit({
       customerId, cartItems, categoryIds, routingInput,
@@ -173,7 +179,9 @@ async function placeOrder(req, res) {
       }
       results.forEach((r) => notifyRestaurantIfVisible(r.order));
       return res.status(201).json({
-        message: "These items are being sent as two separate orders since no single kitchen could prepare both.",
+        message: coupon_code
+          ? "These items are being sent as two separate orders since no single kitchen could prepare both. The coupon could not be applied to a split order."
+          : "These items are being sent as two separate orders since no single kitchen could prepare both.",
         orders: results.map((r) => ({ ...r, order: withCancelInfo(r.order) })),
       });
     }
@@ -200,12 +208,12 @@ async function attemptClubbedFallbackSplit({ customerId, cartItems, categoryIds,
 
   if (!resultA.match || !resultB.match) return null;
 
-  const orderA = await createOrderForRestaurant({
+  const { order: orderA } = await createOrderForRestaurant({
     customerId, restaurant: resultA.match.restaurant, distanceKm: resultA.match.distanceKm,
     cartItems: itemsA, deliveryLat, deliveryLng, deliveryAddress, paymentMethod,
     isClubbed: false, cascadeAttempts: resultA.cascadeAttempts,
   });
-  const orderB = await createOrderForRestaurant({
+  const { order: orderB } = await createOrderForRestaurant({
     customerId, restaurant: resultB.match.restaurant, distanceKm: resultB.match.distanceKm,
     cartItems: itemsB, deliveryLat, deliveryLng, deliveryAddress, paymentMethod,
     isClubbed: false, cascadeAttempts: resultB.cascadeAttempts,
@@ -215,15 +223,31 @@ async function attemptClubbedFallbackSplit({ customerId, cartItems, categoryIds,
 }
 
 /**
- * Creates one order + its order_items rows for a matched restaurant, inside a transaction.
+ * Creates one order + its order_items rows for a matched restaurant, inside a
+ * transaction. Returns { order, couponError } — couponError is set (and the
+ * order still goes through, un-discounted) when couponCode was given but
+ * turned out invalid/ineligible/expired/over its usage limit; never thrown.
  */
-async function createOrderForRestaurant({ customerId, restaurant, distanceKm, cartItems, deliveryLat, deliveryLng, deliveryAddress, paymentMethod, isClubbed, cascadeAttempts }) {
+async function createOrderForRestaurant({ customerId, restaurant, distanceKm, cartItems, deliveryLat, deliveryLng, deliveryAddress, paymentMethod, isClubbed, cascadeAttempts, couponCode }) {
   return db.transaction(async (trx) => {
     const itemTotal = cartItems.reduce((sum, i) => sum + i.unitPrice * i.quantity, 0);
     const deliveryFee = routing.computeDeliveryFee(distanceKm, restaurant);
-    const commissionAmount = commission.computeCommission(itemTotal, restaurant);
-    const { cgstAmount, sgstAmount } = computeTax(itemTotal);
-    const grandTotal = Number((itemTotal + deliveryFee + cgstAmount + sgstAmount).toFixed(2));
+    const commissionAmount = commission.computeCommission(itemTotal, restaurant); // unaffected by any coupon — platform-funded, not a restaurant cost
+    const { cgstAmount, sgstAmount } = computeTax(itemTotal); // computed on the full, pre-discount item_total
+
+    let appliedCoupon = null;
+    let couponDiscount = 0;
+    let couponError = null;
+    if (couponCode) {
+      const result = await couponService.validateCoupon({ code: couponCode, customerId, itemTotal, trx });
+      if (result.error) couponError = result.error;
+      else {
+        appliedCoupon = result.coupon;
+        couponDiscount = result.discount;
+      }
+    }
+
+    const grandTotal = Number((itemTotal + deliveryFee + cgstAmount + sgstAmount - couponDiscount).toFixed(2));
 
     const [orderId] = await trx("orders").insert({
       customer_id: customerId,
@@ -239,11 +263,24 @@ async function createOrderForRestaurant({ customerId, restaurant, distanceKm, ca
       commission_amount: commissionAmount,
       cgst_amount: cgstAmount,
       sgst_amount: sgstAmount,
+      coupon_id: appliedCoupon ? appliedCoupon.id : null,
+      coupon_code: appliedCoupon ? appliedCoupon.code : null,
+      coupon_discount_amount: couponDiscount,
       grand_total: grandTotal,
       payment_method: paymentMethod,
       payment_status: "pending",
       delivery_otp: generateDeliveryOtp(),
     });
+
+    if (appliedCoupon) {
+      await trx("coupon_redemptions").insert({
+        coupon_id: appliedCoupon.id,
+        user_id: customerId,
+        order_id: orderId,
+        discount_amount: couponDiscount,
+        redeemed_at: trx.fn.now(),
+      });
+    }
 
     await trx("order_items").insert(
       cartItems.map((i) => ({
@@ -257,7 +294,8 @@ async function createOrderForRestaurant({ customerId, restaurant, distanceKm, ca
       }))
     );
 
-    return trx("orders").where({ id: orderId }).first();
+    const order = await trx("orders").where({ id: orderId }).first();
+    return { order, couponError };
   });
 }
 
@@ -399,7 +437,7 @@ async function acceptOrder(req, res) {
       // taxable value actually left on the bill.
       const newItemTotal = Number(order.item_total) - droppedSubtotal;
       const { cgstAmount, sgstAmount } = computeTax(newItemTotal);
-      const newGrandTotal = Number((newItemTotal + Number(order.delivery_fee) + cgstAmount + sgstAmount).toFixed(2));
+      const newGrandTotal = Number((newItemTotal + Number(order.delivery_fee) + cgstAmount + sgstAmount - Number(order.coupon_discount_amount || 0)).toFixed(2));
       refundAmount = Number((Number(order.grand_total) - newGrandTotal).toFixed(2));
 
       await trx("orders").where({ id }).update({
@@ -490,7 +528,7 @@ async function rejectOrder(req, res) {
       restaurant_id: nextCandidate.restaurant.id,
       commission_amount: commissionAmount,
       delivery_fee: deliveryFee,
-      grand_total: Number((Number(order.item_total) + deliveryFee + Number(order.cgst_amount) + Number(order.sgst_amount)).toFixed(2)),
+      grand_total: Number((Number(order.item_total) + deliveryFee + Number(order.cgst_amount) + Number(order.sgst_amount) - Number(order.coupon_discount_amount || 0)).toFixed(2)),
       cascade_attempts: (order.cascade_attempts || 1) + 1,
       status: "placed", // re-enters the queue for the new restaurant
     });
@@ -505,6 +543,7 @@ async function rejectOrder(req, res) {
       await wallet.recordCustomerRefund(order.customer_id, order.id, Number(order.grand_total), "No restaurant available to fulfil order", trx);
       await trx("orders").where({ id }).update({ payment_status: "refunded" });
     }
+    await trx("coupon_redemptions").where({ order_id: id }).delete();
   });
   notifyLater(() => orderPush.orderCancelledBySystem(id));
   res.json({ message: "No further restaurants available — order cancelled and refunded if paid", reassigned: false });
@@ -541,6 +580,10 @@ async function cancelOrder(req, res) {
       await wallet.recordCustomerRefund(order.customer_id, order.id, Number(order.grand_total), "Customer cancellation", trx);
       await trx("orders").where({ id }).update({ payment_status: "refunded" });
     }
+    // A cancelled order never actually delivered its discount — voiding the
+    // redemption (no-op if none exists) frees the coupon up for reuse rather
+    // than silently burning one of the customer's uses on nothing.
+    await trx("coupon_redemptions").where({ order_id: id }).delete();
   });
 
   res.json({ message: "Order cancelled" });

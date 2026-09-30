@@ -142,6 +142,40 @@ async function customerWantsOrderUpdates(customerId) {
 }
 
 /**
+ * notification_prefs.promotions === false is the only opt-OUT signal;
+ * unset/true/null means opted in. A different toggle from order_updates
+ * above — this one gates promotional pushes (coupons), not order status.
+ */
+function promoOptIn(notificationPrefsRaw) {
+  if (!notificationPrefsRaw) return true;
+  const prefs = typeof notificationPrefsRaw === "string" ? JSON.parse(notificationPrefsRaw) : notificationPrefsRaw;
+  return prefs.promotions !== false;
+}
+
+/**
+ * Broadcasts one notification to every device belonging to the given
+ * customer ids, skipping anyone who's turned "Offers & news" off. Used for
+ * coupon-creation pushes — order-update pushes go through sendToOwner()'s
+ * own (different) preference check, never this one.
+ */
+async function sendPromoBroadcast(customerIds, { title, body, data = {} }) {
+  if (!customerIds.length) return;
+  const customers = await db("users").whereIn("id", customerIds).select("id", "notification_prefs");
+  const optedIn = customers.filter((c) => promoOptIn(c.notification_prefs)).map((c) => c.id);
+  if (!optedIn.length) return;
+
+  const rows = await db("device_tokens").where({ owner_type: "customer" }).whereIn("owner_id", optedIn).select("token");
+  const tokens = rows.map((r) => r.token);
+  if (!tokens.length) return;
+
+  const notification = { title, body, data };
+  await Promise.all([
+    sendFcm(tokens.filter((t) => !isExpoToken(t)), notification),
+    sendExpo(tokens.filter(isExpoToken), notification),
+  ]);
+}
+
+/**
  * Send one notification to every device registered to an account.
  * @param {'customer'|'restaurant'|'rider'} ownerType
  * @param {number} ownerId
@@ -171,4 +205,4 @@ function notifyLater(job) {
   });
 }
 
-module.exports = { sendToOwner, notifyLater, CHANNEL_ID };
+module.exports = { sendToOwner, notifyLater, CHANNEL_ID, promoOptIn, sendPromoBroadcast };

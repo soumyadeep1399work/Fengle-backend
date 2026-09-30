@@ -4,6 +4,7 @@ const adminController = require("../controllers/admin.controller");
 const adminOrders = require("../controllers/adminOrders.controller");
 const adminCustomers = require("../controllers/adminCustomers.controller");
 const adminCategories = require("../controllers/adminCategories.controller");
+const adminCoupons = require("../controllers/adminCoupons.controller");
 
 const router = express.Router();
 
@@ -30,6 +31,11 @@ router.get("/categories", adminCategories.listCategories);
 router.patch("/categories/:id", adminCategories.updateCategory);
 router.post("/categories/:id/merge", adminCategories.mergeCategories);
 router.get("/items", adminCategories.listItems);
+
+// Coupons
+router.post("/coupons", adminCoupons.createCoupon);
+router.get("/coupons", adminCoupons.listCoupons);
+router.patch("/coupons/:id", adminCoupons.updateCoupon);
 
 // Customers
 router.get("/customers/export.csv", adminCustomers.exportCustomersCsv); // before /:id — "export.csv" would otherwise look like an :id

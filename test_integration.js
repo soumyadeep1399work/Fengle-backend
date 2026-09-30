@@ -1042,6 +1042,156 @@ async function main() {
 
   check("customer T&C uses its OWN version lever, independent of the restaurant/rider CURRENT_AGREEMENT_VERSION", customerTermsUtil.CUSTOMER_TERMS_VERSION !== undefined && require("./src/utils/agreement").CURRENT_AGREEMENT_VERSION !== undefined);
 
+  console.log("\n--- Test 30: Coupon system — targeting, redemption, limits, and the two grand_total recompute fixes ---");
+  const adminCouponsCtl = require("./src/controllers/adminCoupons.controller");
+  const couponCtl = require("./src/controllers/coupon.controller");
+  const couponSvc = require("./src/services/coupon.service");
+
+  const createCoupon = async (body) => { const r = fakeRes(); await adminCouponsCtl.createCoupon(fakeReq(body, {}, adminAuth), r); return r; };
+  const listAdminCoupons = async (query = {}) => { const r = fakeRes(); await adminCouponsCtl.listCoupons({ query, auth: adminAuth }, r); return r; };
+  const patchCoupon = async (id, body) => { const r = fakeRes(); await adminCouponsCtl.updateCoupon(fakeReq(body, { id }, adminAuth), r); return r; };
+  const myCoupons = async (custId) => { const r = fakeRes(); await couponCtl.listMyCoupons(fakeReq({}, {}, { id: custId, type: "customer" }), r); return r; };
+
+  console.log("  (admin CRUD + validation)");
+  check("missing code -> 400", (await createCoupon({ title: "x", discount_type: "flat", discount_value: 10 })).statusCode === 400);
+  check("missing title -> 400", (await createCoupon({ code: "X", discount_type: "flat", discount_value: 10 })).statusCode === 400);
+  check("bad discount_type -> 400", (await createCoupon({ code: "X", title: "x", discount_type: "bogus", discount_value: 10 })).statusCode === 400);
+  check("bad target_type -> 400", (await createCoupon({ code: "X", title: "x", discount_type: "flat", discount_value: 10, target_type: "bogus" })).statusCode === 400);
+  check("selected_users without target_meta.phones -> 400", (await createCoupon({ code: "X", title: "x", discount_type: "flat", discount_value: 10, target_type: "selected_users" })).statusCode === 400);
+
+  const [newUserId] = await db("users").insert({ name: "New Customer", phone: "8000000090", wallet_balance: 0 });
+  const [selectedUserId] = await db("users").insert({ name: "Selected Customer", phone: "8000000091", wallet_balance: 0 });
+
+  const welcomeRes = await createCoupon({
+    code: "welcome50", title: "Welcome offer", description: "50 off your first order", discount_type: "flat", discount_value: 50,
+    min_order_value: 100, target_type: "new_users", usage_limit_per_user: 1,
+  });
+  check("create succeeds (201) and lower-cases input code is stored upper-cased", welcomeRes.statusCode === 201 && welcomeRes.body.coupon.code === "WELCOME50");
+  const welcomeCouponId = welcomeRes.body.coupon.id;
+  check("creating the same code again -> 409", (await createCoupon({ code: "WELCOME50", title: "dup", discount_type: "flat", discount_value: 10 })).statusCode === 409);
+
+  const pctRes = await createCoupon({ code: "SAVE10PCT", title: "10% off", discount_type: "percent", discount_value: 10, max_discount_amount: 30, target_type: "all" });
+  const pctCouponId = pctRes.body.coupon.id;
+
+  const vipRes = await createCoupon({ code: "VIP20", title: "VIP only", discount_type: "flat", discount_value: 20, target_type: "selected_users", target_meta: { phones: ["8000000091"] } });
+  check("selected_users coupon created", vipRes.statusCode === 201 && vipRes.body.coupon.target_type === "selected_users");
+
+  const expiredRes = await createCoupon({ code: "EXPIRED10", title: "Expired", discount_type: "flat", discount_value: 10, valid_until: "2020-01-01" });
+  check("an already-expired coupon can still be created (e.g. imported/backfilled), just never usable", expiredRes.statusCode === 201);
+
+  const adminListRes = await listAdminCoupons({ limit: "50" });
+  check("GET /admin/coupons lists them with redemption_count starting at 0", adminListRes.body.coupons.find((c) => c.code === "WELCOME50").redemption_count === 0 && typeof adminListRes.body.total === "number");
+
+  check("PATCH /admin/coupons/:id can toggle is_active", (await patchCoupon(pctCouponId, { is_active: false })).body.coupon.is_active === false);
+  await patchCoupon(pctCouponId, { is_active: true }); // restore for the tests below
+  check("PATCH into an existing code -> 409", (await patchCoupon(pctCouponId, { code: "WELCOME50" })).statusCode === 409);
+  check("PATCH empty body -> 400", (await patchCoupon(pctCouponId, {})).statusCode === 400);
+  check("PATCH unknown id -> 404", (await patchCoupon(999999, { title: "x" })).statusCode === 404);
+
+  console.log("  (GET /coupons/mine — targeting eligibility)");
+  const newUserCoupons = (await myCoupons(newUserId)).body.coupons.map((c) => c.code);
+  check("a zero-order customer sees the new_users coupon", newUserCoupons.includes("WELCOME50"));
+  check("...and the 'all' coupon", newUserCoupons.includes("SAVE10PCT"));
+  check("...but NOT the selected_users coupon (wrong phone)", !newUserCoupons.includes("VIP20"));
+  check("...and NOT the expired one", !newUserCoupons.includes("EXPIRED10"));
+
+  const selectedUserCoupons = (await myCoupons(selectedUserId)).body.coupons.map((c) => c.code);
+  check("the listed phone sees the selected_users coupon", selectedUserCoupons.includes("VIP20"));
+
+  const existingCustomerCoupons = (await myCoupons(customerId)).body.coupons.map((c) => c.code);
+  check("a customer with existing orders does NOT see the new_users coupon", !existingCustomerCoupons.includes("WELCOME50"));
+  check("...but still sees the 'all' coupon", existingCustomerCoupons.includes("SAVE10PCT"));
+
+  console.log("  (POST /cart/quote — preview, no persistence)");
+  const quoteWithCoupon = fakeRes();
+  await cartController.quoteCart(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }, { item_id: rasgullaId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, coupon_code: "welcome50" }, {}, { id: newUserId, type: "customer" }), quoteWithCoupon);
+  check("quote nets a valid coupon's discount into grandTotal", quoteWithCoupon.body.couponDiscount === 50 && quoteWithCoupon.body.couponError === null && quoteWithCoupon.body.grandTotal === Number((quoteWithCoupon.body.itemTotal + quoteWithCoupon.body.deliveryFee + quoteWithCoupon.body.cgstAmount + quoteWithCoupon.body.sgstAmount - 50).toFixed(2)));
+
+  const quoteBadCode = fakeRes();
+  await cartController.quoteCart(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }, { item_id: rasgullaId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, coupon_code: "NOPE" }, {}, { id: newUserId, type: "customer" }), quoteBadCode);
+  check("quote with an invalid code: 0 discount + an error string, price unaffected", quoteBadCode.body.couponDiscount === 0 && quoteBadCode.body.couponError === "Invalid coupon code");
+
+  const quoteBelowMin = fakeRes();
+  await cartController.quoteCart(fakeReq({ items: [{ item_id: rasgullaId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, coupon_code: "welcome50" }, {}, { id: newUserId, type: "customer" }), quoteBelowMin);
+  check("quote below the coupon's own min_order_value is rejected with a clear reason", quoteBelowMin.body.couponError && quoteBelowMin.body.couponError.includes("Minimum order value"));
+
+  console.log("  (POST /orders — real redemption, usage limits, GST/commission untouched by the discount)");
+  const couponOrderRes = fakeRes();
+  await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }, { item_id: rasgullaId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "cod", coupon_code: "welcome50" }, {}, { id: newUserId, type: "customer" }), couponOrderRes);
+  const couponOrder = couponOrderRes.body.order;
+  check("order applies the coupon: coupon_code/discount stored, grand_total nets it", couponOrder.coupon_code === "WELCOME50" && Number(couponOrder.coupon_discount_amount) === 50 && Number(couponOrder.grand_total) === Number((Number(couponOrder.item_total) + Number(couponOrder.delivery_fee) + Number(couponOrder.cgst_amount) + Number(couponOrder.sgst_amount) - 50).toFixed(2)));
+  check("GST is computed on the full pre-discount item_total, unaffected by the coupon", Math.abs(Number(couponOrder.cgst_amount) - Number(couponOrder.item_total) * 0.025) < 0.01);
+  check("a coupon_redemptions row was written", Number((await db("coupon_redemptions").where({ coupon_id: welcomeCouponId, user_id: newUserId }).count({ n: "*" }).first()).n) === 1);
+
+  const secondUseRes = fakeRes();
+  await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "cod", coupon_code: "welcome50" }, {}, { id: newUserId, type: "customer" }), secondUseRes);
+  check("re-using a usage_limit_per_user:1 coupon: order still succeeds, but with NO discount and a couponError", secondUseRes.statusCode === 201 && Number(secondUseRes.body.order.coupon_discount_amount) === 0 && secondUseRes.body.order.couponError === "You've already used this coupon the maximum number of times");
+
+  const invalidCodeOrderRes = fakeRes();
+  await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "cod", coupon_code: "TOTALLY-FAKE" }, {}, { id: customerId, type: "customer" }), invalidCodeOrderRes);
+  check("placing an order with an invalid code still succeeds, uncoupled, full price", invalidCodeOrderRes.statusCode === 201 && invalidCodeOrderRes.body.order.couponError === "Invalid coupon code" && Number(invalidCodeOrderRes.body.order.coupon_discount_amount) === 0);
+
+  console.log("  (total_usage_limit — global cap across all customers)");
+  const limitedRes = await createCoupon({ code: "LIMITED1", title: "One redemption ever", discount_type: "flat", discount_value: 15, total_usage_limit: 1 });
+  const [limitedUseA] = await db("users").insert({ name: "Limited A", phone: "8000000092", wallet_balance: 0 });
+  const [limitedUseB] = await db("users").insert({ name: "Limited B", phone: "8000000093", wallet_balance: 0 });
+  const limitedOrderA = fakeRes();
+  await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "cod", coupon_code: "LIMITED1" }, {}, { id: limitedUseA, type: "customer" }), limitedOrderA);
+  check("first customer redeems the globally-limited coupon", Number(limitedOrderA.body.order.coupon_discount_amount) === 15);
+  const limitedOrderB = fakeRes();
+  await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "cod", coupon_code: "LIMITED1" }, {}, { id: limitedUseB, type: "customer" }), limitedOrderB);
+  check("a second, different customer is blocked once total_usage_limit is hit", Number(limitedOrderB.body.order.coupon_discount_amount) === 0 && limitedOrderB.body.order.couponError === "This coupon has reached its usage limit");
+
+  console.log("  (cancelling an order frees the redemption back up)");
+  const cancelCouponOrderRes = fakeRes();
+  await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "cod", coupon_code: "SAVE10PCT" }, {}, { id: customerId, type: "customer" }), cancelCouponOrderRes);
+  const cancelCouponOrderId = cancelCouponOrderRes.body.order.id;
+  check("redemption exists right after placing", Number((await db("coupon_redemptions").where({ order_id: cancelCouponOrderId }).count({ n: "*" }).first()).n) === 1);
+  await orderController.cancelOrder(fakeReq({}, { id: cancelCouponOrderId }, { id: customerId, type: "customer" }), fakeRes());
+  check("cancelling voids the redemption (coupon freed up again)", Number((await db("coupon_redemptions").where({ order_id: cancelCouponOrderId }).count({ n: "*" }).first()).n) === 0);
+
+  console.log("  (the two grand_total recompute paths — must not silently drop the coupon discount)");
+  const acceptCouponOrderRes = fakeRes();
+  await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }, { item_id: rasgullaId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "cod", coupon_code: "SAVE10PCT" }, {}, { id: customerId, type: "customer" }), acceptCouponOrderRes);
+  const acceptCouponOrderId = acceptCouponOrderRes.body.order.id;
+  const acceptCouponOrderBefore = await db("orders").where({ id: acceptCouponOrderId }).first();
+  check("this order actually has a coupon discount to lose", Number(acceptCouponOrderBefore.coupon_discount_amount) > 0);
+  await orderController.acceptOrder(fakeReq({ unavailable_item_ids: [rasgullaId] }, { id: acceptCouponOrderId }, { id: acceptCouponOrderBefore.restaurant_id, type: "restaurant" }), fakeRes());
+  const acceptCouponOrderAfter = await db("orders").where({ id: acceptCouponOrderId }).first();
+  const expectedAcceptGrandTotal = Number((Number(acceptCouponOrderAfter.item_total) + Number(acceptCouponOrderAfter.delivery_fee) + Number(acceptCouponOrderAfter.cgst_amount) + Number(acceptCouponOrderAfter.sgst_amount) - Number(acceptCouponOrderAfter.coupon_discount_amount)).toFixed(2));
+  check("accept-with-dropped-item recompute STILL subtracts the coupon discount from the new grand_total", Number(acceptCouponOrderAfter.grand_total) === expectedAcceptGrandTotal);
+  // Free the rider (same cleanup pattern as Test 7/14/18) AND void the
+  // redemption exactly like the real cancel endpoints do — otherwise this
+  // manual DB-level "cancel" would silently burn customerId's one-time
+  // SAVE10PCT use before the reject-cascade test below gets to it.
+  await db("orders").where({ id: acceptCouponOrderId }).update({ status: "cancelled", cancelled_at: new Date(), rider_id: null });
+  await db("coupon_redemptions").where({ order_id: acceptCouponOrderId }).delete();
+
+  const rejectCouponOrderRes = fakeRes();
+  await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "cod", coupon_code: "SAVE10PCT" }, {}, { id: customerId, type: "customer" }), rejectCouponOrderRes);
+  const rejectCouponOrderId = rejectCouponOrderRes.body.order.id;
+  const rejectCouponOrderBefore = await db("orders").where({ id: rejectCouponOrderId }).first();
+  check("this order (on restA) actually has a coupon discount to lose on cascade", Number(rejectCouponOrderBefore.coupon_discount_amount) > 0 && rejectCouponOrderBefore.restaurant_id === restA);
+  await orderController.rejectOrder(fakeReq({}, { id: rejectCouponOrderId }, { id: restA, type: "restaurant" }), fakeRes());
+  const rejectCouponOrderAfter = await db("orders").where({ id: rejectCouponOrderId }).first();
+  check("reject-cascade reassigns to restB and STILL subtracts the coupon discount from the recomputed grand_total",
+    rejectCouponOrderAfter.restaurant_id === restB &&
+    Number(rejectCouponOrderAfter.grand_total) === Number((Number(rejectCouponOrderAfter.item_total) + Number(rejectCouponOrderAfter.delivery_fee) + Number(rejectCouponOrderAfter.cgst_amount) + Number(rejectCouponOrderAfter.sgst_amount) - Number(rejectCouponOrderAfter.coupon_discount_amount)).toFixed(2)));
+  await db("orders").where({ id: rejectCouponOrderId }).update({ status: "cancelled", cancelled_at: new Date(), rider_id: null });
+
+  console.log("  (invoice line item)");
+  const invoiceSvc = require("./src/services/invoice.service");
+  const invoiceOrder = await db("orders").where({ id: couponOrder.id }).first();
+  const invoiceCustomer = await db("users").where({ id: newUserId }).first();
+  const invoiceData = invoiceSvc.buildInvoiceData(invoiceOrder, invoiceCustomer);
+  check("invoice gets a negative 'Coupon discount' line naming the code, and invoiceTotal already nets it", invoiceData.lines.some((l) => l.description.includes("Coupon discount") && l.description.includes("WELCOME50") && l.amount === -50) && invoiceData.invoiceTotal === Number(invoiceOrder.grand_total));
+
+  console.log("  (bulk eligibility used for the creation push — must agree with the per-customer check)");
+  const allEligible = await couponSvc.getEligibleCustomerIds(await db("coupons").where({ id: pctCouponId }).first());
+  check("getEligibleCustomerIds('all') includes an ordinary active customer", allEligible.includes(customerId) && allEligible.includes(newUserId));
+  const vipEligible = await couponSvc.getEligibleCustomerIds(await db("coupons").where({ id: vipRes.body.coupon.id }).first());
+  check("getEligibleCustomerIds('selected_users') is exactly the listed phone's account, not everyone", vipEligible.includes(selectedUserId) && !vipEligible.includes(customerId) && !vipEligible.includes(newUserId));
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

@@ -1,6 +1,7 @@
 const db = require("../config/db");
 const routing = require("../services/routing.service");
 const { computeTax } = require("../services/tax.service");
+const couponService = require("../services/coupon.service");
 
 const MIN_ORDER_VALUE = 50; // keep in sync with order.controller.js
 
@@ -16,7 +17,7 @@ const MIN_ORDER_VALUE = 50; // keep in sync with order.controller.js
  * customer — only whether a single kitchen can serve the whole cart.
  */
 async function quoteCart(req, res) {
-  const { items, delivery_lat, delivery_lng } = req.body;
+  const { items, delivery_lat, delivery_lng, coupon_code } = req.body;
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: "items array is required" });
@@ -74,7 +75,18 @@ async function quoteCart(req, res) {
 
   const deliveryFee = routing.computeDeliveryFee(match.distanceKm, match.restaurant);
   const { cgstAmount, sgstAmount } = computeTax(itemTotal);
-  const grandTotal = Number((itemTotal + deliveryFee + cgstAmount + sgstAmount).toFixed(2));
+
+  // Preview only — nothing persisted, no redemption row, no trx/lock. The
+  // real, race-safe check happens again inside POST /orders at placement.
+  let couponDiscount = 0;
+  let couponError = null;
+  if (coupon_code) {
+    const result = await couponService.validateCoupon({ code: coupon_code, customerId: req.auth.id, itemTotal });
+    if (result.error) couponError = result.error;
+    else couponDiscount = result.discount;
+  }
+
+  const grandTotal = Number((itemTotal + deliveryFee + cgstAmount + sgstAmount - couponDiscount).toFixed(2));
 
   res.json({
     valid: minOrderOk,
@@ -86,6 +98,8 @@ async function quoteCart(req, res) {
     deliveryFee,
     cgstAmount,
     sgstAmount,
+    couponDiscount,
+    couponError,
     grandTotal,
     reason: minOrderOk ? null : `Minimum order value is ₹${MIN_ORDER_VALUE}`,
   });

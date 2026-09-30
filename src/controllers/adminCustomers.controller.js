@@ -2,13 +2,7 @@ const db = require("../config/db");
 const wallet = require("../services/wallet.service");
 const { paginationParams } = require("../utils/pagination");
 const { listOrdersForOwner } = require("./adminOrders.controller");
-
-/** notification_prefs.promotions === false is the only opt-OUT signal; unset/true/null means opted in. */
-function promoOptIn(notificationPrefsRaw) {
-  if (!notificationPrefsRaw) return true;
-  const prefs = typeof notificationPrefsRaw === "string" ? JSON.parse(notificationPrefsRaw) : notificationPrefsRaw;
-  return prefs.promotions !== false;
-}
+const { promoOptIn } = require("../services/push.service");
 
 function customersWithOrderStats() {
   return db("users as u")

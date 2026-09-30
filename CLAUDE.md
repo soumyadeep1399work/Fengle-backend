@@ -136,6 +136,35 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   deliberately separate from `CURRENT_AGREEMENT_VERSION` above, since customer
   terms and the restaurant/rider partner agreement are different documents
   that shouldn't re-gate each other's audience when one is bumped.
+- **Targeted coupon system** (added 2026-09-30, client request): coupons are
+  never "for everyone" by default — an admin picks a `target_type` (`all`,
+  `new_users` — zero orders ever, `inactive_users` — no order in
+  `target_meta.days` days, or `selected_users` — an explicit phone list in
+  `target_meta.phones`) when creating one (`POST /admin/coupons`), and
+  creation fans a push out to every eligible, opted-in
+  (`notification_prefs.promotions`) customer. Applied at `POST /cart/quote`
+  and `POST /orders` via `coupon_code`; `src/services/coupon.service.js` is
+  the single place eligibility/limits/discount math lives, shared by both so
+  a quote preview and the real order can never disagree. Some documented,
+  not-client-confirmed design defaults: percent discounts apply to
+  `item_total` (capped by `max_discount_amount`, never exceeding
+  `item_total` either way); GST is computed on the full **pre-discount**
+  `item_total` (the discount is a platform-funded promo, not a menu-price
+  cut, so it also never reduces a restaurant's commission); an invalid/
+  expired/limit-exceeded code never blocks the order, it just doesn't
+  discount it (`couponError` surfaced on the response); a coupon is
+  deliberately **not** applied to a clubbed cart that falls back to two
+  separate orders (see `attemptClubbedFallbackSplit` in
+  `order.controller.js`) — no single obvious order to attach one discount
+  to, and that path is already a rare edge case. Cancelling a redeemed
+  order (customer, admin, or the reject-cascade "nobody else can take it"
+  path) voids its `coupon_redemptions` row so the coupon is freed up again —
+  **any future code path that force-cancels an order must do the same**,
+  or it silently burns a customer's use for nothing. Similarly, both
+  `grand_total` recompute paths that already existed before this feature
+  (`acceptOrder`'s dropped-unavailable-item recompute, `rejectOrder`'s
+  cascade-reassignment recompute) now subtract `coupon_discount_amount` —
+  don't let a future edit to either recompute drop that term again.
 
 ## Tech stack (do not deviate without updating this file)
 
@@ -165,16 +194,18 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
 fengle-backend/
   src/
     config/db.js
-    migrations/     — 31 Knex migrations (run `npx knex migrate:latest`)
+    migrations/     — 32 Knex migrations (run `npx knex migrate:latest`)
     controllers/    — auth, profile, catalog, cart, address, payment, order,
-                      wallet, favorite, notification (customer-facing);
+                      wallet, favorite, notification, coupon (customer-facing);
                       restaurant, rider, admin + adminOrders/adminCustomers/
-                      adminCategories (portal-facing)
+                      adminCategories/adminCoupons (portal-facing)
     routes/         — one router per controller, mounted in routes/index.js
     services/       — routing (nearest-match/cascade/clubbing), commission,
                       tax (GST), payment (Razorpay + dev stub), wallet
                       (ledger), settlement (rider), invoice (data + PDF),
-                      storage (uploads + agreement selfies, disk/S3)
+                      storage (uploads + agreement selfies, disk/S3),
+                      coupon (eligibility/limits/discount math, shared by
+                      cart quote + order placement + the admin push fan-out)
     middleware/     — auth, selfieUpload (multer for accept-agreement)
     utils/          — jwt, otp, sms, geo, agreement (CURRENT_AGREEMENT_VERSION,
                       restaurant/rider), customerTerms (CUSTOMER_TERMS_VERSION,
@@ -199,7 +230,8 @@ min-order override), `restaurant_categories`, `items` (`is_veg`),
 `restaurant_items`, `riders`, `orders` (status machine, GST split
 `cgst_amount`/`sgst_amount`, rider + restaurant rating columns),
 `order_items`, `wallet_ledger`, `favorites`, `device_tokens`,
-`commission_config_history`, `otp_verifications`, `admins`.
+`commission_config_history`, `otp_verifications`, `admins`, `coupons`,
+`coupon_redemptions`.
 
 Read the migration files before adding new tables — most of what you need
 has a home in this schema already.

@@ -181,6 +181,7 @@ async function cancelOrder(req, res) {
       await wallet.recordCustomerRefund(order.customer_id, order.id, Number(order.grand_total), reason ? `Admin cancellation: ${reason}` : "Admin cancellation", trx);
       await trx("orders").where({ id }).update({ payment_status: "refunded" });
     }
+    await trx("coupon_redemptions").where({ order_id: id }).delete();
   });
 
   res.json({ order: scrubDeliveryOtp(await db("orders").where({ id }).first(), "admin") });
