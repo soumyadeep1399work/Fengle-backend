@@ -51,6 +51,16 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   self-serve — this asymmetry is intentional, don't "fix" it.)
 - **Rider can see restaurant name/location. Customer never can.** This
   permission reversal is intentional.
+- **Calling works both ways once a rider is assigned** (customer→rider
+  shipped earlier; rider→customer added 2026-09-30): `GET /orders/:id` and
+  `GET /orders` expose `customer_phone` to `rider`/`admin` only, mirroring
+  `restaurantContactFields()`'s pattern (`customerContactFields()` in
+  `order.controller.js`). **Restaurants still get neither** — they only ever
+  see `delivery_address` text, never customer name/phone; that gap is
+  deliberate and unrelated to this change, don't "fix" it into symmetry.
+  Real phone number, no masking/telephony-proxy vendor on either side — a
+  known gap noted in `docs/API.md`, not something either calling direction
+  changes.
 - **No live GPS map tracking in Phase 1.** Delivery status is shown via
   discrete steps only: Order Placed → Accepted → Picked Up → On the Way →
   Delivered, pushed as notifications. A one-time ETA estimate is set at

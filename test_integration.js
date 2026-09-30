@@ -640,6 +640,7 @@ async function main() {
   const contactOrderId = afterRenameOrder.body.order.id; // fresh order on restA, still 'placed'
   const contactOrder = await db("orders").where({ id: contactOrderId }).first();
   const restaurantRow = await db("restaurants").where({ id: contactOrder.restaurant_id }).first();
+  const contactCustomerRow = await db("users").where({ id: contactOrder.customer_id }).first();
 
   const asCustomer = fakeRes();
   await orderController.getOrder(fakeReq({}, { id: contactOrderId }, { id: customerId, type: "customer" }), asCustomer);
@@ -648,10 +649,12 @@ async function main() {
   const asRestaurant = fakeRes();
   await orderController.getOrder(fakeReq({}, { id: contactOrderId }, { id: contactOrder.restaurant_id, type: "restaurant" }), asRestaurant);
   check("restaurant's own GET /orders/:id also has it (never restricted for them)", asRestaurant.body.order.restaurant_name === restaurantRow.name);
+  check("...but a restaurant still gets NO customer phone (existing, deliberate gap — not changed by adding rider->customer calling)", asRestaurant.body.order.customer_phone === undefined);
 
   const asAdmin = fakeRes();
   await orderController.getOrder(fakeReq({}, { id: contactOrderId }, { id: 1, type: "admin" }), asAdmin);
   check("admin's GET /orders/:id also has it", asAdmin.body.order.restaurant_name === restaurantRow.name);
+  check("admin's GET /orders/:id also has the customer's phone", asAdmin.body.order.customer_phone === contactCustomerRow.phone);
 
   const listCustomer = fakeRes();
   await orderController.listMyOrders(fakeReq({}, {}, { id: customerId, type: "customer" }), listCustomer);
@@ -666,10 +669,12 @@ async function main() {
   check("rider's GET /orders/:id HAS the restaurant's name, address and coordinates",
     asRider.body.order.restaurant_name === restaurantRow.name && asRider.body.order.restaurant_address === restaurantRow.address &&
     Number(asRider.body.order.restaurant_lat) === Number(restaurantRow.lat) && Number(asRider.body.order.restaurant_lng) === Number(restaurantRow.lng));
+  check("rider's GET /orders/:id ALSO now has the customer's phone (rider->customer calling)", asRider.body.order.customer_phone === contactCustomerRow.phone);
 
   const listRider = fakeRes();
   await orderController.listMyOrders(fakeReq({}, {}, { id: riderForContact, type: "rider" }), listRider);
   check("rider's GET /orders list HAS the restaurant contact fields", listRider.body.orders.find((o) => o.id === contactOrderId).restaurant_name === restaurantRow.name);
+  check("rider's GET /orders list ALSO has the customer's phone on the row", listRider.body.orders.find((o) => o.id === contactOrderId).customer_phone === contactCustomerRow.phone);
 
   const riderCtl = require("./src/controllers/rider.controller");
   const assignedRes = fakeRes();

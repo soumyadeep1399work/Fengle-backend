@@ -683,6 +683,22 @@ function restaurantContactFields(requesterType, restaurant) {
   };
 }
 
+/**
+ * Customer's phone for the requester's order view — mirrors
+ * restaurantContactFields' asymmetric-visibility idea, just the other
+ * direction: a rider already gets delivery_address text, this adds a callable
+ * number so rider->customer calling works the same way customer->rider
+ * calling already does (via the `rider` object below). Restaurants
+ * deliberately do NOT get this (they never see customer name/phone, only
+ * delivery_address — an existing, intentional gap, not something this
+ * changes). Real number, no masking/proxy vendor — same caveat that already
+ * applies to the rider's own phone shown to the customer.
+ */
+function customerContactFields(requesterType, customer) {
+  if ((requesterType !== "rider" && requesterType !== "admin") || !customer) return {};
+  return { customer_phone: customer.phone };
+}
+
 async function getOrder(req, res) {
   const { id } = req.params;
   const order = await db("orders").where({ id }).first();
@@ -705,6 +721,7 @@ async function getOrder(req, res) {
   const categories = distinctCategories(items);
   const rider = order.rider_id ? await db("riders").where({ id: order.rider_id }).select("name", "phone").first() : null;
   const restaurant = await db("restaurants").where({ id: order.restaurant_id }).select("name", "address", "lat", "lng").first();
+  const customer = type === "rider" || type === "admin" ? await db("users").where({ id: order.customer_id }).select("phone").first() : null;
 
   res.json({
     order: scrubDeliveryOtp(
@@ -720,6 +737,7 @@ async function getOrder(req, res) {
         restaurantRatingSkipped: Boolean(order.restaurant_rating_skipped),
         rider: rider ? { name: rider.name, phone: rider.phone } : null,
         ...restaurantContactFields(type, restaurant),
+        ...customerContactFields(type, customer),
       },
       type
     ),
@@ -960,6 +978,15 @@ async function listMyOrders(req, res) {
         (await db("restaurants").whereIn("id", restaurantIds).select("id", "name", "address", "lat", "lng")).map((r) => [r.id, r])
       );
 
+  // Only riders reach this endpoint needing it (customers already know their
+  // own phone; restaurants never get it, see customerContactFields above).
+  const customerIds = [...new Set(orders.map((o) => o.customer_id).filter(Boolean))];
+  const customerById = type !== "rider" || customerIds.length === 0
+    ? {}
+    : Object.fromEntries(
+        (await db("users").whereIn("id", customerIds).select("id", "phone")).map((c) => [c.id, c])
+      );
+
   res.json({
     orders: orders.map((o) => {
       const items = itemsByOrderId[o.id] || [];
@@ -968,6 +995,7 @@ async function listMyOrders(req, res) {
         {
           ...withCancelInfo(o), items, categories, category_name: categories.map((c) => c.name).join(" + "),
           ...restaurantContactFields(type, restaurantById[o.restaurant_id]),
+          ...customerContactFields(type, customerById[o.customer_id]),
         },
         type
       );
