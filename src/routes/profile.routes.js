@@ -10,5 +10,6 @@ router.get("/me", profile.getMyProfile);
 router.patch("/me", profile.updateMyProfile);
 router.patch("/preferences", profile.updatePreferences);
 router.patch("/default-address", profile.setDefaultAddress);
+router.post("/accept-agreement", profile.acceptAgreement);
 
 module.exports = router;

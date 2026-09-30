@@ -45,10 +45,11 @@ Same thing over HTTP (no auth): `POST /dev/orders/:id/advance` with optional `{ 
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| GET | `/profile/me` | — | → `{ profile: { id, name, phone, email, photo_url, veg_only, wallet_balance, notification_prefs } }`. |
+| GET | `/profile/me` | — | → `{ profile: { id, name, phone, email, photo_url, veg_only, wallet_balance, notification_prefs, agreementRequired } }`. |
 | PATCH | `/profile/me` | any of `{ name, email, photo_url }` | Phone isn't editable (it's the login identity). |
 | PATCH | `/profile/preferences` | `{ veg_only }` | Cross-device veg-only sync. |
 | PATCH | `/profile/default-address` | `{ address_id }` | Sets the default; returns the full address list. Equivalent to `PATCH /addresses/:id {is_default:true}`. |
+| POST | `/profile/accept-agreement` | `{ agreement_version }` | The Customer app's one-time T&C popup — see "Customer app T&C popup" below. **Not** the restaurant/rider agreement feature; no file upload here. |
 
 ## Addresses (`/addresses`) — customer
 
@@ -308,6 +309,16 @@ On top of the physical signed agreement, restaurants and riders must accept an i
 - **Reviewing**: `GET /admin/restaurants/:id/agreement-selfie` / `GET /admin/riders/:id/agreement-selfie` (admin-only) stream the image bytes directly (never a redirect to a public URL) — see the Restaurants/Riders tables above. `agreementAcceptedAt`/`agreementVersion` are included on the corresponding list/detail endpoints for a review queue.
 - **Not enforced server-side on other endpoints** — this is deliberately an app-level gate (per the client's spec: fully blocks the Restaurant/Rider app's main screens client-side) plus an admin audit trail, not a backend block on order-accept/rider-assignment/etc. A restaurant or rider that hasn't accepted yet can still be routed orders/deliveries by the backend today; flag it if the client wants that tightened later.
 - Both apps' in-app agreement **text is a placeholder** — same status as the invoice issuer fields, needs real legal copy from the client before launch.
+
+## Customer app T&C popup (added 2026-09-30)
+
+**Unrelated to the restaurant/rider feature above** — a lightweight, one-time terms-acceptance checkbox for customers only, no selfie, no admin review. Same backfill/exemption pattern: every pre-existing `users` row was backfilled (`agreement_accepted_at = created_at`, `agreement_version = CUSTOMER_TERMS_VERSION`) in the migration that added the columns, so existing customers are permanently exempt.
+
+- `GET /profile/me` → `agreementRequired: boolean`, true when `agreement_accepted_at IS NULL` or `agreement_version < CUSTOMER_TERMS_VERSION`.
+- `POST /profile/accept-agreement` — JSON body `{ agreement_version }` (no file). **409** if it doesn't match `CUSTOMER_TERMS_VERSION`, 400 if missing/malformed. 200 `{ agreementAcceptedAt }` (server clock only).
+- **`CUSTOMER_TERMS_VERSION` is a separate env var from `CURRENT_AGREEMENT_VERSION`** (the restaurant/rider lever) — customer terms and the restaurant/rider partner agreement are different documents; bumping one must not re-gate the other's audience.
+- Not enforced server-side on order placement — same app-level-gate posture as the restaurant/rider feature.
+- Terms text is a placeholder, same status as the other placeholder copy noted above.
 
 ## Known gaps / placeholders
 

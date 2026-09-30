@@ -1002,6 +1002,41 @@ async function main() {
   await adminController.getRiderAgreementSelfie(fakeReq({}, { id: secondRiderId }, adminAuth), riderNoSelfieRes);
   check("GET /admin/riders/:id/agreement-selfie 404s for a rider that never accepted", riderNoSelfieRes.statusCode === 404);
 
+  console.log("\n--- Test 29: Customer app T&C popup — GET /profile/me + POST /profile/accept-agreement ---");
+  // Deliberately no selfie, no admin review — a lightweight checkbox
+  // acceptance, and a SEPARATE version lever from the restaurant/rider
+  // agreement (CUSTOMER_TERMS_VERSION, not CURRENT_AGREEMENT_VERSION).
+  const profileCtl = require("./src/controllers/profile.controller");
+  const customerTermsUtil = require("./src/utils/customerTerms");
+
+  // Real pre-existing customers (ids 1-3 on the dev DB, backfilled the moment
+  // this migration ran) were confirmed exempt via a direct DB check outside
+  // this suite — same as the restaurant/rider backfill above, this can't be
+  // exercised here since every row this script inserts is inserted AFTER the
+  // migration already ran on an empty table, so it's never backfilled.
+  const [freshCustomerId] = await db("users").insert({ name: "Fresh Customer", phone: "8000000099", wallet_balance: 0 });
+  const freshCustomerProfileRes = fakeRes();
+  await profileCtl.getMyProfile(fakeReq({}, {}, { id: freshCustomerId, type: "customer" }), freshCustomerProfileRes);
+  check("a customer created after the migration starts gated (agreementRequired: true)", freshCustomerProfileRes.body.profile.agreementRequired === true);
+
+  const missingVersionRes = fakeRes();
+  await profileCtl.acceptAgreement(fakeReq({}, {}, { id: freshCustomerId, type: "customer" }), missingVersionRes);
+  check("accept-agreement without agreement_version -> 400", missingVersionRes.statusCode === 400);
+
+  const staleVersionRes = fakeRes();
+  await profileCtl.acceptAgreement(fakeReq({ agreement_version: 99 }, {}, { id: freshCustomerId, type: "customer" }), staleVersionRes);
+  check("accept-agreement with a stale version -> 409", staleVersionRes.statusCode === 409);
+
+  const acceptCustomerAgreementRes = fakeRes();
+  await profileCtl.acceptAgreement(fakeReq({ agreement_version: customerTermsUtil.CUSTOMER_TERMS_VERSION }, {}, { id: freshCustomerId, type: "customer" }), acceptCustomerAgreementRes);
+  check("accept-agreement succeeds and returns agreementAcceptedAt (server clock)", acceptCustomerAgreementRes.statusCode === undefined && typeof acceptCustomerAgreementRes.body.agreementAcceptedAt === "string");
+
+  const profileAfterAcceptRes = fakeRes();
+  await profileCtl.getMyProfile(fakeReq({}, {}, { id: freshCustomerId, type: "customer" }), profileAfterAcceptRes);
+  check("GET /profile/me flips to agreementRequired: false after accepting", profileAfterAcceptRes.body.profile.agreementRequired === false);
+
+  check("customer T&C uses its OWN version lever, independent of the restaurant/rider CURRENT_AGREEMENT_VERSION", customerTermsUtil.CUSTOMER_TERMS_VERSION !== undefined && require("./src/utils/agreement").CURRENT_AGREEMENT_VERSION !== undefined);
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

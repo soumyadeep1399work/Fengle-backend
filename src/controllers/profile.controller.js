@@ -1,4 +1,5 @@
 const db = require("../config/db");
+const { CUSTOMER_TERMS_VERSION, customerAgreementRequired } = require("../utils/customerTerms");
 
 const DEFAULT_NOTIFICATION_PREFS = { order_updates: true, promotions: true };
 
@@ -14,6 +15,7 @@ function serializeProfile(row) {
     notification_prefs: row.notification_prefs
       ? (typeof row.notification_prefs === "string" ? JSON.parse(row.notification_prefs) : row.notification_prefs)
       : DEFAULT_NOTIFICATION_PREFS,
+    agreementRequired: customerAgreementRequired(row),
   };
 }
 
@@ -82,4 +84,30 @@ async function setDefaultAddress(req, res) {
   res.json({ addresses });
 }
 
-module.exports = { getMyProfile, updateMyProfile, updatePreferences, setDefaultAddress };
+/**
+ * POST /profile/accept-agreement
+ * body: { agreement_version }
+ * The Customer app's one-time T&C popup — no file upload, unlike the
+ * restaurant/rider agreement+selfie feature. 409 if the version the app is
+ * showing is stale, so an old build can't accept an outdated version.
+ * agreement_accepted_at is always the server's own clock.
+ */
+async function acceptAgreement(req, res) {
+  const version = Number(req.body.agreement_version);
+  if (!Number.isInteger(version)) {
+    return res.status(400).json({ error: "agreement_version is required and must be an integer" });
+  }
+  if (version !== CUSTOMER_TERMS_VERSION) {
+    return res.status(409).json({ error: `agreement_version mismatch — current version is ${CUSTOMER_TERMS_VERSION}` });
+  }
+
+  const acceptedAt = new Date();
+  await db("users").where({ id: req.auth.id }).update({
+    agreement_accepted_at: acceptedAt,
+    agreement_version: version,
+  });
+
+  res.json({ agreementAcceptedAt: acceptedAt.toISOString() });
+}
+
+module.exports = { getMyProfile, updateMyProfile, updatePreferences, setDefaultAddress, acceptAgreement };

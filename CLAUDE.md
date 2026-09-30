@@ -117,6 +117,15 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   client-side/app gate plus an admin audit trail, **not** a server-side block
   on order-accept or rider-assignment — see `docs/API.md` if that needs
   tightening later.
+- **Customer app T&C popup** (added 2026-09-30, unrelated to the bullet
+  above): a lightweight, one-time terms-acceptance checkbox for customers
+  only — no selfie, no admin review. `agreementRequired` on `GET /profile/me`,
+  accepted via `POST /profile/accept-agreement` (body `{ agreement_version }`,
+  409 on a stale version). Backfilled the same way (pre-existing customers
+  exempt). Uses its **own** version lever, `CUSTOMER_TERMS_VERSION` —
+  deliberately separate from `CURRENT_AGREEMENT_VERSION` above, since customer
+  terms and the restaurant/rider partner agreement are different documents
+  that shouldn't re-gate each other's audience when one is bumped.
 
 ## Tech stack (do not deviate without updating this file)
 
@@ -146,7 +155,7 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
 fengle-backend/
   src/
     config/db.js
-    migrations/     — 30 Knex migrations (run `npx knex migrate:latest`)
+    migrations/     — 31 Knex migrations (run `npx knex migrate:latest`)
     controllers/    — auth, profile, catalog, cart, address, payment, order,
                       wallet, favorite, notification (customer-facing);
                       restaurant, rider, admin + adminOrders/adminCustomers/
@@ -157,7 +166,9 @@ fengle-backend/
                       (ledger), settlement (rider), invoice (data + PDF),
                       storage (uploads + agreement selfies, disk/S3)
     middleware/     — auth, selfieUpload (multer for accept-agreement)
-    utils/          — jwt, otp, sms, geo, agreement (CURRENT_AGREEMENT_VERSION)
+    utils/          — jwt, otp, sms, geo, agreement (CURRENT_AGREEMENT_VERSION,
+                      restaurant/rider), customerTerms (CUSTOMER_TERMS_VERSION,
+                      customer T&C — a separate lever, see business rules)
   scripts/create-admin.js   — the only way an admin account is created
   scripts/seed.js           — dev catalog, 7 dev restaurants, dev rider (npm run seed)
   scripts/advance-order.js  — dev-only: push an order through its status steps
