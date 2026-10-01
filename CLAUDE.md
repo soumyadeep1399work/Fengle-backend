@@ -177,8 +177,12 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
 - **Admin Panel**: React JS (SPA)
 - **Business Website**: React JS (standalone, separate from the above)
 - **Auth**: OTP + JWT
-- **Payments**: Razorpay, incl. Route for split settlement (subject to RBI
-  eligibility — treat as a pending external dependency, not yet live)
+- **Payments**: Razorpay. **Test-mode keys live on production since 2026-10-01**
+  (`RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` set, real Orders API + signature
+  verification confirmed working — see `docs/API.md`'s Payments section).
+  Still pending: live (non-test) keys, and Route for split settlement
+  (subject to RBI eligibility — a separate, still-pending external
+  dependency from the base payment integration above).
 - **Maps**: Google Maps API for geocoding/distance calc only (NOT live
   tracking — see above)
 - **Push**: Firebase Cloud Messaging
