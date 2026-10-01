@@ -88,7 +88,7 @@ Every item payload includes `avgRating` (1 decimal, or `null` if unrated) and `r
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| GET | `/payments/methods` | — | `{ methods: [{ id, label, enabled, balance? }], razorpay_key_id }` — `wallet` includes the Platter-credits balance. `razorpay_key_id` is the **public** key_id (safe to ship to the client — never the secret), `null` until `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` are both set in `.env`. No saved cards/UPI handles yet (gap). |
+| GET | `/payments/methods` | — | `{ methods: [{ id, label, enabled, balance? }], razorpay_key_id }` — `wallet` includes the Fengle-credits balance. `razorpay_key_id` is the **public** key_id (safe to ship to the client — never the secret), `null` until `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` are both set in `.env`. No saved cards/UPI handles yet (gap). |
 | POST | `/payments/upi/initiate` | `{ order_id }` | Idempotent — returns the order's existing `razorpay_order_id` payment object if `POST /orders` already created one, now including `dev_stub`. |
 | POST | `/payments/card/charge` | `{ order_id }` | Dev-stub mode (no Razorpay keys): auto-succeeds and marks the order paid. With real keys: **501** — use Razorpay Checkout + `POST /orders/:id/confirm-payment` instead (direct server-side card charging isn't built). |
 

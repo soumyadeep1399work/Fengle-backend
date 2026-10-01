@@ -1,5 +1,5 @@
 // Adds "order_payment" to wallet_ledger.reason — the debit reason for a
-// customer paying an order fully from Platter credits (payment_method:
+// customer paying an order fully from Fengle credits (payment_method:
 // "wallet"). That enum value was accepted by the orders table from the start
 // but nothing ever actually debited the wallet for it — see order.controller.js.
 exports.up = function (knex) {

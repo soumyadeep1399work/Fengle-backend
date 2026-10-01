@@ -121,7 +121,7 @@ async function updateCustomerStatus(req, res) {
 
 /**
  * POST /admin/customers/:id/wallet-credit  body: { amount, notes? }
- * Goodwill credit — the only way an admin adds Platter credits by hand.
+ * Goodwill credit — the only way an admin adds Fengle credits by hand.
  */
 async function creditCustomerWallet(req, res) {
   const { id } = req.params;

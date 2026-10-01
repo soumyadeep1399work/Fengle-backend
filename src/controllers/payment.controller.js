@@ -18,7 +18,7 @@ async function getPaymentMethods(req, res) {
       { id: "upi", label: "UPI", enabled: true },
       { id: "card", label: "Card", enabled: true },
       { id: "cod", label: "Cash on Delivery", enabled: true },
-      { id: "wallet", label: "Platter Credits", enabled: true, balance },
+      { id: "wallet", label: "Fengle Credits", enabled: true, balance },
     ],
     razorpay_key_id: payment.getPublicKeyId(), // public key, safe for the client; null until real keys are configured
   });

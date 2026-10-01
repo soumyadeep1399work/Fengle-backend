@@ -312,14 +312,14 @@ async function withPaymentOrder(order, paymentMethod) {
   }
 
   if (paymentMethod === "wallet") {
-    // Platter credits: paid in full from the customer's wallet balance at
+    // Fengle credits: paid in full from the customer's wallet balance at
     // placement, no gateway involved (mirrors COD's "no gateway" shape, but
     // debits immediately since credits are our own liability, not cash).
     const balance = await wallet.getBalance("customer", order.customer_id);
     if (balance < Number(order.grand_total)) {
       await db("orders").where({ id: order.id }).update({ status: "cancelled", cancelled_at: new Date() });
       return {
-        error: `Insufficient Platter credits (₹${balance.toFixed(2)} available, ₹${order.grand_total} required) for this order`,
+        error: `Insufficient Fengle credits (₹${balance.toFixed(2)} available, ₹${order.grand_total} required) for this order`,
         status: 402,
       };
     }
@@ -331,7 +331,7 @@ async function withPaymentOrder(order, paymentMethod) {
       amount: Number(order.grand_total),
       reason: "order_payment",
       relatedOrderId: order.id,
-      notes: `Paid via Platter credits for order #${order.id}`,
+      notes: `Paid via Fengle credits for order #${order.id}`,
     });
     await db("orders").where({ id: order.id }).update({ payment_status: "paid" });
     const updated = await db("orders").where({ id: order.id }).first();

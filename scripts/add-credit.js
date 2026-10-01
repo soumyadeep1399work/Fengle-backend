@@ -1,4 +1,4 @@
-// Dev-only: give a test customer Platter credits so the wallet payment option
+// Dev-only: give a test customer Fengle credits so the wallet payment option
 // can be exercised. Goes through the real wallet ledger (reason manual_adjustment).
 //
 //   node scripts/add-credit.js <10-digit phone> <amount>
