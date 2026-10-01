@@ -186,7 +186,8 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
 - **Maps**: Google Maps API for geocoding/distance calc only (NOT live
   tracking — see above)
 - **Push**: Firebase Cloud Messaging
-- **SMS/OTP**: MSG91 or Fast2SMS (Twilio is ~3x cost, avoid unless needed)
+- **SMS/OTP**: Fast2SMS, DLT route (chosen 2026-10-01; `utils/sms.js`). With no
+  `FAST2SMS_*` keys set it logs the OTP instead of sending
 - **Email**: AWS SES
 - **Storage**: AWS S3
 - **Hosting**: AWS EC2 + MySQL (self-hosted on same instance, or RDS

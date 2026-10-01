@@ -14,7 +14,7 @@ npm run seed            # dev catalog, restaurants and rider (idempotent)
 npm run dev              # starts on PORT (default 4000)
 ```
 
-Requires a running MySQL/MariaDB instance. Without Razorpay/MSG91 keys set,
+Requires a running MySQL/MariaDB instance. Without Razorpay/Fast2SMS keys set,
 payments and OTP both fall back to dev-safe stubs (see `services/payment.service.js`
 and `utils/sms.js`) — OTPs print to the console, payments auto-succeed. This
 means you can build and test the full order flow without waiting on Razorpay

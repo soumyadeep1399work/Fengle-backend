@@ -36,7 +36,15 @@ async function requestOtp(req, res) {
     expires_at: getExpiryDate(),
   });
 
-  await sendOtpSms(phone, otp);
+  // Caught here (not left to reject) because Express 4 does not forward a
+  // rejected async handler to the error middleware — an SMS provider outage
+  // would otherwise be an unhandled rejection instead of a clean error.
+  try {
+    await sendOtpSms(phone, otp);
+  } catch (err) {
+    console.error(`[otp] SMS send failed for ${phone}:`, err.message);
+    return res.status(502).json({ error: "Could not send the OTP right now. Please try again in a moment." });
+  }
 
   return res.json({ message: "OTP sent", expires_in_minutes: 5 });
 }
