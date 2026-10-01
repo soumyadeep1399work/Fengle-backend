@@ -5,18 +5,26 @@
  * @param {string} phone - E.164 or 10-digit Indian mobile number
  * @param {string} otp
  */
-// Dev only: last OTP per phone, kept in memory so testers (or another
-// process, via GET /api/v1/dev/last-otp) can read it without needing the
-// server's console. Only populated outside production — unlike the
-// always-log-to-stdout fallback below, this Map is never evicted/bounded, so
-// populating it in production (a real, growing user base) would be an
-// unbounded memory leak on a RAM-constrained box. The /dev/last-otp route
-// itself is also unmounted entirely in production (routes/index.js), so this
-// is defense in depth, not the only thing keeping it private.
+// Last OTP per phone, kept in memory so GET /api/v1/dev/last-otp can read it
+// without needing the server's console. TEMPORARY (2026-10-01): now populated
+// in every environment, including production, per the same user-approved
+// exception as otpLookup.routes.js — was previously dev-only. Capped at
+// MAX_ENTRIES (oldest evicted first) since it's otherwise never evicted and
+// production now has a real, growing user base — unbounded growth would be
+// a real memory leak on this box's 1GB RAM, not just a theoretical one.
 const lastDevOtps = new Map();
+const MAX_DEV_OTP_ENTRIES = 1000;
 
 function getLastDevOtp(phone) {
   return lastDevOtps.get(phone) || null;
+}
+
+function rememberOtp(phone, otp) {
+  lastDevOtps.delete(phone); // re-insert so this phone becomes the newest for eviction order
+  lastDevOtps.set(phone, { otp, requestedAt: new Date().toISOString() });
+  if (lastDevOtps.size > MAX_DEV_OTP_ENTRIES) {
+    lastDevOtps.delete(lastDevOtps.keys().next().value); // evict the oldest
+  }
 }
 
 /**
@@ -34,9 +42,7 @@ async function sendOtpSms(phone, otp) {
 
   if (!authKey || !templateId) {
     console.log(`[otp] no SMS provider configured — OTP for ${phone}: ${otp}`);
-    if (process.env.NODE_ENV !== "production") {
-      lastDevOtps.set(phone, { otp, requestedAt: new Date().toISOString() });
-    }
+    rememberOtp(phone, otp);
     return { success: true, dev: true };
   }
 
