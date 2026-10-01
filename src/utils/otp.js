@@ -12,6 +12,20 @@ function generateOtp() {
   return crypto.randomInt(min, max).toString();
 }
 
+/**
+ * Demo logins (Play Store review, client demos, pilot accounts): a phone listed
+ * in DEMO_LOGIN_PHONES always gets DEMO_LOGIN_OTP as its code and no SMS is
+ * sent for it. Off unless both are set, and DEMO_LOGIN_OTP must be exactly
+ * OTP_LENGTH digits. Anyone who knows a listed phone and the code can log in
+ * as it, so list only numbers that exist for this purpose.
+ */
+function demoOtpFor(phone) {
+  const otp = process.env.DEMO_LOGIN_OTP || "";
+  if (!new RegExp(`^\\d{${OTP_LENGTH}}$`).test(otp)) return null;
+  const phones = (process.env.DEMO_LOGIN_PHONES || "").split(",").map((p) => p.trim());
+  return phones.includes(phone) ? otp : null;
+}
+
 async function hashOtp(otp) {
   return bcrypt.hash(otp, 10);
 }
@@ -26,6 +40,7 @@ function getExpiryDate() {
 
 module.exports = {
   generateOtp,
+  demoOtpFor,
   hashOtp,
   verifyOtpHash,
   getExpiryDate,

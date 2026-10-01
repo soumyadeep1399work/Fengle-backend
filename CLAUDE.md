@@ -176,7 +176,10 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   Firebase Cloud Messaging push notifications. Not full native builds.
 - **Admin Panel**: React JS (SPA)
 - **Business Website**: React JS (standalone, separate from the above)
-- **Auth**: OTP + JWT
+- **Auth**: OTP + JWT. Demo logins (added 2026-10-01): phones in
+  `DEMO_LOGIN_PHONES` get the fixed `DEMO_LOGIN_OTP` with no SMS — for Play
+  Store review and demos only (`demoOtpFor` in `utils/otp.js`); list only
+  numbers created for that purpose, never a real person's
 - **Payments**: Razorpay. **Test-mode keys live on production since 2026-10-01**
   (`RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` set, real Orders API + signature
   verification confirmed working — see `docs/API.md`'s Payments section).

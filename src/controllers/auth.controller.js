@@ -1,6 +1,6 @@
 const bcrypt = require("bcrypt");
 const db = require("../config/db");
-const { generateOtp, hashOtp, verifyOtpHash, getExpiryDate, MAX_ATTEMPTS } = require("../utils/otp");
+const { generateOtp, demoOtpFor, hashOtp, verifyOtpHash, getExpiryDate, MAX_ATTEMPTS } = require("../utils/otp");
 const { sendOtpSms } = require("../utils/sms");
 const { signToken } = require("../utils/jwt");
 
@@ -26,7 +26,8 @@ async function requestOtp(req, res) {
     return res.status(400).json({ error: "Invalid purpose" });
   }
 
-  const otp = generateOtp();
+  const demoOtp = demoOtpFor(phone);
+  const otp = demoOtp || generateOtp();
   const otpHash = await hashOtp(otp);
 
   await db("otp_verifications").insert({
@@ -36,14 +37,18 @@ async function requestOtp(req, res) {
     expires_at: getExpiryDate(),
   });
 
-  // Caught here (not left to reject) because Express 4 does not forward a
-  // rejected async handler to the error middleware — an SMS provider outage
-  // would otherwise be an unhandled rejection instead of a clean error.
-  try {
-    await sendOtpSms(phone, otp);
-  } catch (err) {
-    console.error(`[otp] SMS send failed for ${phone}:`, err.message);
-    return res.status(502).json({ error: "Could not send the OTP right now. Please try again in a moment." });
+  // A demo phone's code is fixed and already known to whoever uses it, so
+  // nothing is sent (or logged) for it.
+  if (!demoOtp) {
+    // Caught here (not left to reject) because Express 4 does not forward a
+    // rejected async handler to the error middleware — an SMS provider outage
+    // would otherwise be an unhandled rejection instead of a clean error.
+    try {
+      await sendOtpSms(phone, otp);
+    } catch (err) {
+      console.error(`[otp] SMS send failed for ${phone}:`, err.message);
+      return res.status(502).json({ error: "Could not send the OTP right now. Please try again in a moment." });
+    }
   }
 
   return res.json({ message: "OTP sent", expires_in_minutes: 5 });
