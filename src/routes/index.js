@@ -29,6 +29,7 @@ router.use("/admin", adminRoutes);
 router.use("/addresses", addressRoutes);
 router.use("/profile", profileRoutes);
 router.use("/cart", cartRoutes);
+router.use("/payments/razorpay/webhook", require("./razorpayWebhook.routes")); // before /payments: that router requires a customer JWT
 router.use("/payments", paymentRoutes);
 router.use("/favorites", favoriteRoutes);
 router.use("/notifications", notificationRoutes);

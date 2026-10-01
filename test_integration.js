@@ -1237,6 +1237,101 @@ async function main() {
   }
   check("env vars restored — isConfigured() is false again", paymentSvc.isConfigured() === false);
 
+  console.log("\n--- Test 32: Razorpay webhook — signature check, idempotency, cancelled-order refund, and the confirmPayment race fix ---");
+  const webhookCtl = require("./src/controllers/razorpayWebhook.controller");
+  const crypto = require("crypto");
+  const originalWebhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+  process.env.RAZORPAY_WEBHOOK_SECRET = "test_webhook_secret";
+
+  const fakeWebhookReq = (payload, signature) => {
+    const rawBody = Buffer.from(JSON.stringify(payload));
+    return { rawBody, body: payload, get: (h) => (h.toLowerCase() === "x-razorpay-signature" ? signature : undefined) };
+  };
+  const signWebhook = (payload) => crypto.createHmac("sha256", "test_webhook_secret").update(Buffer.from(JSON.stringify(payload))).digest("hex");
+  const capturedEvent = (orderId, paymentId) => ({ event: "payment.captured", payload: { payment: { entity: { id: paymentId, order_id: orderId } } } });
+
+  try {
+    const noSecretRes = fakeRes();
+    delete process.env.RAZORPAY_WEBHOOK_SECRET;
+    await webhookCtl.handleWebhook(fakeWebhookReq(capturedEvent("order_x", "pay_x"), "whatever"), noSecretRes);
+    check("webhook with no RAZORPAY_WEBHOOK_SECRET configured -> 503", noSecretRes.statusCode === 503);
+    process.env.RAZORPAY_WEBHOOK_SECRET = "test_webhook_secret";
+
+    const missingSigRes = fakeRes();
+    await webhookCtl.handleWebhook(fakeWebhookReq(capturedEvent("order_x", "pay_x"), undefined), missingSigRes);
+    check("webhook with no signature header -> 400", missingSigRes.statusCode === 400);
+
+    const wrongSigRes = fakeRes();
+    await webhookCtl.handleWebhook(fakeWebhookReq(capturedEvent("order_x", "pay_x"), "0000000000000000000000000000000000000000000000000000000000000000"), wrongSigRes);
+    check("webhook with a wrong signature -> 400", wrongSigRes.statusCode === 400);
+
+    const unknownOrderPayload = capturedEvent("order_does_not_exist", "pay_x");
+    const unknownOrderRes = fakeRes();
+    await webhookCtl.handleWebhook(fakeWebhookReq(unknownOrderPayload, signWebhook(unknownOrderPayload)), unknownOrderRes);
+    check("correctly-signed event for an unknown razorpay_order_id -> 200, handled, result unknown_order", unknownOrderRes.body.handled === true && unknownOrderRes.body.result === "unknown_order");
+
+    const ignoredEventPayload = { event: "payment.failed", payload: { payment: { entity: { id: "pay_x", order_id: "order_x" } } } };
+    const ignoredEventRes = fakeRes();
+    await webhookCtl.handleWebhook(fakeWebhookReq(ignoredEventPayload, signWebhook(ignoredEventPayload)), ignoredEventRes);
+    check("payment.failed is ignored (handled: false), not an error", ignoredEventRes.body.handled === false);
+
+    // A real order with a dev-stub razorpay_order_id to mark paid via webhook.
+    const webhookOrderRes = fakeRes();
+    await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "upi" }, {}, { id: customerId, type: "customer" }), webhookOrderRes);
+    const webhookOrderId = webhookOrderRes.body.order.id;
+    const webhookRazorpayOrderId = webhookOrderRes.body.payment.id;
+    check("a upi order gets a (dev-stub) razorpay_order_id to key the webhook off", typeof webhookRazorpayOrderId === "string" && webhookRazorpayOrderId.length > 0);
+
+    const captureEventPayload = capturedEvent(webhookRazorpayOrderId, "pay_webhook_test_1");
+    const captureRes = fakeRes();
+    await webhookCtl.handleWebhook(fakeWebhookReq(captureEventPayload, signWebhook(captureEventPayload)), captureRes);
+    check("payment.captured for a real unpaid order -> marked_paid", captureRes.body.result === "marked_paid");
+    check("the order is actually paid now, with the webhook's payment id stored", (await db("orders").where({ id: webhookOrderId }).first()).payment_status === "paid" && (await db("orders").where({ id: webhookOrderId }).first()).razorpay_payment_id === "pay_webhook_test_1");
+
+    const duplicateCaptureRes = fakeRes();
+    await webhookCtl.handleWebhook(fakeWebhookReq(captureEventPayload, signWebhook(captureEventPayload)), duplicateCaptureRes);
+    check("the SAME captured event delivered again -> already_settled, not double-processed", duplicateCaptureRes.body.result === "already_settled");
+
+    // confirmPayment racing a webhook that already marked it paid: must be a
+    // harmless no-op, not an error, and must not re-notify the restaurant.
+    const confirmAfterWebhookRes = fakeRes();
+    await orderController.confirmPayment(fakeReq({ razorpay_payment_id: "pay_webhook_test_1", razorpay_signature: "irrelevant-in-dev-stub-mode" }, { id: webhookOrderId }, { id: customerId, type: "customer" }), confirmAfterWebhookRes);
+    check("confirmPayment called AFTER the webhook already paid it is a harmless no-op, payment_status stays paid", confirmAfterWebhookRes.body.payment_status === "paid");
+
+    // Cancelled-order refund path: place, cancel (still unpaid), then the
+    // money arrives late via webhook -> wallet refund, not a reopened order.
+    const lateOrderRes = fakeRes();
+    await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Test", payment_method: "upi" }, {}, { id: customerId, type: "customer" }), lateOrderRes);
+    const lateOrderId = lateOrderRes.body.order.id;
+    const lateRazorpayOrderId = lateOrderRes.body.payment.id;
+    await orderController.cancelOrder(fakeReq({}, { id: lateOrderId }, { id: customerId, type: "customer" }), fakeRes());
+    check("the order is cancelled, still unpaid", (await db("orders").where({ id: lateOrderId }).first()).status === "cancelled" && (await db("orders").where({ id: lateOrderId }).first()).payment_status === "pending");
+
+    const balanceBeforeLateCapture = await wallet.getBalance("customer", customerId);
+    const lateCapturePayload = capturedEvent(lateRazorpayOrderId, "pay_late_capture_1");
+    const lateCaptureRes = fakeRes();
+    await webhookCtl.handleWebhook(fakeWebhookReq(lateCapturePayload, signWebhook(lateCapturePayload)), lateCaptureRes);
+    check("payment.captured arriving after cancellation -> refunded_cancelled_order", lateCaptureRes.body.result === "refunded_cancelled_order");
+    const lateOrderAfter = await db("orders").where({ id: lateOrderId }).first();
+    check("the order's payment_status is refunded (not paid, not left pending)", lateOrderAfter.payment_status === "refunded");
+    check("the customer's wallet was actually credited the grand_total", Math.abs((await wallet.getBalance("customer", customerId)) - balanceBeforeLateCapture - Number(lateOrderAfter.grand_total)) < 0.01);
+
+    const duplicateLateCaptureRes = fakeRes();
+    await webhookCtl.handleWebhook(fakeWebhookReq(lateCapturePayload, signWebhook(lateCapturePayload)), duplicateLateCaptureRes);
+    check("re-delivering that same late-capture event -> already_settled, no double refund", duplicateLateCaptureRes.body.result === "already_settled");
+    check("...and the wallet balance didn't move again", Math.abs((await wallet.getBalance("customer", customerId)) - balanceBeforeLateCapture - Number(lateOrderAfter.grand_total)) < 0.01);
+
+    // confirmPayment racing a webhook that already refunded a cancelled order
+    // MUST NOT flip payment_status back to "paid" — this is the real bug
+    // the unconditional update had before the fix.
+    const confirmAfterRefundRes = fakeRes();
+    await orderController.confirmPayment(fakeReq({ razorpay_payment_id: "pay_late_capture_1", razorpay_signature: "irrelevant-in-dev-stub-mode" }, { id: lateOrderId }, { id: customerId, type: "customer" }), confirmAfterRefundRes);
+    check("confirmPayment called AFTER the webhook refunded a cancelled order does NOT overwrite refunded back to paid", confirmAfterRefundRes.body.payment_status === "refunded");
+    check("...confirmed again directly against the DB row, not just the response", (await db("orders").where({ id: lateOrderId }).first()).payment_status === "refunded");
+  } finally {
+    if (originalWebhookSecret === undefined) delete process.env.RAZORPAY_WEBHOOK_SECRET; else process.env.RAZORPAY_WEBHOOK_SECRET = originalWebhookSecret;
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

@@ -387,16 +387,25 @@ async function confirmPayment(req, res) {
   });
   if (!valid) return res.status(400).json({ error: "Payment verification failed" });
 
-  await db("orders").where({ id }).update({
-    payment_status: "paid",
-    razorpay_payment_id,
-  });
+  // Conditional on still being unpaid — guards against racing the Razorpay
+  // webhook (POST /payments/razorpay/webhook), which can resolve the same
+  // payment from the other side. Without this, an unconditional update could
+  // overwrite "refunded" (the webhook's outcome when the money arrives after
+  // the order was already cancelled) back to "paid", corrupting the record
+  // even though the customer was already credited via wallet refund.
+  const changed = await db("orders")
+    .where({ id })
+    .whereIn("payment_status", ["pending", "failed"])
+    .update({ payment_status: "paid", razorpay_payment_id });
 
-  // Paid now, so the kitchen can see it. Skip if it was already paid (a retry).
-  if (order.payment_status !== "paid" && order.status === "placed") {
+  // Paid now, so the kitchen can see it. Skip if the webhook already handled
+  // it (not `changed`) or the order isn't `placed` (e.g. cancelled+refunded).
+  if (changed && order.status === "placed") {
     notifyLater(() => orderPush.newOrderForRestaurant(order.id));
   }
-  res.json({ message: "Payment confirmed" });
+
+  const finalStatus = await db("orders").where({ id }).select("payment_status").first();
+  res.json({ message: "Payment confirmed", payment_status: finalStatus.payment_status });
 }
 
 // ---------------------------------------------------------------------------

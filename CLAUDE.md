@@ -183,6 +183,10 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
 - **Payments**: Razorpay. **Test-mode keys live on production since 2026-10-01**
   (`RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` set, real Orders API + signature
   verification confirmed working — see `docs/API.md`'s Payments section).
+  A webhook (`POST /payments/razorpay/webhook`, added 2026-10-01, needs
+  `RAZORPAY_WEBHOOK_SECRET`) records `payment.captured` when the app's own
+  confirm-payment never arrives; a capture for an already-cancelled order is
+  refunded to the customer's wallet.
   Still pending: live (non-test) keys, and Route for split settlement
   (subject to RBI eligibility — a separate, still-pending external
   dependency from the base payment integration above).

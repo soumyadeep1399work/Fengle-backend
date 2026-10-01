@@ -11,7 +11,15 @@ const app = express();
 app.use(helmet());
 app.use(cors());
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
-app.use(express.json());
+app.use(
+  express.json({
+    // The Razorpay webhook signature is computed over the exact bytes sent, so
+    // that one route needs the unparsed body kept alongside the parsed one.
+    verify: (req, res, buf) => {
+      if (req.originalUrl.startsWith("/api/v1/payments/razorpay/webhook")) req.rawBody = buf;
+    },
+  })
+);
 app.use(express.urlencoded({ extended: true }));
 
 // Uploaded images (dev: local disk; production would sit behind S3/CDN with the

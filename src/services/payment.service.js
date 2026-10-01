@@ -59,12 +59,28 @@ function verifyPaymentSignature({ razorpayOrderId, razorpayPaymentId, razorpaySi
   if (!isConfigured()) {
     return true;
   }
+  if (typeof razorpaySignature !== "string") return false;
   const crypto = require("crypto");
-  const expected = crypto
-    .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-    .update(`${razorpayOrderId}|${razorpayPaymentId}`)
-    .digest("hex");
-  return expected === razorpaySignature;
+  const expected = Buffer.from(
+    crypto.createHmac("sha256", process.env.RAZORPAY_KEY_SECRET).update(`${razorpayOrderId}|${razorpayPaymentId}`).digest("hex")
+  );
+  const given = Buffer.from(razorpaySignature);
+  return expected.length === given.length && crypto.timingSafeEqual(expected, given);
 }
 
-module.exports = { createPaymentOrder, verifyPaymentSignature, isConfigured, getPublicKeyId };
+/**
+ * Verifies a Razorpay webhook: X-Razorpay-Signature must be the HMAC-SHA256 of
+ * the exact raw request body, keyed with the webhook's own secret (set when
+ * the webhook is created in the Razorpay dashboard — not the API key secret).
+ * False when no webhook secret is configured.
+ */
+function verifyWebhookSignature(rawBody, signature) {
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+  if (!secret || !rawBody || typeof signature !== "string") return false;
+  const crypto = require("crypto");
+  const expected = Buffer.from(crypto.createHmac("sha256", secret).update(rawBody).digest("hex"));
+  const given = Buffer.from(signature);
+  return expected.length === given.length && crypto.timingSafeEqual(expected, given);
+}
+
+module.exports = { createPaymentOrder, verifyPaymentSignature, verifyWebhookSignature, isConfigured, getPublicKeyId };
