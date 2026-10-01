@@ -39,11 +39,17 @@ async function createPaymentOrder(amountRupees, receiptId) {
     };
   }
 
-  return client.orders.create({
+  const order = await client.orders.create({
     amount: Math.round(amountRupees * 100),
     currency: "INR",
     receipt: String(receiptId),
   });
+  return { ...order, dev_stub: false };
+}
+
+/** The public key_id — safe to send to the client (unlike the secret). null when not configured. */
+function getPublicKeyId() {
+  return isConfigured() ? process.env.RAZORPAY_KEY_ID : null;
 }
 
 /**
@@ -61,4 +67,4 @@ function verifyPaymentSignature({ razorpayOrderId, razorpayPaymentId, razorpaySi
   return expected === razorpaySignature;
 }
 
-module.exports = { createPaymentOrder, verifyPaymentSignature, isConfigured };
+module.exports = { createPaymentOrder, verifyPaymentSignature, isConfigured, getPublicKeyId };

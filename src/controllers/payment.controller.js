@@ -20,6 +20,7 @@ async function getPaymentMethods(req, res) {
       { id: "cod", label: "Cash on Delivery", enabled: true },
       { id: "wallet", label: "Platter Credits", enabled: true, balance },
     ],
+    razorpay_key_id: payment.getPublicKeyId(), // public key, safe for the client; null until real keys are configured
   });
 }
 
@@ -62,7 +63,7 @@ async function initiateUpi(req, res) {
   }
 
   if (order.razorpay_order_id) {
-    return res.json({ payment: { id: order.razorpay_order_id, amount: Math.round(Number(order.grand_total) * 100), currency: "INR", status: "created" } });
+    return res.json({ payment: { id: order.razorpay_order_id, amount: Math.round(Number(order.grand_total) * 100), currency: "INR", status: "created", dev_stub: !payment.isConfigured() } });
   }
 
   const paymentOrder = await payment.createPaymentOrder(order.grand_total, order.id);

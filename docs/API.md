@@ -88,9 +88,11 @@ Every item payload includes `avgRating` (1 decimal, or `null` if unrated) and `r
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| GET | `/payments/methods` | — | `{ methods: [{ id, label, enabled, balance? }] }` — `wallet` includes the Platter-credits balance. No saved cards/UPI handles yet (gap). |
-| POST | `/payments/upi/initiate` | `{ order_id }` | Idempotent — returns the order's existing `razorpay_order_id` payment object if `POST /orders` already created one. |
+| GET | `/payments/methods` | — | `{ methods: [{ id, label, enabled, balance? }], razorpay_key_id }` — `wallet` includes the Platter-credits balance. `razorpay_key_id` is the **public** key_id (safe to ship to the client — never the secret), `null` until `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` are both set in `.env`. No saved cards/UPI handles yet (gap). |
+| POST | `/payments/upi/initiate` | `{ order_id }` | Idempotent — returns the order's existing `razorpay_order_id` payment object if `POST /orders` already created one, now including `dev_stub`. |
 | POST | `/payments/card/charge` | `{ order_id }` | Dev-stub mode (no Razorpay keys): auto-succeeds and marks the order paid. With real keys: **501** — use Razorpay Checkout + `POST /orders/:id/confirm-payment` instead (direct server-side card charging isn't built). |
+
+**Real Razorpay flow** (once `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` are set): `POST /orders` (for `upi`/`card`/`netbanking`) creates a **real** Razorpay Order via the Orders API and returns `payment: { id, amount, currency, status, dev_stub: false, ... }` — `id` is the real `razorpay_order_id` to open Checkout with. `POST /orders/:id/confirm-payment` then verifies the signature server-side: `HMAC_SHA256(order.razorpay_order_id + "|" + razorpay_payment_id, RAZORPAY_KEY_SECRET)` must equal `razorpay_signature`, else 400. **`razorpay_order_id` always comes from the order row the server itself created and stored at placement — never trusted from the request body** — even if the client sends one (harmless either way), only the server's own stored value is used, so a client can't point verification at a different order's payment. Toggling `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` unset↔set is the only thing that switches dev-stub↔real mode anywhere in the payment flow — no code changes. No webhook yet (known gap, below) — this client-confirmed signature check is the only verification path.
 
 ## Orders (`/orders`)
 

@@ -1192,6 +1192,51 @@ async function main() {
   const vipEligible = await couponSvc.getEligibleCustomerIds(await db("coupons").where({ id: vipRes.body.coupon.id }).first());
   check("getEligibleCustomerIds('selected_users') is exactly the listed phone's account, not everyone", vipEligible.includes(selectedUserId) && !vipEligible.includes(customerId) && !vipEligible.includes(newUserId));
 
+  console.log("\n--- Test 31: Real Razorpay integration — dev-stub vs configured-mode branching ---");
+  const paymentSvc = require("./src/services/payment.service");
+  const paymentCtl = require("./src/controllers/payment.controller");
+
+  check("isConfigured() is false with no keys in env (this test run's baseline)", paymentSvc.isConfigured() === false);
+  check("getPublicKeyId() is null when unconfigured", paymentSvc.getPublicKeyId() === null);
+
+  const methodsRes = fakeRes();
+  await paymentCtl.getPaymentMethods(fakeReq({}, {}, { id: customerId, type: "customer" }), methodsRes);
+  check("GET /payments/methods exposes razorpay_key_id: null when unconfigured", methodsRes.body.razorpay_key_id === null);
+
+  const devStubOrder = await paymentSvc.createPaymentOrder(199, 12345);
+  check("createPaymentOrder's dev-stub path is clearly marked dev_stub: true", devStubOrder.dev_stub === true && devStubOrder.id.startsWith("dev_order_"));
+
+  // Simulate configured mode WITHOUT calling the real Razorpay API (no real
+  // test-mode keys available in this suite) — verifyPaymentSignature and
+  // getPublicKeyId don't touch the network, so they're safe to exercise with
+  // fake credentials; createPaymentOrder's real branch is NOT called here.
+  const originalKeyId = process.env.RAZORPAY_KEY_ID;
+  const originalKeySecret = process.env.RAZORPAY_KEY_SECRET;
+  process.env.RAZORPAY_KEY_ID = "rzp_test_fake123";
+  process.env.RAZORPAY_KEY_SECRET = "fake_secret_for_hmac_test";
+  try {
+    check("isConfigured() flips true once both env vars are set", paymentSvc.isConfigured() === true);
+    check("getPublicKeyId() returns the key_id (safe to expose) once configured", paymentSvc.getPublicKeyId() === "rzp_test_fake123");
+
+    const methodsResConfigured = fakeRes();
+    await paymentCtl.getPaymentMethods(fakeReq({}, {}, { id: customerId, type: "customer" }), methodsResConfigured);
+    check("GET /payments/methods exposes the real key_id once configured", methodsResConfigured.body.razorpay_key_id === "rzp_test_fake123");
+
+    const crypto = require("crypto");
+    const realOrderId = "order_realtest1";
+    const realPaymentId = "pay_realtest1";
+    const validSignature = crypto.createHmac("sha256", "fake_secret_for_hmac_test").update(`${realOrderId}|${realPaymentId}`).digest("hex");
+    check("verifyPaymentSignature accepts a correctly-computed HMAC", paymentSvc.verifyPaymentSignature({ razorpayOrderId: realOrderId, razorpayPaymentId: realPaymentId, razorpaySignature: validSignature }) === true);
+    check("verifyPaymentSignature rejects a tampered signature", paymentSvc.verifyPaymentSignature({ razorpayOrderId: realOrderId, razorpayPaymentId: realPaymentId, razorpaySignature: "0000000000000000000000000000000000000000000000000000000000000000" }) === false);
+    check("verifyPaymentSignature rejects a signature computed for a DIFFERENT order id (can't replay across orders)", paymentSvc.verifyPaymentSignature({ razorpayOrderId: "order_other", razorpayPaymentId: realPaymentId, razorpaySignature: validSignature }) === false);
+  } finally {
+    // Restore immediately — later tests (and re-runs within the same process)
+    // must not see fake Razorpay credentials as "configured".
+    if (originalKeyId === undefined) delete process.env.RAZORPAY_KEY_ID; else process.env.RAZORPAY_KEY_ID = originalKeyId;
+    if (originalKeySecret === undefined) delete process.env.RAZORPAY_KEY_SECRET; else process.env.RAZORPAY_KEY_SECRET = originalKeySecret;
+  }
+  check("env vars restored — isConfigured() is false again", paymentSvc.isConfigured() === false);
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }
