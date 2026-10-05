@@ -3,6 +3,7 @@ const settlement = require("../services/settlement.service");
 const { paginationParams } = require("../utils/pagination");
 const { listOrdersForOwner } = require("./adminOrders.controller");
 const storage = require("../services/storage.service");
+const { reviewPartner } = require("../services/partnerVerification.service");
 
 // Never password_hash — every admin-facing rider read goes through this
 // column list rather than select("*")/first() on the raw table.
@@ -53,7 +54,8 @@ async function listRiders(req, res) {
     .select(
       "id", "name", "phone", "status", "wallet_balance", "vehicle_type", "vehicle_number", "updated_at", "created_at",
       "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion",
-      db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie")
+      db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie"),
+      "verification_status as verificationStatus", "verification_denied_reason as verificationDeniedReason", "verification_reviewed_at as verificationReviewedAt"
     );
 
   const riderIds = riders.map((r) => r.id);
@@ -72,6 +74,7 @@ async function listRiders(req, res) {
       last_active_at: r.updated_at, created_at: r.created_at,
       agreementAcceptedAt: r.agreementAcceptedAt, agreementVersion: r.agreementVersion,
       hasAgreementSelfie: !!r.hasAgreementSelfie,
+      verificationStatus: r.verificationStatus, verificationDeniedReason: r.verificationDeniedReason,
     })),
     page, limit, total: Number(total),
   });
@@ -89,7 +92,8 @@ async function getRider(req, res) {
     .where({ id })
     .select(
       ...RIDER_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion",
-      db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie")
+      db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie"),
+      "verification_status as verificationStatus", "verification_denied_reason as verificationDeniedReason", "verification_reviewed_at as verificationReviewedAt"
     )
     .first();
   if (!rider) return res.status(404).json({ error: "Rider not found" });
@@ -126,6 +130,17 @@ async function getRiderAgreementSelfie(req, res) {
   const { buffer, contentType } = await storage.readAgreementSelfie(rider.agreement_selfie_path);
   res.set("Content-Type", contentType);
   res.send(buffer);
+}
+
+/**
+ * POST /admin/riders/:id/verification  body: { decision: 'approve'|'deny', reason? }
+ * Approves or denies the rider's agreement selfie. Until approved the rider can
+ * only onboard (see requireAuth). `reason` is required on deny and shown to the rider.
+ */
+async function reviewRiderVerification(req, res) {
+  const { decision, reason } = req.body || {};
+  const result = await reviewPartner("riders", req.params.id, req.auth.id, decision, reason);
+  res.status(result.status).json(result.body);
 }
 
 /**
@@ -226,5 +241,5 @@ async function dashboardSummary(req, res) {
 
 module.exports = {
   settleRider, listRiders, getRider, updateRiderStatus, listSettlements,
-  dashboardSummary, getRiderAgreementSelfie,
+  dashboardSummary, getRiderAgreementSelfie, reviewRiderVerification,
 };

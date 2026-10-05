@@ -36,6 +36,7 @@ async function findCandidates({ items, customerLat, customerLng }) {
     .join("restaurant_categories", "restaurants.id", "restaurant_categories.restaurant_id")
     .whereIn("restaurant_categories.category_id", categoryIds)
     .andWhere("restaurants.status", "active")
+    .andWhere("restaurants.verification_status", "approved")
     .groupBy("restaurants.id")
     .havingRaw("COUNT(DISTINCT restaurant_categories.category_id) = ?", [categoryIds.length])
     .select("restaurants.*");

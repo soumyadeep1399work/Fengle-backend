@@ -121,12 +121,19 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   backfilled as already-accepted in the same migration, so seeded/dev
   accounts and everyone onboarded before 2026-09-29 are permanently exempt.
   No paid face-match/liveness API (out of scope for Oct 2) — the selfie is
-  just an evidentiary trail an admin reviews by eye via
+  reviewed by eye by an admin via
   `GET /admin/{restaurants,riders}/:id/agreement-selfie`, stored at an
-  internal path that's never a public URL like catalog photos. This is a
-  client-side/app gate plus an admin audit trail, **not** a server-side block
-  on order-accept or rider-assignment — see `docs/API.md` if that needs
-  tightening later.
+  internal path that's never a public URL like catalog photos.
+  **Admin approval gate (added 2026-10-05):** a submitted selfie is `pending`
+  until an admin approves it (`POST /admin/{restaurants,riders}/:id/verification`,
+  deny needs a reason and sends the partner back to retake it). Until
+  `verification_status = 'approved'`, `requireAuth` 403s (`code:
+  verification_required`) every restaurant/rider route except the onboarding
+  ones that opt out with `{ allowUnverified: true }`, and routing/catalog/rider
+  auto-assignment skip non-approved partners. **Rows that existed before the
+  migration are `approved`** (column default); only admin-onboarded kitchens and
+  self-signed-up riders start `pending`. Any NEW restaurant/rider route is gated
+  automatically — don't add an `allowUnverified` opt-out without a reason.
 - **Customer app T&C popup** (added 2026-09-30, unrelated to the bullet
   above): a lightweight, one-time terms-acceptance checkbox for customers
   only — no selfie, no admin review. `agreementRequired` on `GET /profile/me`,

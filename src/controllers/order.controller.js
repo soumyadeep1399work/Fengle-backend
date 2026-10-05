@@ -618,7 +618,7 @@ async function autoAssignRider(orderId) {
   ).map((r) => r.rider_id);
 
   const candidates = await db("riders")
-    .where({ status: "active" })
+    .where({ status: "active", verification_status: "approved" })
     .whereNotNull("last_known_lat")
     .whereNotNull("last_known_lng")
     .modify((qb) => {

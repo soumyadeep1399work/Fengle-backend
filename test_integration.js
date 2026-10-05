@@ -5,6 +5,7 @@ process.env.ORDER_CANCEL_BUFFER_SECONDS = "1"; // fast buffer so the expiry test
 require("dotenv").config();
 const db = require("./src/config/db");
 const routing = require("./src/services/routing.service");
+const { reviewPartner } = require("./src/services/partnerVerification.service");
 const wallet = require("./src/services/wallet.service");
 const orderController = require("./src/controllers/order.controller");
 const cartController = require("./src/controllers/cart.controller");
@@ -1336,6 +1337,83 @@ async function main() {
     check("...confirmed again directly against the DB row, not just the response", (await db("orders").where({ id: lateOrderId }).first()).payment_status === "refunded");
   } finally {
     if (originalWebhookSecret === undefined) delete process.env.RAZORPAY_WEBHOOK_SECRET; else process.env.RAZORPAY_WEBHOOK_SECRET = originalWebhookSecret;
+  }
+
+  console.log("\n--- Test 33: Admin approve/deny of the agreement selfie gates partners server-side ---");
+  {
+    const { requireAuth } = require("./src/middleware/auth.middleware");
+    const { signToken } = require("./src/utils/jwt");
+    const bearer = (auth) => ({ headers: { authorization: `Bearer ${signToken(auth)}` } });
+    // Runs the real middleware; resolves once it either answers or calls next().
+    const runGate = (mw, req) =>
+      new Promise((resolve) => {
+        const res = fakeRes();
+        res.json = (payload) => { res.body = payload; resolve({ res, passed: false }); return res; };
+        mw(req, res, (err) => resolve({ res, passed: !err, err }));
+      });
+
+    // A brand-new rider, as rider self-signup creates it: pending.
+    const [pendingRiderId] = await db("riders").insert({ name: "Pending Rider", phone: "8500000031", status: "active", wallet_balance: 0, verification_status: "pending" });
+    const riderTok = bearer({ id: pendingRiderId, type: "rider" });
+    const gated = requireAuth(["rider"]);
+    const open = requireAuth(["rider"], { allowUnverified: true });
+
+    const g1 = await runGate(gated, riderTok);
+    check("pending rider: a normal route answers 403 verification_required", g1.res.statusCode === 403 && g1.res.body.code === "verification_required" && g1.res.body.verificationStatus === "pending");
+    check("pending rider: an allowUnverified route (profile/accept-agreement) still passes", (await runGate(open, riderTok)).passed === true);
+
+    check("approve with no selfie on file -> 409", (await reviewPartner("riders", pendingRiderId, 1, "approve")).status === 409);
+    check("unknown decision -> 400", (await reviewPartner("riders", pendingRiderId, 1, "maybe")).status === 400);
+
+    const accept = fakeRes();
+    await riderCtl.acceptRiderAgreement({ ...fakeReq({ agreement_version: "1" }, {}, { id: pendingRiderId, type: "rider" }), file: { buffer: TEST_JPEG } }, accept);
+    check("accept-agreement leaves a new rider 'pending' (in the review queue)", accept.body.verificationStatus === "pending");
+
+    check("deny without a reason -> 400", (await reviewPartner("riders", pendingRiderId, 1, "deny", "  ")).status === 400);
+    const denied = await reviewPartner("riders", pendingRiderId, 1, "deny", "Face not visible");
+    check("deny with a reason -> 200, status denied", denied.status === 200 && denied.body.verificationStatus === "denied");
+    const meDenied = fakeRes();
+    await riderCtl.getMyProfile(fakeReq({}, {}, { id: pendingRiderId, type: "rider" }), meDenied);
+    check("GET /riders/me shows denied + reason and re-opens the selfie step (agreementRequired)", meDenied.body.rider.verificationStatus === "denied" && meDenied.body.rider.verificationDeniedReason === "Face not visible" && meDenied.body.rider.agreementRequired === true);
+    check("denied rider is still blocked from normal routes", (await runGate(gated, riderTok)).res.body.verificationStatus === "denied");
+
+    const retake = fakeRes();
+    await riderCtl.acceptRiderAgreement({ ...fakeReq({ agreement_version: "1" }, {}, { id: pendingRiderId, type: "rider" }), file: { buffer: TEST_JPEG } }, retake);
+    const meRetaken = fakeRes();
+    await riderCtl.getMyProfile(fakeReq({}, {}, { id: pendingRiderId, type: "rider" }), meRetaken);
+    check("retaking the selfie after a denial goes back to pending with the reason cleared", retake.body.verificationStatus === "pending" && meRetaken.body.rider.verificationDeniedReason === null && meRetaken.body.rider.agreementRequired === false);
+    const approved = await reviewPartner("riders", pendingRiderId, 1, "approve");
+    check("approve -> 200, status approved", approved.status === 200 && approved.body.verificationStatus === "approved");
+    check("approved rider passes the normal gate", (await runGate(gated, riderTok)).passed === true);
+
+    // Auto-assignment only considers approved riders.
+    await db("riders").where({ id: pendingRiderId }).update({ last_known_lat: 22.5801, last_known_lng: 88.4601 });
+    await db("riders").whereNot({ id: pendingRiderId }).update({ verification_status: "pending" });
+    const [assignOrderId] = await db("orders").insert({
+      customer_id: customerId, restaurant_id: restA, status: "accepted", payment_method: "cod", payment_status: "pending",
+      item_total: 100, delivery_fee: 30, grand_total: 130, delivery_address: "x", delivery_lat: 22.58, delivery_lng: 88.46,
+    });
+    check("autoAssignRider only considers approved riders", (await orderController.autoAssignRider(assignOrderId)) === pendingRiderId);
+    await db("orders").where({ id: assignOrderId }).update({ rider_id: null });
+    await db("riders").where({ id: pendingRiderId }).update({ verification_status: "pending" });
+    check("...and assigns nobody when no rider is approved", (await orderController.autoAssignRider(assignOrderId)) === null);
+    await db("riders").update({ verification_status: "approved" });
+    await db("orders").where({ id: assignOrderId }).update({ status: "cancelled", rider_id: null });
+
+    // Routing only considers approved kitchens.
+    await db("restaurants").where({ id: restA }).update({ verification_status: "pending" });
+    const pendingRouting = await routing.findRestaurantForCart({ items: [{ itemId: fishCurryId, categoryId: bengaliCatId }], customerLat: 22.5805, customerLng: 88.4605 });
+    check("a pending restaurant is never matched for an order (falls to the next kitchen)", pendingRouting.match && pendingRouting.match.restaurant.id !== restA);
+    await db("restaurants").where({ id: restA }).update({ verification_status: "approved" });
+
+    // Restaurant side of the gate.
+    const restTok = bearer({ id: restB, type: "restaurant" });
+    await db("restaurants").where({ id: restB }).update({ verification_status: "denied", verification_denied_reason: "Blurry" });
+    const rg = await runGate(requireAuth(["restaurant"]), restTok);
+    check("denied restaurant: normal route -> 403 with the reason", rg.res.statusCode === 403 && rg.res.body.verificationDeniedReason === "Blurry");
+    check("denied restaurant: allowUnverified route (GET /restaurants/me) passes", (await runGate(requireAuth(["restaurant"], { allowUnverified: true }), restTok)).passed === true);
+    await db("restaurants").where({ id: restB }).update({ verification_status: "approved", verification_denied_reason: null });
+    check("customers are never held to the partner gate", (await runGate(requireAuth(["customer"]), bearer({ id: customerId, type: "customer" }))).passed === true);
   }
 
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);

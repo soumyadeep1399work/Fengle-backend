@@ -4,6 +4,7 @@ const categoryService = require("../services/category.service");
 const { paginationParams } = require("../utils/pagination");
 const { CURRENT_AGREEMENT_VERSION, agreementRequired } = require("../utils/agreement");
 const storage = require("../services/storage.service");
+const { reviewPartner } = require("../services/partnerVerification.service");
 
 // Never password_hash — every admin-facing restaurant read goes through this
 // column list rather than select("*")/first() on the raw table.
@@ -42,6 +43,7 @@ async function onboardRestaurant(req, res) {
       radius_km: radius_km || 5.0,
       commission_rate_percent: commission_rate_percent || 15.0,
       status: "active",
+      verification_status: "pending", // the kitchen must submit + get its selfie approved before it can operate
     });
 
     await trx("restaurant_categories").insert(
@@ -62,7 +64,8 @@ async function listRestaurants(req, res) {
   const restaurants = await db("restaurants")
     .select(
       ...RESTAURANT_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion",
-      db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie")
+      db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie"),
+      "verification_status as verificationStatus", "verification_denied_reason as verificationDeniedReason", "verification_reviewed_at as verificationReviewedAt"
     )
     .orderBy("name")
     .limit(limit)
@@ -149,7 +152,8 @@ async function getRestaurantDetail(req, res) {
     .where({ id })
     .select(
       ...RESTAURANT_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion",
-      db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie")
+      db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie"),
+      "verification_status as verificationStatus", "verification_denied_reason as verificationDeniedReason", "verification_reviewed_at as verificationReviewedAt"
     )
     .first();
   if (!restaurant) return res.status(404).json({ error: "Restaurant not found" });
@@ -206,6 +210,8 @@ async function getMyRestaurant(req, res) {
       status: restaurant.status,
       categories,
       agreementRequired: agreementRequired(restaurant),
+      verificationStatus: restaurant.verification_status,
+      verificationDeniedReason: restaurant.verification_denied_reason,
     },
   });
 }
@@ -237,13 +243,28 @@ async function acceptRestaurantAgreement(req, res) {
 
   const selfiePath = await storage.saveAgreementSelfie(req.file.buffer, ext);
   const acceptedAt = new Date();
+  const current = await db("restaurants").where({ id: req.auth.id }).select("verification_status").first();
   await db("restaurants").where({ id: req.auth.id }).update({
     agreement_accepted_at: acceptedAt,
     agreement_version: version,
     agreement_selfie_path: selfiePath,
+    // A new or re-taken selfie goes to the admin's review queue; an already-approved
+    // partner re-accepting a bumped agreement version stays approved.
+    ...(current && current.verification_status === "approved" ? {} : { verification_status: "pending", verification_denied_reason: null }),
   });
 
-  res.json({ agreementAcceptedAt: acceptedAt.toISOString() });
+  res.json({ agreementAcceptedAt: acceptedAt.toISOString(), verificationStatus: current && current.verification_status === "approved" ? "approved" : "pending" });
+}
+
+/**
+ * POST /admin/restaurants/:id/verification  body: { decision: 'approve'|'deny', reason? }
+ * Same contract as the rider counterpart: until approved the kitchen can only
+ * onboard, and routing never picks it for an order.
+ */
+async function reviewRestaurantVerification(req, res) {
+  const { decision, reason } = req.body || {};
+  const result = await reviewPartner("restaurants", req.params.id, req.auth.id, decision, reason);
+  res.status(result.status).json(result.body);
 }
 
 /**
@@ -450,5 +471,5 @@ async function addMyCategory(req, res) {
 module.exports = {
   onboardRestaurant, listRestaurants, updateRestaurant, addRestaurantCategory, removeRestaurantCategory, getRestaurantDetail,
   getMyRestaurant, getMyMenu, getCategoryOptions, addMyCategory,
-  acceptRestaurantAgreement, getRestaurantAgreementSelfie,
+  acceptRestaurantAgreement, getRestaurantAgreementSelfie, reviewRestaurantVerification,
 };

@@ -9,10 +9,10 @@ const router = express.Router();
 // "me" can never be mistaken for a :restaurantId. (The stock toggle,
 // PATCH /restaurants/:restaurantId/items/:itemId/availability, lives in
 // catalog.routes.js and is a different method/depth, so there's no clash.)
-router.get("/me", requireAuth(["restaurant"]), restaurantController.getMyRestaurant);
+router.get("/me", requireAuth(["restaurant"], { allowUnverified: true }), restaurantController.getMyRestaurant);
 router.get("/me/menu", requireAuth(["restaurant"]), restaurantController.getMyMenu);
 router.get("/me/category-options", requireAuth(["restaurant"]), restaurantController.getCategoryOptions);
 router.post("/me/categories", requireAuth(["restaurant"]), restaurantController.addMyCategory);
-router.post("/me/accept-agreement", requireAuth(["restaurant"]), parseSelfie, restaurantController.acceptRestaurantAgreement);
+router.post("/me/accept-agreement", requireAuth(["restaurant"], { allowUnverified: true }), parseSelfie, restaurantController.acceptRestaurantAgreement);
 
 module.exports = router;

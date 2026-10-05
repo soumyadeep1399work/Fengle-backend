@@ -15,7 +15,7 @@ const ITEM_COLUMNS = ["items.id", "items.name", "items.description", "items.pric
  * so they all agree on what "nearby" means.
  */
 async function getInRangeRestaurantIds(lat, lng, categoryId) {
-  let query = db("restaurants").where("restaurants.status", "active");
+  let query = db("restaurants").where("restaurants.status", "active").andWhere("restaurants.verification_status", "approved");
   if (categoryId) {
     query = query
       .join("restaurant_categories", "restaurants.id", "restaurant_categories.restaurant_id")

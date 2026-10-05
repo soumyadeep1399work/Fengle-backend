@@ -1,11 +1,23 @@
+const db = require("../config/db");
 const { verifyToken } = require("../utils/jwt");
+
+const PARTNER_TABLES = { restaurant: "restaurants", rider: "riders" };
 
 /**
  * Verifies the JWT and attaches `req.auth = { id, type }`.
+ *
+ * Restaurant and rider tokens are additionally held to the admin's selfie
+ * review: until `verification_status` is 'approved' every route that uses this
+ * middleware answers 403 { code: "verification_required" } — secure by default,
+ * so a new partner route can't forget the gate. Only the routes a partner
+ * needs to get verified (profile read, accept-agreement, session, push-token
+ * registration) opt out with `{ allowUnverified: true }`.
+ *
  * @param {Array<'customer'|'restaurant'|'rider'|'admin'>} [allowedTypes] - restrict to specific user types
+ * @param {{ allowUnverified?: boolean }} [options]
  */
-function requireAuth(allowedTypes) {
-  return (req, res, next) => {
+function requireAuth(allowedTypes, { allowUnverified = false } = {}) {
+  return async (req, res, next) => {
     const header = req.headers.authorization || "";
     const token = header.startsWith("Bearer ") ? header.slice(7) : null;
 
@@ -13,16 +25,39 @@ function requireAuth(allowedTypes) {
       return res.status(401).json({ error: "Missing bearer token" });
     }
 
+    let decoded;
     try {
-      const decoded = verifyToken(token);
-      if (allowedTypes && !allowedTypes.includes(decoded.type)) {
-        return res.status(403).json({ error: "Not authorized for this resource" });
-      }
-      req.auth = decoded;
-      next();
+      decoded = verifyToken(token);
     } catch (err) {
       return res.status(401).json({ error: "Invalid or expired token" });
     }
+    if (allowedTypes && !allowedTypes.includes(decoded.type)) {
+      return res.status(403).json({ error: "Not authorized for this resource" });
+    }
+
+    const partnerTable = PARTNER_TABLES[decoded.type];
+    if (partnerTable && !allowUnverified) {
+      try {
+        const row = await db(partnerTable).where({ id: decoded.id }).select("verification_status", "verification_denied_reason").first();
+        if (!row) return res.status(401).json({ error: "Invalid or expired token" });
+        if (row.verification_status !== "approved") {
+          return res.status(403).json({
+            error:
+              row.verification_status === "denied"
+                ? "Your verification photo was not approved. Please retake it."
+                : "Your account is waiting for admin approval.",
+            code: "verification_required",
+            verificationStatus: row.verification_status,
+            verificationDeniedReason: row.verification_denied_reason,
+          });
+        }
+      } catch (err) {
+        return next(err);
+      }
+    }
+
+    req.auth = decoded;
+    next();
   };
 }
 

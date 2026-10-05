@@ -104,7 +104,8 @@ async function verifyOtp(req, res) {
   if (!userRow) {
     // Self-serve signup: first successful OTP verification creates the account.
     // Applies to customers and riders (confirmed: rider onboarding is self-serve).
-    const [id] = await db(table).insert({ phone, name: name || null });
+    // A rider starts unverified: nothing but onboarding works until an admin approves the selfie.
+    const [id] = await db(table).insert({ phone, name: name || null, ...(table === "riders" ? { verification_status: "pending" } : {}) });
     userRow = await db(table).where({ id }).first();
   }
 

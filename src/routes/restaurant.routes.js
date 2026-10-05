@@ -13,5 +13,6 @@ router.patch("/:id", requireAuth(["admin"]), restaurantController.updateRestaura
 router.post("/:id/categories", requireAuth(["admin"]), restaurantController.addRestaurantCategory);
 router.delete("/:id/categories/:categoryId", requireAuth(["admin"]), restaurantController.removeRestaurantCategory);
 router.get("/:id/agreement-selfie", requireAuth(["admin"]), restaurantController.getRestaurantAgreementSelfie);
+router.post("/:id/verification", requireAuth(["admin"]), restaurantController.reviewRestaurantVerification);
 
 module.exports = router;

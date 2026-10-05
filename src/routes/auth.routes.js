@@ -7,7 +7,7 @@ const router = express.Router();
 router.post("/otp/request", requestOtp);
 router.post("/otp/verify", verifyOtp);
 router.post("/admin/login", adminLogin);
-router.get("/session", requireAuth(), getSession);
-router.post("/logout", requireAuth(), logout);
+router.get("/session", requireAuth(undefined, { allowUnverified: true }), getSession);
+router.post("/logout", requireAuth(undefined, { allowUnverified: true }), logout);
 
 module.exports = router;

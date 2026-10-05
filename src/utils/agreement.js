@@ -4,7 +4,8 @@
 const CURRENT_AGREEMENT_VERSION = Number(process.env.CURRENT_AGREEMENT_VERSION) || 1;
 
 function agreementRequired(row) {
-  return row.agreement_accepted_at == null || row.agreement_version < CURRENT_AGREEMENT_VERSION;
+  // A denied selfie re-opens the gate: the partner has to retake it.
+  return row.agreement_accepted_at == null || row.agreement_version < CURRENT_AGREEMENT_VERSION || row.verification_status === "denied";
 }
 
 module.exports = { CURRENT_AGREEMENT_VERSION, agreementRequired };

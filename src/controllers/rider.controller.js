@@ -35,6 +35,8 @@ async function getMyProfile(req, res) {
       status: rider.status,
       wallet_balance: Number(rider.wallet_balance),
       agreementRequired: agreementRequired(rider),
+      verificationStatus: rider.verification_status,
+      verificationDeniedReason: rider.verification_denied_reason,
     },
   });
 }
@@ -63,13 +65,18 @@ async function acceptRiderAgreement(req, res) {
 
   const selfiePath = await storage.saveAgreementSelfie(req.file.buffer, ext);
   const acceptedAt = new Date();
+  const current = await db("riders").where({ id: req.auth.id }).select("verification_status").first();
+  const stillApproved = current && current.verification_status === "approved";
   await db("riders").where({ id: req.auth.id }).update({
     agreement_accepted_at: acceptedAt,
     agreement_version: version,
     agreement_selfie_path: selfiePath,
+    // Same rule as restaurants: a new/re-taken selfie awaits review; a bumped-version
+    // re-accept by an already-approved rider stays approved.
+    ...(stillApproved ? {} : { verification_status: "pending", verification_denied_reason: null }),
   });
 
-  res.json({ agreementAcceptedAt: acceptedAt.toISOString() });
+  res.json({ agreementAcceptedAt: acceptedAt.toISOString(), verificationStatus: stillApproved ? "approved" : "pending" });
 }
 
 /**
