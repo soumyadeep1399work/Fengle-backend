@@ -1,4 +1,8 @@
 const express = require("express");
+// Express 4 ignores a rejected promise from an async handler, so one bad request that makes a controller
+// throw would crash the whole Node process. This patch forwards it to the error handler below instead.
+// Must load right after express and before any route is created.
+require("express-async-errors");
 const cors = require("cors");
 const helmet = require("helmet");
 const morgan = require("morgan");
