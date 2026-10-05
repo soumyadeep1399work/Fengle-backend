@@ -5,13 +5,10 @@
  * @param {string} phone - E.164 or 10-digit Indian mobile number
  * @param {string} otp
  */
-// Last OTP per phone, kept in memory so GET /api/v1/dev/last-otp can read it
-// without needing the server's console. TEMPORARY (2026-10-01): now populated
-// in every environment, including production, per the same user-approved
-// exception as otpLookup.routes.js — was previously dev-only. Capped at
-// MAX_ENTRIES (oldest evicted first) since it's otherwise never evicted and
-// production now has a real, growing user base — unbounded growth would be
-// a real memory leak on this box's 1GB RAM, not just a theoretical one.
+// Last OTP per phone, kept in memory so the dev-only GET /api/v1/dev/last-otp
+// can read it without needing the server's console. Never populated in
+// production (rememberOtp is a no-op there) — an OTP must not outlive its SMS.
+// Capped at MAX_DEV_OTP_ENTRIES (oldest evicted first) so it can't grow forever.
 const lastDevOtps = new Map();
 const MAX_DEV_OTP_ENTRIES = 1000;
 
@@ -20,6 +17,7 @@ function getLastDevOtp(phone) {
 }
 
 function rememberOtp(phone, otp) {
+  if (process.env.NODE_ENV === "production") return;
   lastDevOtps.delete(phone); // re-insert so this phone becomes the newest for eviction order
   lastDevOtps.set(phone, { otp, requestedAt: new Date().toISOString() });
   if (lastDevOtps.size > MAX_DEV_OTP_ENTRIES) {

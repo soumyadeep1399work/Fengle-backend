@@ -36,11 +36,7 @@ router.use("/notifications", notificationRoutes);
 router.use("/uploads", uploadRoutes);
 router.use("/coupons", couponRoutes);
 
-// Always mounted, even in production — see otpLookup.routes.js for why
-// (TEMPORARY, user-approved exception, 2026-10-01: must be removed/gated
-// before real users are onboarded).
-router.use("/dev", require("./otpLookup.routes"));
-
+// Dev/test tools (last-otp, advance order, add credit) exist only outside production.
 if (process.env.NODE_ENV !== "production") {
   router.use("/dev", require("./dev.routes"));
 }

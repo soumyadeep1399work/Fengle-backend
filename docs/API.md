@@ -23,7 +23,7 @@ Companion Postman collection: `postman/Fengle-Backend.postman_collection.json` (
 
 ### Dev-only: read the last OTP
 
-`GET /dev/last-otp?phone=<10-digit>` → `{ phone, otp, requestedAt }` (404 if no OTP was requested for that phone since the server started). Lets testers and other tooling fetch the dev OTP without the server console. In-memory only, and the router is **not mounted at all** when `NODE_ENV=production`.
+`GET /dev/last-otp?phone=<10-digit>` → `{ phone, otp, requestedAt }` (404 if no OTP was requested for that phone since the server started, or if an SMS provider is configured — then the code only goes out by SMS). In-memory only, and the router is **not mounted at all** when `NODE_ENV=production` (it was briefly open on production on 2026-10-01 to 2026-10-05 for pre-launch testing and is closed again).
 
 ### Dev tools: advance an order / add wallet credit
 
