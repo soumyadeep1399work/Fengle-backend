@@ -1,6 +1,6 @@
 const express = require("express");
 const multer = require("multer");
-const { requireAuth } = require("../middleware/auth.middleware");
+const { requireAuth, requireRole } = require("../middleware/auth.middleware");
 const uploads = require("../controllers/upload.controller");
 
 // The Restaurant app sends ~200 KB; the Admin Panel sends whatever file was picked. The server
@@ -30,6 +30,6 @@ function parseImage(req, res, next) {
   });
 }
 
-router.post("/image", requireAuth(["restaurant", "admin"]), parseImage, uploads.uploadImage);
+router.post("/image", requireAuth(["restaurant", "admin"]), requireRole("super_admin", "ops"), parseImage, uploads.uploadImage);
 
 module.exports = router;

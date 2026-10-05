@@ -324,6 +324,33 @@ All list endpoints accept `?page=&limit=` (default limit 50, max 200) and return
 | GET | `/admin/coupons?page=&limit=` | — | Every coupon (incl. inactive/expired), paginated, each with `redemption_count` (from `coupon_redemptions`, all customers combined). |
 | PATCH | `/admin/coupons/:id` | Any of the creatable fields above | Edit or just toggle `is_active`. Renaming `code` is safe — past orders keep their own `coupon_code` snapshot (see "Coupons" below), so this never rewrites order history. 409 if the new code collides with a different coupon. |
 
+### Admin roles, admin accounts and permissions (added 2026-10-05)
+
+`admins.role` is `super_admin | ops | support` and is **enforced server-side**. Every request with an admin token re-reads the admin row (`requireAuth`), so the role/`is_active` come from the database, not the 30-day JWT: **disabling an admin, or changing their role, takes effect on their very next request.** A disabled admin gets **401** `{ error, code: "account_disabled" }` on any call and **403** `{ code: "account_disabled" }` at `/auth/admin/login`. `/auth/admin/login` also stamps `last_login_at`; `/auth/admin/login` and `/auth/session` return `user.role`.
+
+A role that isn't allowed gets **403** `{ error: "Your role doesn't allow this action", code: "forbidden_role" }` (`requireRole` in `middleware/auth.middleware.js`; restaurant/rider tokens pass it untouched, so it can sit on shared routes).
+
+| | super_admin | ops | support |
+|---|---|---|---|
+| Every admin `GET` (dashboard, orders, riders, restaurants, customers, coupons, settlements, selfies…) | yes | yes | yes |
+| `GET /admin/customers/export.csv`, anything under `/admin/admins` | yes | no | no |
+| `POST /admin/orders/:id/cancel` | yes | yes | yes |
+| `POST /admin/orders/:id/reassign-rider` | yes | yes | no |
+| Restaurants: onboard, `PATCH`, add/remove category, `POST …/verification` | yes | yes | no |
+| Riders: `PATCH` status, `POST …/verification` | yes | yes | no |
+| Catalog: `PATCH /admin/categories/:id`, `…/merge`, admin `POST /categories`, `POST`/`PATCH /items`, `POST /uploads/image` | yes | yes | no |
+| Customers: `PATCH /admin/customers/:id` (block/unblock) | yes | yes | no |
+| `POST /admin/riders/:riderId/settle`, `POST /admin/customers/:id/wallet-credit`, `POST`/`PATCH /admin/coupons` | yes | no | no |
+
+| Method | Path | Who | Body | Notes |
+|---|---|---|---|---|
+| GET | `/admin/admins` | super_admin | — | → `{ admins: [{ id, name, email, role, is_active, last_login_at, created_at }] }`. Never `password_hash`. |
+| POST | `/admin/admins` | super_admin | `{ name, email, password, role }` | → **201** `{ admin }`. 400 on a bad field; password must be 10–72 chars; **409** on a duplicate email (case-insensitive). |
+| PATCH | `/admin/admins/:id` | super_admin | any of `{ name, role, is_active, password }` | `password` = reset. → `{ admin }`. 400: can't change your own role or disable yourself; **409**: the last active super_admin can't be demoted or disabled. No delete — disable instead. A password reset does not end the target's existing sessions (JWTs are stateless) — disable + re-enable if that's needed. |
+| POST | `/admin/me/password` | any admin | `{ current_password, new_password }` | → `{ message }`. A wrong current password is **400**, not 401 (the panel signs out on any 401). |
+
+`node scripts/create-admin.js "Name" "email" "password" [super_admin|ops|support]` still bootstraps the first account; day-to-day accounts are created with `POST /admin/admins`. Pre-existing admins were migrated as active with their old role.
+
 ### Login/ordering enforcement (not an endpoint — a cross-cutting rule)
 
 A **blocked customer** or a **suspended rider/restaurant** cannot get a new session (`POST /auth/otp/verify` returns 403 even with the correct OTP) and, for a customer specifically, cannot place an order even on an already-issued token (`POST /orders` re-checks `users.status`). A suspended rider was already excluded from new auto-assignment (routing only considers `status: 'active'` riders); this closes the login-side gap that let a suspended/blocked account keep using a token issued before the change.

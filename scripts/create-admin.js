@@ -3,7 +3,8 @@
 // the only way an admin account gets created.
 //
 // Usage: node scripts/create-admin.js "Name" "email@example.com" "password" [role]
-// role defaults to "ops"; pass "super_admin" for the first account.
+// role defaults to "ops"; pass "super_admin" for the first account, or "support" for a read-only
+// account that can only cancel orders. (Day-to-day accounts are created from the Admin Panel.)
 require("dotenv").config();
 const bcrypt = require("bcrypt");
 const db = require("../src/config/db");
@@ -15,8 +16,8 @@ async function main() {
     console.error('Usage: node scripts/create-admin.js "Name" "email@example.com" "password" [role]');
     process.exit(1);
   }
-  if (!["super_admin", "ops"].includes(role)) {
-    console.error('role must be "super_admin" or "ops"');
+  if (!["super_admin", "ops", "support"].includes(role)) {
+    console.error('role must be "super_admin", "ops" or "support"');
     process.exit(1);
   }
 

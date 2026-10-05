@@ -134,6 +134,15 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   migration are `approved`** (column default); only admin-onboarded kitchens and
   self-signed-up riders start `pending`. Any NEW restaurant/rider route is gated
   automatically — don't add an `allowUnverified` opt-out without a reason.
+- **Admin roles are enforced server-side** (added 2026-10-05): `super_admin`
+  (everything), `ops` (orders/restaurants/riders/catalog/customer-block writes;
+  NOT settlement, wallet credit, coupons, customer CSV export or admin
+  management) and `support` (read everything, plus cancel orders). A route
+  guards itself with `requireRole(...)` after `requireAuth`; the role and
+  `is_active` are re-read from the DB on every admin request, so disabling an
+  admin or changing their role is instant despite the 30-day JWT. Any NEW admin
+  write route needs an explicit `requireRole` — without one every role,
+  `support` included, can call it. Full table in `docs/API.md`.
 - **Customer app T&C popup** (added 2026-09-30, unrelated to the bullet
   above): a lightweight, one-time terms-acceptance checkbox for customers
   only — no selfie, no admin review. `agreementRequired` on `GET /profile/me`,

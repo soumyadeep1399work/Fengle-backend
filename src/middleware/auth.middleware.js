@@ -35,6 +35,21 @@ function requireAuth(allowedTypes, { allowUnverified = false } = {}) {
       return res.status(403).json({ error: "Not authorized for this resource" });
     }
 
+    // Admins are re-read from the DB on every request (not trusted from the 30-day JWT): a disabled
+    // admin is locked out immediately, and a role change applies on the very next call.
+    if (decoded.type === "admin") {
+      try {
+        const admin = await db("admins").where({ id: decoded.id }).select("role", "is_active").first();
+        if (!admin) return res.status(401).json({ error: "Invalid or expired token" });
+        if (!admin.is_active) {
+          return res.status(401).json({ error: "This admin account has been disabled", code: "account_disabled" });
+        }
+        decoded.role = admin.role;
+      } catch (err) {
+        return next(err);
+      }
+    }
+
     const partnerTable = PARTNER_TABLES[decoded.type];
     if (partnerTable && !allowUnverified) {
       try {
@@ -61,4 +76,19 @@ function requireAuth(allowedTypes, { allowUnverified = false } = {}) {
   };
 }
 
-module.exports = { requireAuth };
+/**
+ * Role gate for admin accounts, used after requireAuth. Non-admin tokens pass
+ * straight through, so it can sit on routes that restaurants share (POST /items,
+ * POST /uploads/image) without affecting them.
+ * @param {...('super_admin'|'ops'|'support')} roles
+ */
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (req.auth && req.auth.type === "admin" && !roles.includes(req.auth.role)) {
+      return res.status(403).json({ error: "Your role doesn't allow this action", code: "forbidden_role" });
+    }
+    next();
+  };
+}
+
+module.exports = { requireAuth, requireRole };

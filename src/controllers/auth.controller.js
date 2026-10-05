@@ -151,6 +151,11 @@ async function adminLogin(req, res) {
     return res.status(401).json({ error: "Invalid email or password" });
   }
 
+  if (!admin.is_active) {
+    return res.status(403).json({ error: "This account has been disabled. Ask a super admin to re-enable it.", code: "account_disabled" });
+  }
+
+  await db("admins").where({ id: admin.id }).update({ last_login_at: new Date() });
   const token = signToken({ id: admin.id, type: "admin" });
 
   return res.json({

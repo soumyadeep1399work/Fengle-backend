@@ -1462,6 +1462,147 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 35: Admin roles (super_admin / ops / support), admin management, per-request disable ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const hash = await bcrypt.hash("a-long-password-1", 4);
+    const mk = async (name, role) => {
+      const [id] = await db("admins").insert({ name, email: `${name}@rbac.test`, password_hash: hash, role });
+      return { id, token: signToken({ id, type: "admin" }) };
+    };
+    const superA = await mk("rbac-super", "super_admin");
+    const opsA = await mk("rbac-ops", "ops");
+    const supA = await mk("rbac-support", "support");
+    const call = async (who, method, p, body) => {
+      const res = await fetch(base + p, {
+        method,
+        headers: { Authorization: `Bearer ${who.token}`, ...(body ? { "Content-Type": "application/json" } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const text = await res.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch { /* csv etc. */ }
+      return { status: res.status, body: json };
+    };
+    const forbidden = (r) => r.status === 403 && r.body && r.body.code === "forbidden_role";
+
+    try {
+      // [method, path, body, allowed roles]. Allowed calls use ids/bodies that can't match anything, so
+      // they stop at validation/404 inside the handler and change nothing.
+      const ALL = ["super_admin", "ops", "support"], STAFF = ["super_admin", "ops"], SUPER = ["super_admin"];
+      const matrix = [
+        ["GET", "/admin/dashboard", null, ALL],
+        ["GET", "/admin/orders", null, ALL],
+        ["GET", "/admin/riders", null, ALL],
+        ["GET", "/admin/restaurants", null, ALL],
+        ["GET", "/admin/customers", null, ALL],
+        ["GET", "/admin/coupons", null, ALL],
+        ["GET", "/admin/settlements", null, ALL],
+        ["GET", "/admin/customers/export.csv", null, SUPER],
+        ["GET", "/admin/admins", null, SUPER],
+        ["POST", "/admin/admins", {}, SUPER],
+        ["PATCH", "/admin/admins/999999", { name: "x" }, SUPER],
+        ["POST", "/admin/orders/999999/cancel", {}, ALL],
+        ["POST", "/admin/orders/999999/reassign-rider", {}, STAFF],
+        ["POST", "/admin/restaurants", {}, STAFF],
+        ["PATCH", "/admin/restaurants/999999", {}, STAFF],
+        ["POST", "/admin/restaurants/999999/categories", {}, STAFF],
+        ["DELETE", "/admin/restaurants/999999/categories/1", null, STAFF],
+        ["POST", "/admin/restaurants/999999/verification", {}, STAFF],
+        ["PATCH", "/admin/riders/999999", {}, STAFF],
+        ["POST", "/admin/riders/999999/verification", {}, STAFF],
+        ["POST", "/admin/riders/999999/settle", {}, SUPER],
+        ["PATCH", "/admin/categories/999999", {}, STAFF],
+        ["POST", "/admin/categories/999999/merge", {}, STAFF],
+        ["POST", "/categories", {}, STAFF],
+        ["POST", "/items", {}, STAFF],
+        ["PATCH", "/items/999999", {}, STAFF],
+        ["POST", "/uploads/image", null, STAFF],
+        ["PATCH", "/admin/customers/999999", {}, STAFF],
+        ["POST", "/admin/customers/999999/wallet-credit", {}, SUPER],
+        ["POST", "/admin/coupons", {}, SUPER],
+        ["PATCH", "/admin/coupons/999999", {}, SUPER],
+      ];
+      const who = { super_admin: superA, ops: opsA, support: supA };
+      let wrong = [];
+      for (const [method, p, body, allowed] of matrix) {
+        for (const role of ALL) {
+          const r = await call(who[role], method, p, body);
+          const shouldPass = allowed.includes(role);
+          if (shouldPass === forbidden(r)) wrong.push(`${role} ${method} ${p} -> ${r.status}${forbidden(r) ? " forbidden_role" : ""}`);
+        }
+      }
+      const crashProbe = await call(superA, "POST", "/admin/restaurants/999999/categories", {}); // handler throws on the missing category_id
+      check("a controller that throws answers 500 JSON instead of crashing the process (express-async-errors)", crashProbe.status === 500 && crashProbe.body && typeof crashProbe.body.error === "string");
+      check(`permission matrix holds for all ${matrix.length * 3} role x route combinations (wrong: ${wrong.join("; ") || "none"})`, wrong.length === 0);
+
+      // Admin management.
+      const created = await call(superA, "POST", "/admin/admins", { name: "New Support", email: "new.support@rbac.test", password: "temp-password-123", role: "support" });
+      check("POST /admin/admins -> 201 with the admin and no password_hash", created.status === 201 && created.body.admin.role === "support" && created.body.admin.is_active === true && !("password_hash" in created.body.admin));
+      check("duplicate email (any case) -> 409", (await call(superA, "POST", "/admin/admins", { name: "Dup", email: "NEW.SUPPORT@rbac.test", password: "temp-password-123", role: "ops" })).status === 409);
+      check("password under 10 chars -> 400", (await call(superA, "POST", "/admin/admins", { name: "Short", email: "short@rbac.test", password: "123456789", role: "ops" })).status === 400);
+      check("unknown role -> 400", (await call(superA, "POST", "/admin/admins", { name: "Bad", email: "badrole@rbac.test", password: "temp-password-123", role: "owner" })).status === 400);
+      const list = await call(superA, "GET", "/admin/admins");
+      check("GET /admin/admins lists admins with last_login_at and never password_hash", list.status === 200 && list.body.admins.length >= 4 && list.body.admins.every((a) => !("password_hash" in a) && "last_login_at" in a && typeof a.is_active === "boolean"));
+
+      // Login: new account works with its password, stamps last_login_at, returns the role.
+      const loginRes = await fetch(base.replace("/api/v1", "") + "/api/v1/auth/admin/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "new.support@rbac.test", password: "temp-password-123" }) });
+      const loginBody = await loginRes.json();
+      check("the new admin can log in; the response carries role", loginRes.status === 200 && loginBody.user.role === "support");
+      check("...and last_login_at is stamped", (await db("admins").where({ id: created.body.admin.id }).first()).last_login_at != null);
+
+      // Guards.
+      check("an admin can't change their own role -> 400", (await call(superA, "PATCH", `/admin/admins/${superA.id}`, { role: "ops" })).status === 400);
+      check("an admin can't disable themselves -> 400", (await call(superA, "PATCH", `/admin/admins/${superA.id}`, { is_active: false })).status === 400);
+      const noop = await call(superA, "PATCH", `/admin/admins/${superA.id}`, { name: "rbac-super", role: "super_admin" });
+      check("re-sending your own current role is not a change -> 200", noop.status === 200);
+      const second = await mk("rbac-super2", "super_admin");
+      check("a super admin can demote another super admin while another active one remains", (await call(superA, "PATCH", `/admin/admins/${second.id}`, { role: "ops" })).status === 200);
+      // superA is now the only active super_admin. The guard needs a *different* acting admin, so call the handler directly.
+      const adminAdminsCtl = require("./src/controllers/adminAdmins.controller");
+      const lastGuard = fakeRes();
+      await adminAdminsCtl.updateAdmin({ params: { id: String(superA.id) }, body: { is_active: false }, auth: { id: second.id, type: "admin", role: "super_admin" } }, lastGuard);
+      check("the last active super admin can't be disabled by someone else -> 409", lastGuard.statusCode === 409);
+      const lastDemote = fakeRes();
+      await adminAdminsCtl.updateAdmin({ params: { id: String(superA.id) }, body: { role: "ops" }, auth: { id: second.id, type: "admin", role: "super_admin" } }, lastDemote);
+      check("...nor demoted -> 409", lastDemote.statusCode === 409);
+      check("...and nothing changed", (await db("admins").where({ id: superA.id }).first()).role === "super_admin" && !!(await db("admins").where({ id: superA.id }).first()).is_active);
+
+      // Per-request disable: an already-issued token stops working at once.
+      const victim = created.body.admin.id;
+      const victimTok = { token: signToken({ id: victim, type: "admin" }) };
+      check("before disabling, the new admin's token works", (await call(victimTok, "GET", "/admin/dashboard")).status === 200);
+      const off = await call(superA, "PATCH", `/admin/admins/${victim}`, { is_active: false });
+      check("PATCH is_active:false -> 200", off.status === 200 && off.body.admin.is_active === false);
+      const afterOff = await call(victimTok, "GET", "/admin/dashboard");
+      check("...and that SAME already-issued token is refused immediately (401 account_disabled)", afterOff.status === 401 && afterOff.body.code === "account_disabled");
+      const loginOff = await fetch(base + "/auth/admin/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "new.support@rbac.test", password: "temp-password-123" }) });
+      check("a disabled admin can't log in (403)", loginOff.status === 403);
+      await call(superA, "PATCH", `/admin/admins/${victim}`, { is_active: true, role: "ops" });
+      check("re-enabled + role change applies to the old token on the next request (ops now can reassign)", !forbidden(await call(victimTok, "POST", "/admin/orders/999999/reassign-rider", {})));
+
+      // Password reset by super admin + self-service change.
+      await call(superA, "PATCH", `/admin/admins/${victim}`, { password: "reset-password-456" });
+      const reLogin = await fetch(base + "/auth/admin/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "new.support@rbac.test", password: "reset-password-456" }) });
+      check("a super-admin password reset takes effect (old password no longer needed)", reLogin.status === 200);
+      check("POST /admin/me/password with the wrong current password -> 400 (not 401, which would log the panel out)", (await call(victimTok, "POST", "/admin/me/password", { current_password: "nope-nope-nope", new_password: "another-pass-789" })).status === 400);
+      check("new password under 10 chars -> 400", (await call(victimTok, "POST", "/admin/me/password", { current_password: "reset-password-456", new_password: "short" })).status === 400);
+      check("changing it with the right current password -> 200", (await call(victimTok, "POST", "/admin/me/password", { current_password: "reset-password-456", new_password: "another-pass-789" })).status === 200);
+      const finalLogin = await fetch(base + "/auth/admin/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "new.support@rbac.test", password: "another-pass-789" }) });
+      check("...and the new password is the one that logs in", finalLogin.status === 200);
+      check("every role may change its own password (support included)", (await call(supA, "POST", "/admin/me/password", { current_password: "a-long-password-1", new_password: "support-new-pass-1" })).status === 200);
+      check("/auth/session returns the live role", (await (await fetch(base + "/auth/session", { headers: { Authorization: `Bearer ${victimTok.token}` } })).json()).user.role === "ops");
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@rbac.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }
