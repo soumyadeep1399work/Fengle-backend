@@ -1,9 +1,12 @@
 const storage = require("../services/storage.service");
+const { toWebp } = require("../services/imageProcess.service");
 
 /**
  * POST /uploads/image — multipart/form-data with one file field, `image`.
  * multer (see upload.routes.js) has already enforced the size cap and single
- * file; this validates the bytes really are a JPEG/PNG/WebP and stores them.
+ * file; this validates the bytes really are a JPEG/PNG/WebP, re-encodes them as a
+ * resized WebP (see imageProcess.service.js) and stores that — so the stored
+ * object, and the returned URL, is always a .webp whatever was sent.
  *
  * The returned URL is absolute. When AWS_S3_BUCKET is set, storage.saveImage
  * uploads to S3 and returns the final object URL directly. Otherwise (dev
@@ -24,7 +27,15 @@ async function uploadImage(req, res) {
     return res.status(400).json({ error: "Only JPEG, PNG or WebP images are accepted" });
   }
 
-  const { publicPath, url } = await storage.saveImage(req.file.buffer, ext);
+  let webp;
+  try {
+    webp = await toWebp(req.file.buffer);
+  } catch (err) {
+    // Right magic bytes but undecodable (truncated, corrupt) or absurdly large in pixels.
+    return res.status(400).json({ error: "That image could not be read. Try a different photo." });
+  }
+
+  const { publicPath, url } = await storage.saveImage(webp, "webp");
   if (url) return res.status(201).json({ url });
 
   const base = (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/+$/, "");

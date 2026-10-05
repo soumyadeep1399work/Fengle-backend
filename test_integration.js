@@ -1416,6 +1416,52 @@ async function main() {
     check("customers are never held to the partner gate", (await runGate(requireAuth(["customer"]), bearer({ id: customerId, type: "customer" }))).passed === true);
   }
 
+  console.log("\n--- Test 34: Catalog photo uploads are re-encoded as small WebP on the server ---");
+  {
+    const sharp = require("sharp");
+    const fs = require("fs");
+    const path = require("path");
+    const uploadController = require("./src/controllers/upload.controller");
+    const storageService = require("./src/services/storage.service");
+    const savedBucket = process.env.AWS_S3_BUCKET;
+    delete process.env.AWS_S3_BUCKET; // keep this test off the real S3 bucket: it writes to local disk instead
+    const written = [];
+    try {
+      const upload = async (buffer) => {
+        const res = fakeRes();
+        await uploadController.uploadImage({ file: buffer ? { buffer } : undefined, protocol: "http", get: () => "localhost:4000" }, res);
+        if (res.body && res.body.url) written.push(path.join(__dirname, "uploads", path.basename(res.body.url)));
+        return res;
+      };
+      // A large noisy JPEG with an EXIF orientation tag, as a phone would send.
+      const noise = Buffer.alloc(3000 * 2000 * 3);
+      for (let i = 0; i < noise.length; i++) noise[i] = (i * 7919) & 0xff;
+      const bigJpeg = await sharp(noise, { raw: { width: 3000, height: 2000, channels: 3 } }).jpeg({ quality: 95 }).withMetadata({ orientation: 6 }).toBuffer();
+      const jpegRes = await upload(bigJpeg);
+      check("a JPEG upload -> 201 with a .webp URL", jpegRes.statusCode === 201 && /\.webp$/.test(jpegRes.body.url));
+      const stored = await fs.promises.readFile(written[0]);
+      check("the stored bytes really are WebP (magic bytes), not the original JPEG", storageService.detectImageType(stored) === "webp");
+      const meta = await sharp(stored).metadata();
+      check("resized so the longest side is <= 1000px (EXIF rotation applied: 3000x2000 portrait -> 667x1000)", Math.max(meta.width, meta.height) === 1000 && meta.height > meta.width);
+      check("...and far smaller than the original", stored.length < bigJpeg.length / 3);
+      check("EXIF metadata is stripped", !meta.exif);
+
+      const pngBuf = await sharp({ create: { width: 200, height: 100, channels: 3, background: "#4B18A6" } }).png().toBuffer();
+      const pngRes = await upload(pngBuf);
+      const smallMeta = await sharp(await fs.promises.readFile(written[1])).metadata();
+      check("a PNG upload is converted too, and a small image is not enlarged", pngRes.statusCode === 201 && /\.webp$/.test(pngRes.body.url) && smallMeta.width === 200 && smallMeta.height === 100);
+
+      const corrupt = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(40, 7)]);
+      const corruptRes = await upload(corrupt);
+      check("right magic bytes but undecodable -> 400, nothing stored", corruptRes.statusCode === 400 && written.length === 2);
+      check("not an image at all -> 400", (await upload(Buffer.from("this is definitely not an image file"))).statusCode === 400);
+      check("no file -> 400", (await upload(null)).statusCode === 400);
+    } finally {
+      if (savedBucket !== undefined) process.env.AWS_S3_BUCKET = savedBucket;
+      for (const f of written) await fs.promises.unlink(f).catch(() => {});
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

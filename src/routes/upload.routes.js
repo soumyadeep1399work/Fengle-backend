@@ -3,7 +3,9 @@ const multer = require("multer");
 const { requireAuth } = require("../middleware/auth.middleware");
 const uploads = require("../controllers/upload.controller");
 
-const MAX_IMAGE_BYTES = 2 * 1024 * 1024; // the Restaurant app sends ~200 KB; 2 MB is generous headroom, not a target
+// The Restaurant app sends ~200 KB; the Admin Panel sends whatever file was picked. The server
+// re-encodes everything to a small WebP, so this only bounds what we are willing to decode.
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 const router = express.Router();
 

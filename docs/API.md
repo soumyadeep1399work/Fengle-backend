@@ -185,7 +185,7 @@ Customer pushes never name the kitchen. A customer's own cancellation sends noth
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/uploads/image` | `multipart/form-data` with exactly **one file field named `image`**. Accepts **JPEG, PNG or WebP**, identified by the file's actual bytes (the client's Content-Type and file name are ignored, so a renamed text file or an SVG is rejected). Max **2 MB**. → **201** `{ url }` — an **absolute** URL like `http://192.168.1.16:4000/uploads/<uuid>.jpg`, ready to send as `image_url` to `POST /items`. |
+| POST | `/uploads/image` | `multipart/form-data` with exactly **one file field named `image`**. Accepts **JPEG, PNG or WebP**, identified by the file's actual bytes (the client's Content-Type and file name are ignored, so a renamed text file or an SVG is rejected). Max **5 MB** (413 above that). The server **re-encodes every upload as WebP** (longest side ≤1000 px, quality 78, EXIF/GPS stripped; `sharp`, one conversion at a time), so the stored file is always `.webp` whatever was sent; undecodable/corrupt bytes or >40 megapixels → 400. → **201** `{ url }` — an **absolute** URL like `http://192.168.1.16:4000/uploads/<uuid>.webp`, ready to send as `image_url` to `POST /items`. Agreement selfies are *not* converted. |
 
 Errors: **400** — no file, wrong field name, more than one file, not multipart, empty file, or not a JPEG/PNG/WebP; **413** — larger than 2 MB; **401** — no token; **403** — customer/rider token.
 
