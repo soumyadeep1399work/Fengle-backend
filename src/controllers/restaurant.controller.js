@@ -60,7 +60,10 @@ async function listRestaurants(req, res) {
 
   const { n: total } = await db("restaurants").count({ n: "*" }).first();
   const restaurants = await db("restaurants")
-    .select(...RESTAURANT_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion")
+    .select(
+      ...RESTAURANT_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion",
+      db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie")
+    )
     .orderBy("name")
     .limit(limit)
     .offset(offset);
@@ -70,7 +73,7 @@ async function listRestaurants(req, res) {
   const orderCountById = Object.fromEntries(orderCountRows.map((r) => [r.restaurant_id, Number(r.n)]));
 
   res.json({
-    restaurants: restaurants.map((r) => ({ ...r, order_count: orderCountById[r.id] || 0 })),
+    restaurants: restaurants.map((r) => ({ ...r, hasAgreementSelfie: !!r.hasAgreementSelfie, order_count: orderCountById[r.id] || 0 })),
     page, limit, total: Number(total),
   });
 }
@@ -144,9 +147,13 @@ async function getRestaurantDetail(req, res) {
   const { id } = req.params;
   const restaurant = await db("restaurants")
     .where({ id })
-    .select(...RESTAURANT_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion")
+    .select(
+      ...RESTAURANT_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion",
+      db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie")
+    )
     .first();
   if (!restaurant) return res.status(404).json({ error: "Restaurant not found" });
+  restaurant.hasAgreementSelfie = !!restaurant.hasAgreementSelfie;
 
   const categories = await db("restaurant_categories")
     .join("categories", "categories.id", "restaurant_categories.category_id")

@@ -961,10 +961,13 @@ async function main() {
   await restaurantController.listRestaurants({ query: {} }, adminRestList);
   const restARow = adminRestList.body.restaurants.find((r) => r.id === restA);
   check("GET /admin/restaurants exposes agreementAcceptedAt/agreementVersion", restARow.agreementAcceptedAt != null && restARow.agreementVersion === 1);
+  const restBRow = adminRestList.body.restaurants.find((r) => r.id === restB);
+  check("GET /admin/restaurants hasAgreementSelfie: true once uploaded, false otherwise (never the storage path)", restARow.hasAgreementSelfie === true && restBRow.hasAgreementSelfie === false && !("agreement_selfie_path" in restARow));
 
   const adminRestDetail = fakeRes();
   await restaurantController.getRestaurantDetail(fakeReq({}, { id: restA }, adminAuth), adminRestDetail);
   check("GET /admin/restaurants/:id exposes agreementAcceptedAt/agreementVersion", adminRestDetail.body.restaurant.agreementVersion === 1);
+  check("GET /admin/restaurants/:id exposes hasAgreementSelfie: true", adminRestDetail.body.restaurant.hasAgreementSelfie === true);
 
   const selfieRes = fakeStreamRes();
   await restaurantController.getRestaurantAgreementSelfie(fakeReq({}, { id: restA }, adminAuth), selfieRes);
@@ -994,10 +997,13 @@ async function main() {
   const listAdminRidersAgreement = await listAdminRiders({});
   const riderRow = listAdminRidersAgreement.body.riders.find((r) => r.id === riderId);
   check("GET /admin/riders exposes agreementAcceptedAt/agreementVersion", riderRow.agreementAcceptedAt != null && riderRow.agreementVersion === 1);
+  const riderNoRow = listAdminRidersAgreement.body.riders.find((r) => r.id === secondRiderId);
+  check("GET /admin/riders hasAgreementSelfie: true once uploaded, false otherwise", riderRow.hasAgreementSelfie === true && (!riderNoRow || riderNoRow.hasAgreementSelfie === false));
 
   const adminRiderDetail = fakeRes();
   await adminController.getRider(fakeReq({}, { id: riderId }, adminAuth), adminRiderDetail);
   check("GET /admin/riders/:id exposes agreementAcceptedAt/agreementVersion", adminRiderDetail.body.rider.agreementVersion === 1);
+  check("GET /admin/riders/:id exposes hasAgreementSelfie: true and never the storage path", adminRiderDetail.body.rider.hasAgreementSelfie === true && !("agreement_selfie_path" in adminRiderDetail.body.rider));
 
   const riderSelfieRes = fakeStreamRes();
   await adminController.getRiderAgreementSelfie(fakeReq({}, { id: riderId }, adminAuth), riderSelfieRes);

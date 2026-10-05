@@ -52,7 +52,8 @@ async function listRiders(req, res) {
     .offset(offset)
     .select(
       "id", "name", "phone", "status", "wallet_balance", "vehicle_type", "vehicle_number", "updated_at", "created_at",
-      "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion"
+      "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion",
+      db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie")
     );
 
   const riderIds = riders.map((r) => r.id);
@@ -70,6 +71,7 @@ async function listRiders(req, res) {
       vehicle_type: r.vehicle_type, vehicle_number: r.vehicle_number,
       last_active_at: r.updated_at, created_at: r.created_at,
       agreementAcceptedAt: r.agreementAcceptedAt, agreementVersion: r.agreementVersion,
+      hasAgreementSelfie: !!r.hasAgreementSelfie,
     })),
     page, limit, total: Number(total),
   });
@@ -85,9 +87,13 @@ async function getRider(req, res) {
   const { id } = req.params;
   const rider = await db("riders")
     .where({ id })
-    .select(...RIDER_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion")
+    .select(
+      ...RIDER_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion",
+      db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie")
+    )
     .first();
   if (!rider) return res.status(404).json({ error: "Rider not found" });
+  rider.hasAgreementSelfie = !!rider.hasAgreementSelfie;
 
   const walletLedger = await db("wallet_ledger").where({ owner_type: "rider", owner_id: id }).orderBy("created_at", "desc").limit(200);
   const orders = await listOrdersForOwner("rider_id", id);
