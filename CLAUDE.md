@@ -103,6 +103,13 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   rider must explicitly confirm the exact amount collected at the
   "Mark Delivered" step for a COD order — this is the trigger that creates
   the ledger entry. Do not skip this confirmation step in the UI.
+- **Rider pay is admin-configurable** (2026-10-28): `payout = max(min_payout,
+  base_payout + per_km_rate × distance_km) + incentive_per_delivery`, set by a
+  super_admin (`PUT /admin/settings/rider-pay`, append-only history) and
+  **frozen on the order at delivery** (`orders.rider_payout` + breakdown), so a
+  later rate change never rewrites earnings; settlement pays the frozen figure
+  (older orders without one use the current formula). Customers and
+  restaurants never see it. See `services/riderPay.service.js`.
 - **Wallet** is shared infrastructure for both customer refunds/credits and
   rider COD reconciliation — see `wallet_ledger` table (owner_type/owner_id
   polymorphic pattern).

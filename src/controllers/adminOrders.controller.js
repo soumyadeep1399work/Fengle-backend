@@ -1,5 +1,6 @@
 const db = require("../config/db");
 const { presentLinePortion } = require("../utils/portion");
+const riderPay = require("../services/riderPay.service");
 const wallet = require("../services/wallet.service");
 const { paginationParams } = require("../utils/pagination");
 const { scrubDeliveryOtp } = require("./order.controller");
@@ -51,6 +52,7 @@ async function listOrders(req, res) {
     .offset(offset)
     .select(
       "orders.id", "orders.status", "orders.payment_method", "orders.payment_status", "orders.grand_total", "orders.created_at",
+      "orders.rider_payout",
       "users.id as customer_id", "users.name as customer_name", "users.phone as customer_phone",
       "restaurants.id as restaurant_id", "restaurants.name as restaurant_name",
       "riders.id as rider_id", "riders.name as rider_name"
@@ -76,6 +78,7 @@ async function listOrders(req, res) {
   res.json({
     orders: rows.map((r) => ({
       ...r,
+      rider_payout: r.rider_payout == null ? null : Number(r.rider_payout),
       category_names: [...(categoryNamesByOrder[r.id] || [])],
       item_count: itemCountByOrder[r.id] || 0,
     })),
@@ -118,7 +121,9 @@ async function getOrder(req, res) {
     .then((rows) => rows.map(presentLinePortion));
   const walletLedger = await db("wallet_ledger").where({ related_order_id: id }).orderBy("created_at", "asc");
 
-  const { delivery_otp, ...safeOrder } = order;
+  const { delivery_otp, rider_payout_breakdown, ...safeOrder } = order;
+  safeOrder.rider_payout = safeOrder.rider_payout == null ? null : Number(safeOrder.rider_payout);
+  safeOrder.rider_payout_breakdown = riderPay.parseBreakdown(rider_payout_breakdown);
 
   res.json({ order: safeOrder, customer, restaurant, rider, items, wallet_ledger: walletLedger });
 }
@@ -141,6 +146,7 @@ async function listOrdersForOwner(column, ownerId, limit = 200) {
     .select(
       "orders.id", "orders.customer_id", "orders.restaurant_id", "orders.rider_id",
       "orders.status", "orders.payment_method", "orders.payment_status", "orders.grand_total", "orders.created_at",
+      "orders.rider_payout",
       "restaurants.name as restaurant_name", "riders.name as rider_name"
     );
 
@@ -154,7 +160,7 @@ async function listOrdersForOwner(column, ownerId, limit = 200) {
     itemCountByOrder[row.order_id] = (itemCountByOrder[row.order_id] || 0) + 1;
     (categoryNamesByOrder[row.order_id] ||= new Set()).add(row.category_name);
   }
-  return rows.map((r) => ({ ...r, category_names: [...(categoryNamesByOrder[r.id] || [])], item_count: itemCountByOrder[r.id] || 0 }));
+  return rows.map((r) => ({ ...r, rider_payout: r.rider_payout == null ? null : Number(r.rider_payout), category_names: [...(categoryNamesByOrder[r.id] || [])], item_count: itemCountByOrder[r.id] || 0 }));
 }
 
 /**

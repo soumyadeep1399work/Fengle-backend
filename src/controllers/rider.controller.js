@@ -1,5 +1,5 @@
 const db = require("../config/db");
-const { RIDER_RATE_PER_KM, MIN_EARNING_PER_DELIVERY } = require("../services/settlement.service");
+const riderPay = require("../services/riderPay.service");
 const { CURRENT_AGREEMENT_VERSION, agreementRequired } = require("../utils/agreement");
 const storage = require("../services/storage.service");
 const partnerDocuments = require("../services/partnerDocuments.service");
@@ -13,7 +13,14 @@ const VEHICLE_TYPES = ["bike", "scooter", "bicycle", "car"];
  * confirmed with the client and the env vars change.
  */
 async function getMyRate(req, res) {
-  res.json({ rate_per_km: RIDER_RATE_PER_KM, min_earning_per_delivery: MIN_EARNING_PER_DELIVERY });
+  const c = await riderPay.getCurrentConfig();
+  // rate_per_km / min_earning_per_delivery are the original keys (older Rider app builds read them);
+  // base_payout and incentive_per_delivery are new. The formula is on riderPay.FORMULA.
+  res.json({
+    rate_per_km: c.per_km_rate, min_earning_per_delivery: c.min_payout,
+    base_payout: c.base_payout, incentive_per_delivery: c.incentive_per_delivery,
+    formula: riderPay.FORMULA,
+  });
 }
 
 /**

@@ -1,12 +1,10 @@
 const db = require("../config/db");
 const wallet = require("../services/wallet.service");
-const { haversineDistanceKm } = require("../utils/geo");
+const riderPay = require("./riderPay.service");
 
-// PLACEHOLDER RATE — this was never pinned down in the confirmed business
-// rules (CLAUDE.md covers the COD/wallet *mechanism*, not the exact rider
-// earning formula). Treat this as a starting default to confirm with the
-// client, not a settled figure. Configurable via env so it can change
-// without a code deploy.
+// LEGACY DEFAULTS — rider pay is now admin-configurable (rider_pay_config, see
+// riderPay.service.js). These env values only seed the first config row and keep
+// GET /riders/me/rate's old keys alive for older Rider app builds.
 const RIDER_RATE_PER_KM = Number(process.env.RIDER_RATE_PER_KM) || 8;
 const MIN_EARNING_PER_DELIVERY = Number(process.env.RIDER_MIN_EARNING_PER_DELIVERY) || 15;
 
@@ -33,15 +31,15 @@ async function settleRider(riderId) {
   const restaurants = await db("restaurants").whereIn("id", restaurantIds);
   const restaurantById = Object.fromEntries(restaurants.map((r) => [r.id, r]));
 
+  // Each order pays what was frozen when it was delivered (admin-set rider pay at that moment);
+  // orders delivered before that existed fall back to the current formula.
+  const config = await riderPay.getCurrentConfig();
   let totalEarnings = 0;
+  let storedCount = 0;
   for (const order of unsettledOrders) {
-    const restaurant = restaurantById[order.restaurant_id];
-    const distanceKm = haversineDistanceKm(
-      Number(restaurant.lat), Number(restaurant.lng),
-      Number(order.delivery_lat), Number(order.delivery_lng)
-    );
-    const earning = Math.max(MIN_EARNING_PER_DELIVERY, Number((distanceKm * RIDER_RATE_PER_KM).toFixed(2)));
-    totalEarnings += earning;
+    const { payout, stored } = riderPay.payoutForSettlement({ order, restaurant: restaurantById[order.restaurant_id], config });
+    totalEarnings += payout;
+    if (stored) storedCount += 1;
   }
   totalEarnings = Number(totalEarnings.toFixed(2));
 
@@ -53,7 +51,7 @@ async function settleRider(riderId) {
         entryType: "credit",
         amount: totalEarnings,
         reason: "settlement_payout",
-        notes: `Settlement for ${unsettledOrders.length} deliveries at ₹${RIDER_RATE_PER_KM}/km (min ₹${MIN_EARNING_PER_DELIVERY}/delivery)`,
+        notes: `Settlement for ${unsettledOrders.length} deliveries (${storedCount} at their stored payout, ${unsettledOrders.length - storedCount} at the current rates)`,
       },
       trx
     );

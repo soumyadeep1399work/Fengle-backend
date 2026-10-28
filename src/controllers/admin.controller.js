@@ -106,7 +106,21 @@ async function getRider(req, res) {
   const orders = await listOrdersForOwner("rider_id", id);
   const [{ n: unsettled }] = await db("orders").where({ rider_id: id, status: "delivered" }).whereNull("rider_settled_at").count({ n: "*" });
 
+  // Payout history: what the rider has earned under the pay config in force at each delivery
+  // (frozen on the order). Older deliveries without a stored payout aren't counted here;
+  // settlement still pays them at the current formula.
+  const [payoutRow] = await db("orders")
+    .where({ rider_id: id, status: "delivered" })
+    .whereNotNull("rider_payout")
+    .select(
+      db.raw("COUNT(*) as n"),
+      db.raw("COALESCE(SUM(rider_payout), 0) as total"),
+      db.raw("COALESCE(SUM(CASE WHEN rider_settled_at IS NULL THEN rider_payout ELSE 0 END), 0) as unsettled")
+    );
+  const payouts = { deliveries: Number(payoutRow.n), total_earned: Number(Number(payoutRow.total).toFixed(2)), unsettled: Number(Number(payoutRow.unsettled).toFixed(2)) };
+
   res.json({
+    payouts,
     rider: {
       ...rider,
       wallet_balance: Number(rider.wallet_balance),

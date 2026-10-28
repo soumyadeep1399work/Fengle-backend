@@ -2012,6 +2012,112 @@ async function main() {
     check("admin create with offer >= price -> 400", (await create({ category_id: bengaliCatId, name: `BadOffer ${tag}`, price: 100, offer_price: 100 }, admin)).statusCode === 400);
   }
 
+  console.log("\n--- Test 38: Admin-configurable rider pay — settings + history, payout frozen at delivery, visibility, settlement ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const riderPaySvc = require("./src/services/riderPay.service");
+    const devtools = require("./src/services/devtools.service");
+    const { haversineDistanceKm } = require("./src/utils/geo");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const mkAdmin = async (name, role) => {
+      const [id] = await db("admins").insert({ name, email: `${name}@pay.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role });
+      return { id, token: signToken({ id, type: "admin" }) };
+    };
+    const superA = await mkAdmin("pay-super", "super_admin");
+    const opsA = await mkAdmin("pay-ops", "ops");
+    const call = async (who, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { Authorization: `Bearer ${who.token}`, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      let json = null; try { json = await r.json(); } catch { /* none */ }
+      return { status: r.status, body: json };
+    };
+    const otherRiders = await db("riders").select("id", "status");
+    try {
+      // ---- the pure formula
+      const cfg = { base_payout: 10, per_km_rate: 6, min_payout: 20, incentive_per_delivery: 5 };
+      const far = riderPaySvc.computePayout({ distanceKm: 2.5, config: cfg });
+      check("payout = max(min, base + per_km x km) + incentive: 2.5 km -> max(20, 10+15) + 5 = 30", far.payout === 30 && far.breakdown.min_applied === false && far.breakdown.distance_pay === 15 && far.breakdown.subtotal === 25);
+      const near = riderPaySvc.computePayout({ distanceKm: 0.5, config: cfg });
+      check("a short trip hits the minimum: 0.5 km -> max(20, 10+3) + 5 = 25, min_applied true", near.payout === 25 && near.breakdown.min_applied === true);
+      check("the breakdown carries the formula text", typeof far.breakdown.formula === "string" && far.breakdown.formula.includes("incentive_per_delivery"));
+
+      // ---- settings: read, validate, history, roles
+      const first = await call(opsA, "GET", "/admin/settings/rider-pay");
+      check("GET /admin/settings/rider-pay (any role) -> live config seeded from the old env placeholders (0 / 8 / 15 / 0), one history row",
+        first.status === 200 && first.body.settings.base_payout === 0 && first.body.settings.per_km_rate === 8 && first.body.settings.min_payout === 15 && first.body.settings.incentive_per_delivery === 0 && first.body.history.length === 1 && typeof first.body.formula === "string");
+      check("PUT by ops -> 403 forbidden_role", (await call(opsA, "PUT", "/admin/settings/rider-pay", cfg)).body.code === "forbidden_role");
+      check("PUT with a missing field -> 400", (await call(superA, "PUT", "/admin/settings/rider-pay", { base_payout: 10, per_km_rate: 6, min_payout: 20 })).status === 400);
+      check("PUT with a negative / text value -> 400", (await call(superA, "PUT", "/admin/settings/rider-pay", { ...cfg, per_km_rate: -1 })).status === 400 && (await call(superA, "PUT", "/admin/settings/rider-pay", { ...cfg, base_payout: "abc" })).status === 400);
+      check("PUT with every value 0 -> 400 (riders would earn nothing)", (await call(superA, "PUT", "/admin/settings/rider-pay", { base_payout: 0, per_km_rate: 0, min_payout: 0, incentive_per_delivery: 0 })).status === 400);
+      const put = await call(superA, "PUT", "/admin/settings/rider-pay", cfg);
+      check("PUT by super_admin -> 200 and it is now the live config", put.status === 200 && put.body.settings.base_payout === 10 && put.body.settings.incentive_per_delivery === 5);
+      const hist = await call(opsA, "GET", "/admin/settings/rider-pay");
+      check("history keeps both rows, newest first, with who changed it", hist.body.history.length === 2 && hist.body.settings.id === hist.body.history[0].id && hist.body.history[0].created_by_admin_name === "pay-super" && hist.body.history[1].created_by_admin_id === null);
+      const rateRes = fakeRes();
+      await riderCtl.getMyRate(fakeReq({}, {}, { id: riderId, type: "rider" }), rateRes);
+      check("GET /riders/me/rate follows the live config and keeps the old keys", rateRes.body.rate_per_km === 6 && rateRes.body.min_earning_per_delivery === 20 && rateRes.body.base_payout === 10 && rateRes.body.incentive_per_delivery === 5);
+
+      // ---- deliver an order: the payout is frozen on it
+      await db("riders").update({ status: "inactive" }); // so the auto-assigner can only pick the rider below
+      const [payRiderId] = await db("riders").insert({ name: "Pay Rider", phone: "8500000038", status: "active", last_known_lat: 22.5810, last_known_lng: 88.4610, wallet_balance: 0 });
+      const deliverOne = async (phone, lat, lng) => {
+        const [custId] = await db("users").insert({ name: "Pay Customer", phone, wallet_balance: 0 });
+        const placed = fakeRes();
+        await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: lat, delivery_lng: lng, delivery_address: "Pay St", payment_method: "cod" }, {}, { id: custId, type: "customer" }), placed);
+        const oid = placed.body.order.id;
+        await devtools.advanceOrder(oid, { to: "delivered" });
+        return { oid, custId };
+      };
+      const d1 = await deliverOne("8000000038", 22.6050, 88.4850);
+      const o1 = await db("orders").where({ id: d1.oid }).first();
+      const kitchen1 = await db("restaurants").where({ id: o1.restaurant_id }).first();
+      const km1 = haversineDistanceKm(Number(kitchen1.lat), Number(kitchen1.lng), Number(o1.delivery_lat), Number(o1.delivery_lng));
+      const expected1 = riderPaySvc.computePayout({ distanceKm: km1, config: cfg }).payout;
+      check("the order was delivered by the rider and has a frozen rider_payout under the live config", o1.status === "delivered" && o1.rider_id === payRiderId && Number(o1.rider_payout) === expected1 && o1.rider_pay_config_id === put.body.settings.id);
+
+      // ---- changing the config later never rewrites it
+      await call(superA, "PUT", "/admin/settings/rider-pay", { base_payout: 0, per_km_rate: 100, min_payout: 0, incentive_per_delivery: 0 });
+      check("a later rate change does NOT touch an already-delivered order's payout", Number((await db("orders").where({ id: d1.oid }).first()).rider_payout) === expected1);
+
+      // ---- who sees it
+      const orderAs = async (auth) => { const r = fakeRes(); await orderController.getOrder(fakeReq({}, { id: String(d1.oid) }, auth), r); return r.body.order; };
+      const asCustomer = await orderAs({ id: d1.custId, type: "customer" });
+      const asKitchen = await orderAs({ id: o1.restaurant_id, type: "restaurant" });
+      const asRider = await orderAs({ id: payRiderId, type: "rider" });
+      check("customer and restaurant views never carry the payout, breakdown or config id",
+        ["rider_payout", "rider_payout_breakdown", "rider_pay_config_id"].every((k) => !(k in asCustomer) && !(k in asKitchen)));
+      check("the rider sees their payout and a readable breakdown", asRider.rider_payout === expected1 && asRider.rider_payout_breakdown && asRider.rider_payout_breakdown.payout === expected1 && asRider.rider_payout_breakdown.distance_km > 0);
+      const listAs = async (auth) => { const r = fakeRes(); await orderController.listMyOrders(fakeReq({}, {}, auth, {}), r); return r.body.orders.find((x) => x.id === d1.oid); };
+      check("GET /orders list: the customer's rows have no payout; the rider's rows do", !("rider_payout" in (await listAs({ id: d1.custId, type: "customer" }))) && (await listAs({ id: payRiderId, type: "rider" })).rider_payout === expected1);
+      const adminOrder = await call(opsA, "GET", `/admin/orders/${d1.oid}`);
+      check("GET /admin/orders/:id shows rider_payout (number), the breakdown object and the config id", adminOrder.body.order.rider_payout === expected1 && adminOrder.body.order.rider_payout_breakdown.formula && adminOrder.body.order.rider_pay_config_id === put.body.settings.id);
+      const adminList = await call(opsA, "GET", `/admin/orders?rider_id=${payRiderId}`);
+      check("GET /admin/orders rows carry rider_payout", adminList.body.orders.find((x) => x.id === d1.oid).rider_payout === expected1);
+      const riderDetail = await call(opsA, "GET", `/admin/riders/${payRiderId}`);
+      check("GET /admin/riders/:id has the payout history: orders with rider_payout and totals (earned / unsettled)",
+        riderDetail.body.payouts.deliveries === 1 && riderDetail.body.payouts.total_earned === expected1 && riderDetail.body.payouts.unsettled === expected1 && riderDetail.body.orders.find((x) => x.id === d1.oid).rider_payout === expected1);
+
+      // ---- settlement pays the frozen payout; a pre-feature order (NULL payout) uses the current formula
+      const d2 = await deliverOne("8000000039", 22.5900, 88.4700);
+      const o2 = await db("orders").where({ id: d2.oid }).first();
+      const kitchen2 = await db("restaurants").where({ id: o2.restaurant_id }).first();
+      const km2 = haversineDistanceKm(Number(kitchen2.lat), Number(kitchen2.lng), Number(o2.delivery_lat), Number(o2.delivery_lng));
+      await db("orders").where({ id: d2.oid }).update({ rider_payout: null, rider_payout_breakdown: null, rider_pay_config_id: null }); // as if delivered before this feature
+      const liveCfg = await riderPaySvc.getCurrentConfig();
+      const fallback2 = riderPaySvc.computePayout({ distanceKm: km2, config: liveCfg }).payout;
+      const settled = await settlement.settleRider(payRiderId);
+      check("settlement = frozen payout of the new order + the CURRENT formula for the old one (rate x100 does not touch the frozen one)",
+        settled.ordersSettled === 2 && Math.abs(settled.totalEarnings - (expected1 + fallback2)) < 0.01);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      for (const r of otherRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      await db("admins").where("email", "like", "%@pay.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

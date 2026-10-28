@@ -6,6 +6,7 @@ const adminCustomers = require("../controllers/adminCustomers.controller");
 const adminCategories = require("../controllers/adminCategories.controller");
 const adminCoupons = require("../controllers/adminCoupons.controller");
 const adminAdmins = require("../controllers/adminAdmins.controller");
+const adminSettings = require("../controllers/adminSettings.controller");
 const partnerDocuments = require("../controllers/partnerDocuments.controller");
 
 const router = express.Router();
@@ -63,6 +64,10 @@ router.get("/documents", partnerDocuments.listDocuments);
 router.get("/documents/:id/file", partnerDocuments.getDocumentFile);
 router.post("/documents/:id/review", staff, partnerDocuments.reviewDocument);
 router.get("/documents/:ownerType/:ownerId", partnerDocuments.getOwnerDocuments);
+
+// Rider pay: every role can read it; only a super_admin can change it.
+router.get("/settings/rider-pay", adminSettings.getRiderPay);
+router.put("/settings/rider-pay", superOnly, adminSettings.updateRiderPay);
 
 // Admin accounts (super_admin only) + self-service password change (any admin)
 router.get("/admins", superOnly, adminAdmins.listAdmins);

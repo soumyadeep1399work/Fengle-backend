@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const { portionLabel, presentLinePortion } = require("../utils/portion");
 const { effectivePrice } = require("../utils/pricing");
+const riderPay = require("../services/riderPay.service");
 const db = require("../config/db");
 const routing = require("../services/routing.service");
 const commission = require("../services/commission.service");
@@ -46,6 +47,20 @@ function generateDeliveryOtp() {
  * their order — it must never reach a restaurant, rider, or admin view of the
  * same order (they're the ones who have to ask the customer for it).
  */
+/**
+ * What a rider earns for a delivery is between Fengle and that rider: customers and
+ * restaurants never see the payout, its breakdown or the config row behind it.
+ * Riders (their own orders) and admins do.
+ */
+function scrubRiderPay(orderFields, requesterType) {
+  if (requesterType === "rider" || requesterType === "admin") {
+    const { rider_payout_breakdown, ...rest } = orderFields;
+    return { ...rest, rider_payout: rest.rider_payout == null ? null : Number(rest.rider_payout), rider_payout_breakdown: riderPay.parseBreakdown(rider_payout_breakdown) };
+  }
+  const { rider_payout, rider_payout_breakdown, rider_pay_config_id, ...rest } = orderFields;
+  return rest;
+}
+
 function scrubDeliveryOtp(orderFields, requesterType) {
   if (requesterType === "customer") return orderFields;
   const { delivery_otp, ...rest } = orderFields;
@@ -719,6 +734,9 @@ async function markDelivered(req, res) {
     if (order.payment_method === "cod") {
       await wallet.recordCodCollection(order.rider_id, order.id, Number(cod_amount_collected), trx);
     }
+
+    // Freeze what the rider earns for this delivery under the rider pay config in force right now.
+    await riderPay.recordPayoutOnDelivery(trx, order);
   });
 
   notifyLater(() => orderPush.orderDelivered(id));
@@ -787,7 +805,7 @@ async function getOrder(req, res) {
   const customer = type === "rider" || type === "admin" ? await db("users").where({ id: order.customer_id }).select("phone").first() : null;
 
   res.json({
-    order: scrubDeliveryOtp(
+    order: scrubRiderPay(scrubDeliveryOtp(
       {
         ...withCancelInfo(order),
         categories,
@@ -803,7 +821,7 @@ async function getOrder(req, res) {
         ...customerContactFields(type, customer),
       },
       type
-    ),
+    ), type),
     items,
   });
 }
@@ -1056,14 +1074,14 @@ async function listMyOrders(req, res) {
     orders: orders.map((o) => {
       const items = itemsByOrderId[o.id] || [];
       const categories = distinctCategories(items);
-      return scrubDeliveryOtp(
+      return scrubRiderPay(scrubDeliveryOtp(
         {
           ...withCancelInfo(o), items, categories, category_name: categories.map((c) => c.name).join(" + "),
           ...restaurantContactFields(type, restaurantById[o.restaurant_id]),
           ...customerContactFields(type, customerById[o.customer_id]),
         },
         type
-      );
+      ), type);
     }),
   });
 }
