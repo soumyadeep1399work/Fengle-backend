@@ -3,12 +3,16 @@ const { haversineDistanceKm } = require("../utils/geo");
 const { normalizeCategoryName } = require("../utils/categoryName");
 const categoryService = require("../services/category.service");
 const { parsePortionInput, presentPortion } = require("../utils/portion");
+const { presentPricing, presentAdminPricing } = require("../utils/pricing");
+
+// What customers see for an item: portion label + price/offer/effective_price.
+const presentCatalogItem = (row) => presentPricing(presentPortion(row));
 const { applyDocumentsGate } = require("../services/partnerDocuments.service");
 
 const CATALOG_RANGE_KM = 7; // matches the cascade ceiling in routing.service.js — never show an item that couldn't actually route
 const GLOBAL_MIN_ORDER_VALUE = 50; // keep in sync with order.controller.js's MIN_ORDER_VALUE
 
-const ITEM_COLUMNS = ["items.id", "items.name", "items.description", "items.price", "items.image_url", "items.is_veg", "items.category_id", "items.quantity_value", "items.quantity_unit"];
+const ITEM_COLUMNS = ["items.id", "items.name", "items.description", "items.price", "items.image_url", "items.is_veg", "items.category_id", "items.quantity_value", "items.quantity_unit", "items.offer_price", "items.offer_ends_at"];
 
 /**
  * Restaurants within catalog-visibility range of a location, optionally
@@ -213,7 +217,7 @@ async function getCategoryDetail(req, res) {
       .select(ITEM_COLUMNS);
   }
 
-  const itemsWithRatings = (await attachRatings(items)).map(presentPortion);
+  const itemsWithRatings = (await attachRatings(items)).map(presentCatalogItem);
   const sorted = [...itemsWithRatings].sort((a, b) => (b.ratingCount - a.ratingCount) || (b.avgRating || 0) - (a.avgRating || 0));
   const popular = sorted.slice(0, 3);
   const popularIds = new Set(popular.map((i) => i.id));
@@ -257,7 +261,7 @@ async function listItemsForCategory(req, res) {
     .groupBy(...ITEM_COLUMNS)
     .select(ITEM_COLUMNS);
 
-  res.json({ items: (await attachRatings(items)).map(presentPortion) });
+  res.json({ items: (await attachRatings(items)).map(presentCatalogItem) });
 }
 
 /**
@@ -285,7 +289,7 @@ async function searchItems(req, res) {
   }
 
   const items = await query.groupBy(...ITEM_COLUMNS).select(ITEM_COLUMNS);
-  res.json({ items: (await attachRatings(items)).map(presentPortion) });
+  res.json({ items: (await attachRatings(items)).map(presentCatalogItem) });
 }
 
 /**
@@ -314,7 +318,7 @@ async function getPopularItems(req, res) {
     .orderBy("items.id")
     .select(ITEM_COLUMNS);
 
-  const rated = (await attachRatings(items)).map(presentPortion);
+  const rated = (await attachRatings(items)).map(presentCatalogItem);
 
   const positionInCategory = new Map();
   const seenPerCategory = {};
@@ -335,13 +339,65 @@ async function getPopularItems(req, res) {
 }
 
 /**
+ * Admin-only per-dish offer: offer_price (> 0 and below the price it will apply to) and an
+ * optional offer_ends_at (a future date; null = no end). Returns {} when neither key is in
+ * the body, { error }, or { fields: { offer_price, offer_ends_at } } (null/"" offer_price
+ * clears the offer and its end date). `finalPrice` is the price the offer will sit under
+ * (the new price if the same request changes it); `item` carries the stored offer.
+ */
+function parseOfferInput(body, { finalPrice, item }) {
+  const hasPrice = body.offer_price !== undefined;
+  const hasEnds = body.offer_ends_at !== undefined;
+  if (!hasPrice && !hasEnds) return {};
+  const blank = (v) => v === null || v === "";
+  if (hasPrice && blank(body.offer_price)) return { fields: { offer_price: null, offer_ends_at: null } };
+
+  let offerPrice = item.offer_price == null ? null : Number(item.offer_price);
+  if (hasPrice) {
+    const { offer_price } = body;
+    const value = typeof offer_price === "string" && offer_price.trim() !== "" ? Number(offer_price) : offer_price;
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      return { error: "offer_price must be a positive number" };
+    }
+    offerPrice = Number(value.toFixed(2));
+  } else if (offerPrice == null) {
+    return { error: "offer_ends_at needs an offer_price" };
+  }
+  if (!(offerPrice < finalPrice)) {
+    return { error: `offer_price must be lower than the price (${finalPrice})` };
+  }
+
+  const now = new Date();
+  let endsAt;
+  if (hasEnds) {
+    if (blank(body.offer_ends_at)) endsAt = null;
+    else {
+      const d = new Date(body.offer_ends_at);
+      if (typeof body.offer_ends_at === "boolean" || Number.isNaN(d.getTime())) return { error: "offer_ends_at must be a valid date-time" };
+      if (!(d > now)) return { error: "offer_ends_at must be in the future" };
+      endsAt = d;
+    }
+  } else {
+    // Only the price changed: keep a still-running end date, but don't inherit a stale one.
+    endsAt = item.offer_ends_at && new Date(item.offer_ends_at) > now ? item.offer_ends_at : null;
+  }
+  return { fields: { offer_price: offerPrice, offer_ends_at: endsAt } };
+}
+
+/** An item as the caller should see it: admins get the raw offer, everyone else the customer-style view. */
+function presentItemFor(type, row) {
+  const withPortion = presentPortion(row);
+  return type === "admin" ? presentAdminPricing(withPortion) : presentPricing(withPortion);
+}
+
+/**
  * Shared by POST /items and PATCH /items/:id so the two can never drift apart
  * (this is a system boundary: restaurants type these values in). partial=false
  * is create — name and price are required; partial=true is edit — only the
  * fields actually present are validated. Returns { error } or { fields } with
  * cleaned values for just the columns that were provided.
  */
-function validateItemFields(body, { partial }) {
+function validateItemFields(body, { partial, skipPrice = false }) {
   const fields = {};
   const has = (key) => body[key] !== undefined;
 
@@ -352,7 +408,7 @@ function validateItemFields(body, { partial }) {
     }
     fields.name = name.trim();
   }
-  if (!partial || has("price")) {
+  if (!skipPrice && (!partial || has("price"))) {
     // Numbers, or numeric strings like "250.50" — but never booleans, arrays, null, "" or "abc".
     const { price } = body;
     const value = typeof price === "string" && price.trim() !== "" ? Number(price) : price;
@@ -423,23 +479,52 @@ async function updateItem(req, res) {
     return res.status(400).json({ error: "category_id cannot be changed" });
   }
 
-  const EDITABLE = ["name", "price", "is_veg", "image_url", "description", "quantity_value", "quantity_unit"];
+  // Prices and offers belong to Fengle admins alone (client decision 2026-10-28): a kitchen can
+  // edit everything else on a dish, but never what it costs.
+  const ADMIN_ONLY_KEYS = ["price", "offer_price", "offer_ends_at"];
+  if (type !== "admin" && ADMIN_ONLY_KEYS.some((key) => body[key] !== undefined)) {
+    return res.status(403).json({ error: "Only Fengle admins can set prices or offers", code: "price_admin_only" });
+  }
+
+  const EDITABLE = ["name", "is_veg", "image_url", "description", "quantity_value", "quantity_unit"];
   if (type === "admin" && body.is_active !== undefined) {
     if (typeof body.is_active !== "boolean") return res.status(400).json({ error: "is_active must be true or false" });
   } else if (body.is_active !== undefined) {
     return res.status(403).json({ error: "Only admin can change is_active" });
   }
-  const editableKeys = type === "admin" ? [...EDITABLE, "is_active"] : EDITABLE;
+  const editableKeys = type === "admin" ? [...EDITABLE, ...ADMIN_ONLY_KEYS, "is_active"] : EDITABLE;
   if (!editableKeys.some((key) => body[key] !== undefined)) {
     return res.status(400).json({ error: `Send at least one of: ${editableKeys.join(", ")}` });
   }
 
   const validated = validateItemFields(body, { partial: true });
   if (validated.error) return res.status(400).json({ error: validated.error });
-  if (type === "admin" && body.is_active !== undefined) validated.fields.is_active = body.is_active;
+  const fields = validated.fields;
+  if (type === "admin" && body.is_active !== undefined) fields.is_active = body.is_active;
 
-  await db("items").where({ id }).update({ ...validated.fields, updated_at: db.fn.now() });
-  res.json({ item: presentPortion(await db("items").where({ id }).first()) });
+  if (type === "admin") {
+    const finalPrice = fields.price !== undefined ? fields.price : Number(item.price);
+    const offer = parseOfferInput(body, { finalPrice, item });
+    if (offer.error) return res.status(400).json({ error: offer.error });
+    if (offer.fields) Object.assign(fields, offer.fields);
+    else if (fields.price !== undefined && item.offer_price != null && Number(item.offer_price) >= fields.price) {
+      return res.status(400).json({ error: `price must stay above the current offer price (${Number(item.offer_price)}) — lower or clear the offer in the same request` });
+    }
+
+    if (item.awaiting_price) {
+      if (fields.price !== undefined) {
+        // The admin has now set the price this dish was waiting for: it goes live
+        // (unless the same request explicitly says is_active: false).
+        fields.awaiting_price = false;
+        if (body.is_active === undefined) fields.is_active = true;
+      } else if (body.is_active === true) {
+        return res.status(400).json({ error: "Set a price first — this dish is still awaiting its price" });
+      }
+    }
+  }
+
+  await db("items").where({ id }).update({ ...fields, updated_at: db.fn.now() });
+  res.json({ item: presentItemFor(type, await db("items").where({ id }).first()) });
 }
 
 /**
@@ -450,16 +535,28 @@ async function createItem(req, res) {
   const { category_id, name, price } = req.body;
   const { id: actorId, type } = req.auth;
 
-  if (!category_id || !name || price == null) {
-    return res.status(400).json({ error: "category_id, name and price are required" });
-  }
   if (type !== "admin" && type !== "restaurant") {
     return res.status(403).json({ error: "Only admin or restaurant accounts can create items" });
   }
+  // Prices belong to Fengle admins alone (client decision 2026-10-28). A kitchen proposes a dish
+  // without a price; it stays hidden (awaiting_price) until an admin sets one.
+  if (type === "restaurant" && ["price", "offer_price", "offer_ends_at"].some((key) => req.body[key] !== undefined)) {
+    return res.status(403).json({ error: "Only Fengle admins can set prices or offers — leave the price out; it is added when your dish is approved", code: "price_admin_only" });
+  }
+  if (!category_id || !name || (type === "admin" && price == null)) {
+    return res.status(400).json({ error: type === "admin" ? "category_id, name and price are required" : "category_id and name are required" });
+  }
 
-  const validated = validateItemFields(req.body, { partial: false });
+  const validated = validateItemFields(req.body, { partial: false, skipPrice: type === "restaurant" });
   if (validated.error) return res.status(400).json({ error: validated.error });
   const fields = validated.fields;
+
+  let offerFields = {};
+  if (type === "admin") {
+    const offer = parseOfferInput(req.body, { finalPrice: fields.price, item: { offer_price: null, offer_ends_at: null } });
+    if (offer.error) return res.status(400).json({ error: offer.error });
+    offerFields = offer.fields || {};
+  }
 
   const category = await db("categories").where({ id: category_id, is_active: true }).first();
   if (!category) {
@@ -479,7 +576,11 @@ async function createItem(req, res) {
     category_id,
     name: fields.name,
     description: fields.description || null,
-    price: fields.price,
+    price: type === "restaurant" ? 0 : fields.price, // a kitchen's dish has no price until an admin sets one
+    awaiting_price: type === "restaurant",
+    is_active: type !== "restaurant",
+    offer_price: offerFields.offer_price ?? null,
+    offer_ends_at: offerFields.offer_ends_at ?? null,
     image_url: fields.image_url || null,
     is_veg: fields.is_veg === true,
     quantity_value: fields.quantity_value ?? null,
@@ -493,7 +594,7 @@ async function createItem(req, res) {
     await db("restaurant_items").insert({ restaurant_id: actorId, item_id: id, is_available: true });
   }
 
-  const item = presentPortion(await db("items").where({ id }).first());
+  const item = presentItemFor(type, await db("items").where({ id }).first());
   res.status(201).json({ item });
 }
 

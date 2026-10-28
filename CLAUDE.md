@@ -46,6 +46,13 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   renames never rewrite order history.
 - **Item creation**: both Admin and Restaurant can add items. No
   restaurant-exclusive items — the catalog is shared per category.
+  **Prices are admin-only** (client decision 2026-10-28): a restaurant can
+  never set or change a price (`price_admin_only` 403). A kitchen proposes a
+  dish with no price; it stays hidden (`awaiting_price`) until an admin sets
+  one. Admins can also put a per-dish offer (`offer_price` + optional
+  `offer_ends_at`) on a dish — customers are charged `effective_price` (see
+  `src/utils/pricing.js`), so item total, GST and commission follow what they
+  actually pay.
 - **Restaurant onboarding is manual, via Admin Panel only.** There is no
   restaurant self-registration flow anywhere in the product. (Riders ARE
   self-serve — this asymmetry is intentional, don't "fix" it.)

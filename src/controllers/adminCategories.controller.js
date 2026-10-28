@@ -1,4 +1,11 @@
 const db = require("../config/db");
+const { presentAdminPricing } = require("../utils/pricing");
+
+// price (null while awaiting an admin-set price), the stored offer, whether it is in force, and the price charged.
+const pricingFields = (r) => {
+  const p = presentAdminPricing(r);
+  return { price: p.price, awaiting_price: p.awaiting_price, offer_price: p.offer_price, offer_ends_at: p.offer_ends_at, offer_active: p.offer_active, effective_price: p.effective_price };
+};
 const { portionLabel } = require("../utils/portion");
 const { normalizeCategoryName, validateCategoryName } = require("../utils/categoryName");
 const categoryService = require("../services/category.service");
@@ -159,30 +166,34 @@ async function mergeCategories(req, res) {
 /** GET /admin/items?category_id=&q= — includes inactive items. */
 /** GET /admin/items?category_id=&q=&page=&limit= — includes inactive items. */
 async function listItems(req, res) {
-  const { category_id, q } = req.query;
+  const { category_id, q, awaiting_price, is_active } = req.query;
   const { page, limit, offset } = paginationParams(req);
 
   let base = db("items as i");
   if (category_id) base = base.where("i.category_id", category_id);
+  if (awaiting_price === "1" || awaiting_price === "true") base = base.where("i.awaiting_price", true);
+  if (is_active === "1" || is_active === "true") base = base.where("i.is_active", true);
+  if (is_active === "0" || is_active === "false") base = base.where("i.is_active", false);
   if (q && q.trim()) base = base.andWhere((qb) => qb.where("i.name", "like", `%${q.trim()}%`).orWhere("i.description", "like", `%${q.trim()}%`));
 
   const { n: total } = await base.clone().count({ n: "i.id" }).first();
   const rows = await base
     .clone()
     .join("categories as c", "c.id", "i.category_id")
+    .leftJoin("restaurants as cr", "cr.id", "i.created_by_restaurant_id")
     .orderBy(["c.name", "i.name"])
     .limit(limit)
     .offset(offset)
-    .select("i.*", "c.name as category_name");
+    .select("i.*", "c.name as category_name", "cr.name as created_by_restaurant_name");
 
   res.json({
     page, limit, total: Number(total),
     items: rows.map((r) => ({
-      id: r.id, name: r.name, description: r.description, price: Number(r.price), image_url: r.image_url,
+      id: r.id, name: r.name, description: r.description, ...pricingFields(r), image_url: r.image_url,
       is_veg: Boolean(r.is_veg), is_active: Boolean(r.is_active), category_id: r.category_id, category_name: r.category_name,
       quantity_value: r.quantity_value == null ? null : Number(r.quantity_value), quantity_unit: r.quantity_unit || null,
       portion_label: portionLabel(r.quantity_value, r.quantity_unit),
-      created_by_type: r.created_by_type, created_by_restaurant_id: r.created_by_restaurant_id, created_at: r.created_at,
+      created_by_type: r.created_by_type, created_by_restaurant_id: r.created_by_restaurant_id, created_by_restaurant_name: r.created_by_restaurant_name || null, created_at: r.created_at,
     })),
   });
 }

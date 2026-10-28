@@ -5,6 +5,7 @@ const { paginationParams } = require("../utils/pagination");
 const { CURRENT_AGREEMENT_VERSION, agreementRequired } = require("../utils/agreement");
 const storage = require("../services/storage.service");
 const { portionLabel } = require("../utils/portion");
+const { presentPricing } = require("../utils/pricing");
 const { reviewPartner } = require("../services/partnerVerification.service");
 const partnerDocuments = require("../services/partnerDocuments.service");
 
@@ -306,19 +307,26 @@ async function getMyMenu(req, res) {
       this.on("restaurant_items.item_id", "=", "items.id").andOn("restaurant_items.restaurant_id", "=", db.raw("?", [req.auth.id]));
     })
     .where("restaurant_categories.restaurant_id", req.auth.id)
-    .andWhere("items.is_active", true)
+    // Live dishes, plus this kitchen's own dishes still waiting for an admin to set the price.
+    .andWhere((qb) => qb.where("items.is_active", true).orWhere((q) => q.where("items.awaiting_price", true).andWhere("items.created_by_restaurant_id", req.auth.id)))
     .orderBy([{ column: "categories.name" }, { column: "items.id" }])
     .select(
       "items.id", "items.name", "items.description", "items.price", "items.image_url", "items.is_veg",
-      "items.category_id", "items.quantity_value", "items.quantity_unit", "categories.name as category_name", "restaurant_items.is_available"
+      "items.category_id", "items.quantity_value", "items.quantity_unit", "items.awaiting_price", "items.offer_price", "items.offer_ends_at", "categories.name as category_name", "restaurant_items.is_available"
     );
 
   res.json({
-    items: rows.map((r) => ({
+    items: rows.map((r) => {
+      const pricing = presentPricing(r);
+      return {
       id: r.id,
       name: r.name,
       description: r.description,
-      price: Number(r.price),
+      price: pricing.price,
+      offer_price: pricing.offer_price,
+      offer_ends_at: pricing.offer_ends_at,
+      effective_price: pricing.effective_price,
+      awaiting_price: Boolean(r.awaiting_price),
       image_url: r.image_url,
       is_veg: Boolean(r.is_veg),
       category_id: r.category_id,
@@ -327,7 +335,8 @@ async function getMyMenu(req, res) {
       quantity_value: r.quantity_value == null ? null : Number(r.quantity_value),
       quantity_unit: r.quantity_unit || null,
       portion_label: portionLabel(r.quantity_value, r.quantity_unit),
-    })),
+      };
+    }),
   });
 }
 

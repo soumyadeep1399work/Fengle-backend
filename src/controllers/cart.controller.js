@@ -1,4 +1,5 @@
 const db = require("../config/db");
+const { effectivePrice } = require("../utils/pricing");
 const routing = require("../services/routing.service");
 const { computeTax } = require("../services/tax.service");
 const couponService = require("../services/coupon.service");
@@ -37,7 +38,7 @@ async function quoteCart(req, res) {
     itemId: i.item_id,
     categoryId: itemById[i.item_id].category_id,
     quantity: i.quantity,
-    unitPrice: Number(itemById[i.item_id].price),
+    unitPrice: effectivePrice(itemById[i.item_id]), // the offer price while an offer is in force
   }));
 
   const categoryIds = [...new Set(cartItems.map((i) => i.categoryId))];

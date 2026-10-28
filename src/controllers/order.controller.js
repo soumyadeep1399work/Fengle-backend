@@ -1,5 +1,6 @@
 const crypto = require("crypto");
 const { portionLabel, presentLinePortion } = require("../utils/portion");
+const { effectivePrice } = require("../utils/pricing");
 const db = require("../config/db");
 const routing = require("../services/routing.service");
 const commission = require("../services/commission.service");
@@ -125,7 +126,8 @@ async function placeOrder(req, res) {
     portionValue: itemById[i.item_id].quantity_value, // same for the portion ("3 pc")
     portionUnit: itemById[i.item_id].quantity_unit,
     quantity: i.quantity,
-    unitPrice: Number(itemById[i.item_id].price),
+    unitPrice: effectivePrice(itemById[i.item_id]), // the offer price while an offer is in force
+    listPrice: Number(itemById[i.item_id].price), // snapshotted so a discounted line can still show its strike-through
   }));
 
   const categoryIds = [...new Set(cartItems.map((i) => i.categoryId))];
@@ -296,6 +298,7 @@ async function createOrderForRestaurant({ customerId, restaurant, distanceKm, ca
         category_id: i.categoryId,
         quantity: i.quantity,
         unit_price: i.unitPrice,
+        list_price: i.listPrice ?? null,
         subtotal: Number((i.unitPrice * i.quantity).toFixed(2)),
       }))
     );

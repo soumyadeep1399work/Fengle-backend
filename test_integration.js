@@ -409,7 +409,7 @@ async function main() {
 
   console.log("\n--- Test 15: POST /items validation (restaurant adds a menu item with a photo URL) ---");
   const catalogCtl = require("./src/controllers/catalog.controller");
-  const createItem = async (body, auth = restAuth) => {
+  const createItem = async (body, auth = { id: 1, type: "admin" }) => {
     const r = fakeRes();
     await catalogCtl.createItem(fakeReq(body, {}, auth), r);
     return r;
@@ -424,12 +424,15 @@ async function main() {
   check('rejects is_veg "false" string instead of silently making it veg (400)', (await createItem({ ...okBody, is_veg: "false" })).statusCode === 400);
   check("rejects a javascript: image_url (400)", (await createItem({ ...okBody, image_url: "javascript:alert(1)" })).statusCode === 400);
   check("rejects an unknown category with 404 instead of crashing on the FK", (await createItem({ ...okBody, category_id: 999999 })).statusCode === 404);
-  check("restaurant can't add to a category it isn't approved for (403)", (await createItem({ ...okBody, category_id: southIndianCatId })).statusCode === 403);
+  check("restaurant can't add to a category it isn't approved for (403)", (await createItem({ category_id: southIndianCatId, name: "Not Mine" }, restAuth)).statusCode === 403);
   const goodItem = await createItem(okBody);
   check("valid item is created (201) with trimmed name, numeric price, is_veg false and the photo URL",
     goodItem.statusCode === 201 && goodItem.body.item.name === "Validated Dish" && Number(goodItem.body.item.price) === 120.5 &&
     Boolean(goodItem.body.item.is_veg) === false && goodItem.body.item.image_url === okBody.image_url);
-  const stockRow = await db("restaurant_items").where({ restaurant_id: restA, item_id: goodItem.body.item.id }).first();
+  const kitchenDish = await createItem({ category_id: bengaliCatId, name: "Kitchen Proposed Dish", is_veg: true }, restAuth);
+  check("a kitchen can propose a dish WITHOUT a price: 201, price null, awaiting_price, hidden (is_active false)",
+    kitchenDish.statusCode === 201 && kitchenDish.body.item.price === null && kitchenDish.body.item.awaiting_price === true && Boolean(kitchenDish.body.item.is_active) === false);
+  const stockRow = await db("restaurant_items").where({ restaurant_id: restA, item_id: kitchenDish.body.item.id }).first();
   check("a restaurant-created item is in stock at that restaurant", stockRow && Boolean(stockRow.is_available));
   const vegItem = await createItem({ ...okBody, name: "Veg Dish", is_veg: true }, { id: 1, type: "admin" });
   check("admin can create a veg item; is_veg true is kept", vegItem.statusCode === 201 && Boolean(vegItem.body.item.is_veg) === true);
@@ -446,24 +449,27 @@ async function main() {
   const snapOrder = await db("orders").where({ id: orderId }).first();
   const snapLine = await db("order_items").where({ order_id: orderId, item_id: fishCurryId }).first();
 
-  const e1 = await editItem(fishCurryId, { price: 999, name: "  Fish Curry Deluxe  ", is_veg: true });
+  const e1 = await editItem(fishCurryId, { name: "  Fish Curry Deluxe  ", is_veg: true });
   check("restaurant edits an ADMIN-seeded item it carries (200), updated row returned",
-    e1.statusCode === undefined && Number(e1.body.item.price) === 999 && e1.body.item.name === "Fish Curry Deluxe" && Boolean(e1.body.item.is_veg) === true);
+    e1.statusCode === undefined && Number(e1.body.item.price) === 250 && e1.body.item.name === "Fish Curry Deluxe" && Boolean(e1.body.item.is_veg) === true);
+  check("a restaurant can NOT change a price: PATCH with price -> 403 price_admin_only", (await editItem(fishCurryId, { price: 1 })).statusCode === 403);
+  check("...and the price really did not move", Number((await db("items").where({ id: fishCurryId }).first()).price) === 250);
+  check("admin sets the price (200)", Number((await editItem(fishCurryId, { price: 999 }, adminAuth)).body.item.price) === 999);
   const e2 = await editItem(fishCurryId, { image_url: "http://192.168.1.16:4000/uploads/x.jpg" });
   check("image_url can be set", e2.body.item.image_url === "http://192.168.1.16:4000/uploads/x.jpg");
   const e3 = await editItem(fishCurryId, { image_url: null });
   check("image_url: null removes the photo", e3.body.item.image_url === null);
   check("editing one field leaves the others alone", e3.body.item.name === "Fish Curry Deluxe" && Number(e3.body.item.price) === 999);
-  check("echoing the item's own category_id is harmless", (await editItem(fishCurryId, { category_id: bengaliCatId, price: "250" })).statusCode === undefined);
+  check("echoing the item's own category_id is harmless", (await editItem(fishCurryId, { category_id: bengaliCatId, price: "250" }, adminAuth)).statusCode === undefined);
   check("changing category_id is refused (400)", (await editItem(fishCurryId, { category_id: southIndianCatId })).statusCode === 400);
   check("empty body is refused (400)", (await editItem(fishCurryId, {})).statusCode === 400);
   check("body with only a truly non-editable field ('id') is refused (400)", (await editItem(fishCurryId, { id: 5 })).statusCode === 400);
   check("a restaurant sending is_active gets 403, not the generic 400 (admin-only field)", (await editItem(fishCurryId, { is_active: false })).statusCode === 403);
-  check("same validation as create: price 0 -> 400", (await editItem(fishCurryId, { price: 0 })).statusCode === 400);
-  check("same validation as create: price null -> 400", (await editItem(fishCurryId, { price: null })).statusCode === 400);
+  check("same validation as create: price 0 -> 400", (await editItem(fishCurryId, { price: 0 }, adminAuth)).statusCode === 400);
+  check("same validation as create: price null -> 400", (await editItem(fishCurryId, { price: null }, adminAuth)).statusCode === 400);
   check('same validation as create: is_veg "true" string -> 400', (await editItem(fishCurryId, { is_veg: "true" })).statusCode === 400);
   check("same validation as create: javascript: image_url -> 400", (await editItem(fishCurryId, { image_url: "javascript:alert(1)" })).statusCode === 400);
-  check("restaurant can't edit an item outside the categories it carries (403)", (await editItem(dosaId, { price: 1 })).statusCode === 403);
+  check("restaurant can't edit an item outside the categories it carries (403)", (await editItem(dosaId, { name: "Not Mine" })).statusCode === 403);
   check("unknown item -> 404", (await editItem(999999, { price: 10 })).statusCode === 404);
   await db("items").where({ id: noRowItemId }).update({ is_active: false });
   check("inactive item -> 404", (await editItem(noRowItemId, { price: 10 })).statusCode === 404);
@@ -620,7 +626,8 @@ async function main() {
     momosRow.prepTimeMinMinutes === 30 && momosRow.prepTimeMaxMinutes === 40 && momosRow.minOrder === 50 && momosRow.image_url === null && momosRow.blurb === null);
   check("without lat/lng every active category is returned (unchanged behaviour), empty ones included", allCats.some((c) => c.name === "Biriyani") && allCats.some((c) => c.name === "Momos"));
   const momosItem = await createItem({ category_id: momos.body.category.id, name: "Steamed Momo", price: 90, image_url: "http://192.168.1.16:4000/uploads/momo.jpg" });
-  check("kitchen adds a dish to its new category", momosItem.statusCode === 201);
+  check("a priced dish is added to the kitchen's new category", momosItem.statusCode === 201);
+  await db("restaurant_items").insert({ restaurant_id: restA, item_id: momosItem.body.item.id, is_available: true }); // the kitchen stocks it
   check("category with no photo borrows the first dish photo", (await listCats({})).body.categories.find((c) => c.name === "Momos").image_url === "http://192.168.1.16:4000/uploads/momo.jpg");
   const detailMomos = fakeRes();
   await catalogCtl.getCategoryDetail({ params: { id: momos.body.category.id }, query: { lat: "22.5805", lng: "88.4605" }, body: {} }, detailMomos);
@@ -1904,6 +1911,105 @@ async function main() {
     // a pre-feature order line has no snapshot -> null, never a guess from today's item
     await db("order_items").where({ order_id: o1 }).update({ portion_value: null, portion_unit: null });
     check("an order line with no snapshot (placed before this feature) reads null", (await getLine(o1, customerAuth)).portion_label === null);
+  }
+
+  console.log("\n--- Test 37: Prices are admin-only; kitchen dishes await a price; per-dish offers drive quote, order and commission ---");
+  {
+    const catalogCtl37 = require("./src/controllers/catalog.controller");
+    const adminCatCtl37 = require("./src/controllers/adminCategories.controller");
+    const restCtl37 = require("./src/controllers/restaurant.controller");
+    const admin = { id: 1, type: "admin" };
+    const kitchen = { id: restA, type: "restaurant" };
+    const near = { lat: "22.5805", lng: "88.4605" };
+
+    const create = async (body, auth) => { const r = fakeRes(); await catalogCtl37.createItem(fakeReq(body, {}, auth), r); return r; };
+    const patch = async (id, body, auth) => { const r = fakeRes(); await catalogCtl37.updateItem(fakeReq(body, { id }, auth), r); return r; };
+    const tag = Math.random().toString(36).slice(2, 7);
+
+    // ---- a kitchen can never set a price
+    const rejected = await create({ category_id: bengaliCatId, name: `K2 ${tag}`, price: 50 }, kitchen);
+    check("restaurant POST /items with a price -> 403 price_admin_only (nothing created)", rejected.statusCode === 403 && rejected.body.code === "price_admin_only");
+    check("restaurant POST /items with an offer_price -> 403", (await create({ category_id: bengaliCatId, name: `K3 ${tag}`, offer_price: 10 }, kitchen)).statusCode === 403);
+    check("admin POST /items without a price still needs one -> 400", (await create({ category_id: bengaliCatId, name: `A ${tag}` }, admin)).statusCode === 400);
+
+    // ---- kitchen proposes a dish: hidden until an admin prices it
+    const proposed = await create({ category_id: bengaliCatId, name: `Proposed ${tag}`, is_veg: true }, kitchen);
+    const pid = proposed.body.item.id;
+    check("kitchen dish: 201, price null, awaiting_price true, is_active false", proposed.statusCode === 201 && proposed.body.item.price === null && proposed.body.item.awaiting_price === true && Boolean(proposed.body.item.is_active) === false);
+    const stored = await db("items").where({ id: pid }).first();
+    check("...stored as price 0.00 (column is NOT NULL), awaiting_price 1, is_active 0", Number(stored.price) === 0 && stored.awaiting_price === 1 && stored.is_active === 0);
+
+    const menu1 = fakeRes();
+    await restCtl37.getMyMenu(fakeReq({}, {}, kitchen), menu1);
+    const mine = menu1.body.items.find((i) => i.id === pid);
+    check("the kitchen sees its own pending dish on GET /restaurants/me/menu with price null + awaiting_price", mine && mine.price === null && mine.awaiting_price === true && mine.effective_price === null);
+
+    const listNear = async () => { const r = fakeRes(); await catalogCtl37.listItemsForCategory(fakeReq({}, { categoryId: String(bengaliCatId) }, null, near), r); return r.body.items; };
+    check("customers do NOT see it (inactive)", !(await listNear()).some((i) => i.id === pid));
+    check("a kitchen can't PATCH its hidden dish (404, it only acts on live items)", (await patch(pid, { name: "x" }, kitchen)).statusCode === 404);
+
+    const adminList = fakeRes();
+    await adminCatCtl37.listItems(fakeReq({}, {}, admin, { awaiting_price: "1" }), adminList);
+    const pending = adminList.body.items.find((i) => i.id === pid);
+    check("GET /admin/items?awaiting_price=1 lists it (price null, who proposed it)", pending && pending.price === null && pending.awaiting_price === true && pending.created_by_restaurant_name === "Restaurant A");
+    check("...and the filter excludes priced dishes", !adminList.body.items.some((i) => i.id === fishCurryId));
+
+    check("admin can't activate it before pricing it (400)", (await patch(pid, { is_active: true }, admin)).statusCode === 400);
+    const priced = await patch(pid, { price: "180" }, admin);
+    check("admin sets the price -> it goes live (is_active true, awaiting_price false, price 180)", priced.statusCode === undefined && priced.body.item.price === 180 && priced.body.item.awaiting_price === false && Boolean(priced.body.item.is_active) === true);
+    const live = (await listNear()).find((i) => i.id === pid);
+    check("customers now see it at 180 with effective_price 180 and no offer", live && live.price === 180 && live.effective_price === 180 && live.offer_price === null && live.offer_ends_at === null);
+
+    // ---- offers: admin only, validated
+    check("restaurant PATCH offer_price -> 403", (await patch(pid, { offer_price: 100 }, kitchen)).statusCode === 403);
+    check("offer_price must be BELOW the price: equal -> 400", (await patch(pid, { offer_price: 180 }, admin)).statusCode === 400);
+    check("offer_price above the price -> 400", (await patch(pid, { offer_price: 200 }, admin)).statusCode === 400);
+    check("offer_price 0 / text -> 400", (await patch(pid, { offer_price: 0 }, admin)).statusCode === 400 && (await patch(pid, { offer_price: "abc" }, admin)).statusCode === 400);
+    check("offer_ends_at in the past -> 400", (await patch(pid, { offer_price: 150, offer_ends_at: "2020-01-01T00:00:00Z" }, admin)).statusCode === 400);
+    check("offer_ends_at alone with no offer -> 400", (await patch(pid, { offer_ends_at: new Date(Date.now() + 3600e3).toISOString() }, admin)).statusCode === 400);
+    check("offer_ends_at garbage -> 400", (await patch(pid, { offer_price: 150, offer_ends_at: "not-a-date" }, admin)).statusCode === 400);
+
+    const ends = new Date(Date.now() + 2 * 3600e3).toISOString();
+    const offer = await patch(pid, { offer_price: "150", offer_ends_at: ends }, admin);
+    check("admin sets a 150 offer ending in 2h -> admin read shows offer_active true", offer.statusCode === undefined && offer.body.item.offer_price === 150 && offer.body.item.offer_active === true && offer.body.item.effective_price === 150);
+    const withOffer = (await listNear()).find((i) => i.id === pid);
+    check("customers see price 180, offer_price 150, effective_price 150 and the end time", withOffer.price === 180 && withOffer.offer_price === 150 && withOffer.effective_price === 150 && !!withOffer.offer_ends_at);
+    check("lowering the price to or below the live offer -> 400 unless the offer is changed too", (await patch(pid, { price: 150 }, admin)).statusCode === 400);
+    check("...but raising the price is fine and keeps the offer", (await patch(pid, { price: 200 }, admin)).body.item.offer_price === 150);
+
+    // ---- the offer drives the quote, the order, GST and commission
+    const [offerCustomerId] = await db("users").insert({ name: "Offer Customer", phone: "8000000037", wallet_balance: 0 });
+    await db("restaurant_items").insert({ restaurant_id: restA, item_id: pid, is_available: true }).onConflict(["restaurant_id", "item_id"]).ignore(); // already stocked when the kitchen created it
+    const quote = fakeRes();
+    await cartController.quoteCart(fakeReq({ items: [{ item_id: pid, quantity: 2 }], delivery_lat: 22.5805, delivery_lng: 88.4605 }, {}, { id: offerCustomerId, type: "customer" }), quote);
+    check("POST /cart/quote charges the offer price (2 x 150 = 300, not 400)", quote.body.itemTotal === 300);
+    const place = fakeRes();
+    await orderController.placeOrder(fakeReq({ items: [{ item_id: pid, quantity: 2 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Offer St", payment_method: "cod" }, {}, { id: offerCustomerId, type: "customer" }), place);
+    const o = place.body.order;
+    check("POST /orders item_total uses the offer (300)", place.statusCode === 201 && Number(o.item_total) === 300);
+    const line = await db("order_items").where({ order_id: o.id }).first();
+    check("order line snapshots unit_price 150 (charged) and list_price 200 (the normal price)", Number(line.unit_price) === 150 && Number(line.list_price) === 200 && Number(line.subtotal) === 300);
+    check("commission is computed on what the customer actually pays (15% of 300 = 45)", Number(o.commission_amount) === 45);
+    check("quote and order agree on the total", Number(o.grand_total) === quote.body.grandTotal || Number(o.grand_total) === Number(quote.body.grandTotal));
+
+    // ---- an expired offer stops applying on its own
+    await db("items").where({ id: pid }).update({ offer_ends_at: new Date(Date.now() - 60e3) });
+    const expired = (await listNear()).find((i) => i.id === pid);
+    check("once offer_ends_at passes: customers see no offer and effective_price = price", expired.offer_price === null && expired.offer_ends_at === null && expired.effective_price === 200);
+    const adminExpired = fakeRes();
+    await adminCatCtl37.listItems(fakeReq({}, {}, admin, { q: "Proposed" }), adminExpired);
+    check("...the admin list still shows the stored offer, offer_active false", adminExpired.body.items.find((i) => i.id === pid).offer_price === 150 && adminExpired.body.items.find((i) => i.id === pid).offer_active === false);
+    await db("orders").where({ id: o.id }).update({ status: "cancelled" });
+    const quote2 = fakeRes();
+    await cartController.quoteCart(fakeReq({ items: [{ item_id: pid, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605 }, {}, { id: offerCustomerId, type: "customer" }), quote2);
+    check("an expired offer no longer discounts the quote (200)", quote2.body.itemTotal === 200);
+
+    // ---- clearing
+    const cleared = await patch(pid, { offer_price: null }, admin);
+    check("offer_price: null clears the offer and its end date", cleared.body.item.offer_price === null && cleared.body.item.offer_ends_at === null && cleared.body.item.offer_active === false);
+    const adminCreated = await create({ category_id: bengaliCatId, name: `WithOffer ${tag}`, price: 100, offer_price: 80 }, admin);
+    check("admin can create a dish with an offer in one go", adminCreated.statusCode === 201 && adminCreated.body.item.offer_price === 80 && adminCreated.body.item.offer_active === true);
+    check("admin create with offer >= price -> 400", (await create({ category_id: bengaliCatId, name: `BadOffer ${tag}`, price: 100, offer_price: 100 }, admin)).statusCode === 400);
   }
 
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
