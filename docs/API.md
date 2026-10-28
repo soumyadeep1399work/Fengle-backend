@@ -459,7 +459,7 @@ Client decision: **only Fengle admins set prices.** A restaurant has no way to s
 
 **Needs a real value from the client before go-live**
 - Rider earning rate (₹8/km, ₹15/delivery) — `RIDER_RATE_PER_KM` / `RIDER_MIN_EARNING_PER_DELIVERY`.
-- Invoice issuer legal name / GSTIN / FSSAI / address — `INVOICE_ISSUER_*` env vars (currently obvious placeholders).
+- Invoice issuer legal name / GSTIN / address — `INVOICE_ISSUER_*` env vars (currently obvious placeholders).
 - Restaurant/rider in-app agreement text (both apps have TODO(client) placeholder copy — see "In-app agreement + selfie verification" above).
 
 **Not built**

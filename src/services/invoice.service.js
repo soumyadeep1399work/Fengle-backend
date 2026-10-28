@@ -10,13 +10,12 @@ const FONT_BOLD = path.join(__dirname, "../../assets/fonts/NotoSans-Bold.ttf");
 // The invoice is issued by the platform, never by the fulfilling restaurant —
 // the customer never learns which kitchen prepared their order (confirmed
 // business rule), and this is also how Sec 9(5) CGST Act e-commerce-operator
-// invoicing actually works in practice. These are placeholders: real
-// GSTIN/FSSAI numbers are legal details only the client can supply — same
+// invoicing actually works in practice. These are placeholders: the real
+// GSTIN and legal name/address are details only the client can supply — same
 // "flag before it's real money/compliance" posture as the rider-rate constant.
 const ISSUER = {
   name: process.env.INVOICE_ISSUER_NAME || "Fengle (placeholder legal entity)",
   gstin: process.env.INVOICE_ISSUER_GSTIN || "19XXXXX0000X1ZX (placeholder — needs real GSTIN)",
-  fssai: process.env.INVOICE_ISSUER_FSSAI || "1XXXXXXXXXXX (placeholder — needs real FSSAI)",
   address: process.env.INVOICE_ISSUER_ADDRESS || "Sector V, Kolkata 700091 (placeholder)",
 };
 
@@ -81,7 +80,7 @@ function renderInvoicePdf(res, invoiceData) {
   doc.fontSize(18).text("Tax Invoice", { align: "left" });
   doc.moveDown(0.5);
   doc.fontSize(10).fillColor("#555").text(invoiceData.issuer.name);
-  doc.text(`GSTIN ${invoiceData.issuer.gstin}  ·  FSSAI ${invoiceData.issuer.fssai}`);
+  doc.text(`GSTIN ${invoiceData.issuer.gstin}`);
   doc.text(invoiceData.issuer.address);
   doc.moveDown();
 

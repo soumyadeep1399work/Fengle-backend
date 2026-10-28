@@ -88,7 +88,7 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   `skip-restaurant-rating` for it. Enforced server-side, not just in the app.
 - **Invoices are issued by the platform, never by the fulfilling
   restaurant** (customer never learns which kitchen cooked the order).
-  Issuer GSTIN/FSSAI/name in `invoice.service.js` are env-configurable
+  Issuer GSTIN/name/address in `invoice.service.js` are env-configurable
   placeholders — the client must supply real values before go-live.
 - **Delivery confirmation OTP** (added 2026-09-27): every order gets a 4-digit
   `delivery_otp` generated at placement, shown to the customer only (never to
