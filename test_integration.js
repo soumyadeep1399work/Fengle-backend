@@ -1784,6 +1784,128 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 36: Dish portion (quantity_value + quantity_unit + portion_label), snapshot on order lines ---");
+  {
+    const { parsePortionInput, portionLabel } = require("./src/utils/portion");
+    const catalogCtl = require("./src/controllers/catalog.controller");
+    const favoriteCtl = require("./src/controllers/favorite.controller");
+    const adminCatCtl = require("./src/controllers/adminCategories.controller");
+    const restCtl = require("./src/controllers/restaurant.controller");
+    const admin = { id: 1, type: "admin" };
+
+    // ---- the pure helpers
+    check('label trims trailing zeros: 500.00 gm -> "500 gm", 1.50 ltr -> "1.5 ltr", 3 pc -> "3 pc", unset -> null',
+      portionLabel("500.00", "gm") === "500 gm" && portionLabel(1.5, "ltr") === "1.5 ltr" && portionLabel(3, "pc") === "3 pc" && portionLabel(null, null) === null);
+    check("parsePortionInput: neither key -> {} (untouched)", Object.keys(parsePortionInput({})).length === 0);
+    check("parsePortionInput: one key only -> error", !!parsePortionInput({ quantity_value: 3 }).error && !!parsePortionInput({ quantity_unit: "pc" }).error);
+    check("parsePortionInput: value 0 / negative / text / too big -> error", ["0", -1, "abc", 100000, true].every((v) => !!parsePortionInput({ quantity_value: v, quantity_unit: "pc" }).error));
+    check("parsePortionInput: unknown unit -> error; unit is case-insensitive", !!parsePortionInput({ quantity_value: 1, quantity_unit: "oz" }).error && parsePortionInput({ quantity_value: 1, quantity_unit: " KG " }).fields.quantity_unit === "kg");
+    check("parsePortionInput: both null -> clears both; one null one set -> error", parsePortionInput({ quantity_value: null, quantity_unit: null }).fields.quantity_value === null && !!parsePortionInput({ quantity_value: null, quantity_unit: "pc" }).error);
+
+    // ---- create / edit through the real controllers
+    const create = async (extra) => {
+      const res = fakeRes();
+      await catalogCtl.createItem(fakeReq({ category_id: bengaliCatId, name: `Portion Dish ${Math.random().toString(36).slice(2, 7)}`, price: 120, ...extra }, {}, admin), res);
+      return res;
+    };
+    const plain = await create({});
+    check("an item can still be created with no portion (optional) -> portion_label null", plain.statusCode === 201 && plain.body.item.portion_label === null && plain.body.item.quantity_value === null);
+    const made = await create({ quantity_value: "500.00", quantity_unit: "gm" });
+    check('POST /items with quantity 500 gm -> 201, quantity_value 500, portion_label "500 gm"', made.statusCode === 201 && made.body.item.quantity_value === 500 && made.body.item.quantity_unit === "gm" && made.body.item.portion_label === "500 gm");
+    check("POST /items with a half portion -> 400", (await create({ quantity_value: 3 })).statusCode === 400);
+    check("POST /items with an unknown unit -> 400", (await create({ quantity_value: 3, quantity_unit: "slices" })).statusCode === 400);
+    const itemId = made.body.item.id;
+
+    const patch = async (body) => {
+      const res = fakeRes();
+      await catalogCtl.updateItem(fakeReq(body, { id: itemId }, admin), res);
+      return res;
+    };
+    check("PATCH quantity_value alone -> 400 (must come with the unit)", (await patch({ quantity_value: 2 })).statusCode === 400);
+    const edited = await patch({ quantity_value: 1.5, quantity_unit: "kg" });
+    check('PATCH to 1.5 kg -> portion_label "1.5 kg"', edited.statusCode === undefined && edited.body.item.portion_label === "1.5 kg");
+    const nameOnly = await patch({ name: "Renamed Portion Dish" });
+    check("PATCH of another field leaves the portion alone", nameOnly.body.item.portion_label === "1.5 kg");
+    const cleared = await patch({ quantity_value: null, quantity_unit: null });
+    check("PATCH both null clears the portion", cleared.body.item.portion_label === null && cleared.body.item.quantity_unit === null);
+    await patch({ quantity_value: 500, quantity_unit: "gm" });
+
+    // ---- every read endpoint carries it
+    await db("restaurant_items").insert({ restaurant_id: restA, item_id: itemId, is_available: true });
+    const near = { lat: "22.5805", lng: "88.4605" };
+    const findIn = (list) => (list || []).find((i) => i.id === itemId);
+    const listRes = fakeRes();
+    await catalogCtl.listItemsForCategory(fakeReq({}, { categoryId: String(bengaliCatId) }, null, near), listRes);
+    check("GET /categories/:id/items returns portion_label", findIn(listRes.body.items) && findIn(listRes.body.items).portion_label === "500 gm" && findIn(listRes.body.items).quantity_value === 500);
+    const detailRes = fakeRes();
+    await catalogCtl.getCategoryDetail(fakeReq({}, { id: String(bengaliCatId) }, null, near), detailRes);
+    const detailItems = detailRes.body.sections.flatMap((s) => s.items);
+    check("GET /categories/:id (popular + more sections) returns portion_label", findIn(detailItems) && findIn(detailItems).portion_label === "500 gm");
+    const searchRes = fakeRes();
+    await catalogCtl.searchItems(fakeReq({}, {}, null, { ...near, q: "Renamed Portion" }), searchRes);
+    check("GET /items/search returns portion_label", findIn(searchRes.body.items) && findIn(searchRes.body.items).portion_label === "500 gm");
+    const popRes = fakeRes();
+    await catalogCtl.getPopularItems(fakeReq({}, {}, null, { ...near, limit: "50" }), popRes);
+    check("GET /items/popular returns portion_label", findIn(popRes.body.items) && findIn(popRes.body.items).portion_label === "500 gm");
+
+    const [portionCustomerId] = await db("users").insert({ name: "Portion Customer", phone: "8000000036", wallet_balance: 0 });
+    await db("favorites").insert({ customer_id: portionCustomerId, item_id: itemId });
+    const favRes = fakeRes();
+    await favoriteCtl.listFavorites(fakeReq({}, {}, { id: portionCustomerId, type: "customer" }), favRes);
+    check("GET /favorites returns portion_label", findIn(favRes.body.favorites) && findIn(favRes.body.favorites).portion_label === "500 gm");
+
+    const menuRes = fakeRes();
+    await restCtl.getMyMenu(fakeReq({}, {}, { id: restA, type: "restaurant" }), menuRes);
+    check("GET /restaurants/me/menu returns quantity fields + portion_label", findIn(menuRes.body.items) && findIn(menuRes.body.items).portion_label === "500 gm" && findIn(menuRes.body.items).quantity_unit === "gm");
+    const adminListRes = fakeRes();
+    await adminCatCtl.listItems(fakeReq({}, {}, admin, { q: "Renamed Portion" }), adminListRes);
+    check("GET /admin/items returns quantity fields + portion_label", findIn(adminListRes.body.items) && findIn(adminListRes.body.items).portion_label === "500 gm");
+
+    // ---- order snapshot: later edits never rewrite an old order
+    const placeOne = async () => {
+      const res = fakeRes();
+      await orderController.placeOrder(
+        fakeReq({ items: [{ item_id: itemId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "Portion St", payment_method: "cod" }, {}, { id: portionCustomerId, type: "customer" }),
+        res
+      );
+      return res;
+    };
+    const order1 = await placeOne();
+    check("placing an order with a portioned dish works", order1.statusCode === 201 && !!order1.body.order);
+    const o1 = order1.body.order.id;
+    const snap = await db("order_items").where({ order_id: o1 }).first();
+    check("order_items stores the snapshot (portion_value 500, portion_unit gm)", Number(snap.portion_value) === 500 && snap.portion_unit === "gm");
+
+    const getLine = async (orderId, auth) => {
+      const res = fakeRes();
+      await orderController.getOrder(fakeReq({}, { id: String(orderId) }, auth), res);
+      return res.body.items.find((l) => l.item_id === itemId);
+    };
+    const customerAuth = { id: portionCustomerId, type: "customer" };
+    check('GET /orders/:id (customer) line carries portion_label "500 gm"', (await getLine(o1, customerAuth)).portion_label === "500 gm");
+    check("...and the restaurant sees the same line portion", (await getLine(o1, { id: restA, type: "restaurant" })).portion_label === "500 gm");
+
+    await patch({ quantity_value: 250, quantity_unit: "gm" }); // the dish is edited AFTER the order
+    check("the OLD order keeps its snapshot (still 500 gm) after the dish becomes 250 gm", (await getLine(o1, customerAuth)).portion_label === "500 gm");
+
+    const listOrdersRes = fakeRes();
+    await orderController.listMyOrders(fakeReq({}, {}, customerAuth, {}), listOrdersRes);
+    const listedLine = listOrdersRes.body.orders.find((o) => o.id === o1).items.find((l) => l.item_id === itemId);
+    check("GET /orders list lines carry portion_label (from the snapshot)", listedLine && listedLine.portion_label === "500 gm");
+
+    await db("orders").where({ id: o1 }).update({ status: "cancelled" }); // keep this customer free to order again
+    const order2 = await placeOne();
+    check("a NEW order picks up the edited portion (250 gm)", (await getLine(order2.body.order.id, customerAuth)).portion_label === "250 gm");
+
+    const adminOrderRes = fakeRes();
+    await require("./src/controllers/adminOrders.controller").getOrder(fakeReq({}, { id: String(o1) }, admin), adminOrderRes);
+    check("GET /admin/orders/:id lines carry portion_label", adminOrderRes.body.items[0].portion_label === "500 gm");
+
+    // a pre-feature order line has no snapshot -> null, never a guess from today's item
+    await db("order_items").where({ order_id: o1 }).update({ portion_value: null, portion_unit: null });
+    check("an order line with no snapshot (placed before this feature) reads null", (await getLine(o1, customerAuth)).portion_label === null);
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

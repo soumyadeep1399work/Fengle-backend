@@ -1,12 +1,13 @@
 const db = require("../config/db");
+const { presentPortion } = require("../utils/portion");
 
 async function listFavorites(req, res) {
   const favorites = await db("favorites")
     .join("items", "items.id", "favorites.item_id")
     .where("favorites.customer_id", req.auth.id)
     .andWhere("items.is_active", true)
-    .select("items.id", "items.name", "items.description", "items.price", "items.image_url", "items.is_veg", "items.category_id");
-  res.json({ favorites });
+    .select("items.id", "items.name", "items.description", "items.price", "items.image_url", "items.is_veg", "items.category_id", "items.quantity_value", "items.quantity_unit");
+  res.json({ favorites: favorites.map(presentPortion) });
 }
 
 /**

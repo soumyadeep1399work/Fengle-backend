@@ -2,12 +2,13 @@ const db = require("../config/db");
 const { haversineDistanceKm } = require("../utils/geo");
 const { normalizeCategoryName } = require("../utils/categoryName");
 const categoryService = require("../services/category.service");
+const { parsePortionInput, presentPortion } = require("../utils/portion");
 const { applyDocumentsGate } = require("../services/partnerDocuments.service");
 
 const CATALOG_RANGE_KM = 7; // matches the cascade ceiling in routing.service.js — never show an item that couldn't actually route
 const GLOBAL_MIN_ORDER_VALUE = 50; // keep in sync with order.controller.js's MIN_ORDER_VALUE
 
-const ITEM_COLUMNS = ["items.id", "items.name", "items.description", "items.price", "items.image_url", "items.is_veg", "items.category_id"];
+const ITEM_COLUMNS = ["items.id", "items.name", "items.description", "items.price", "items.image_url", "items.is_veg", "items.category_id", "items.quantity_value", "items.quantity_unit"];
 
 /**
  * Restaurants within catalog-visibility range of a location, optionally
@@ -212,7 +213,7 @@ async function getCategoryDetail(req, res) {
       .select(ITEM_COLUMNS);
   }
 
-  const itemsWithRatings = await attachRatings(items);
+  const itemsWithRatings = (await attachRatings(items)).map(presentPortion);
   const sorted = [...itemsWithRatings].sort((a, b) => (b.ratingCount - a.ratingCount) || (b.avgRating || 0) - (a.avgRating || 0));
   const popular = sorted.slice(0, 3);
   const popularIds = new Set(popular.map((i) => i.id));
@@ -256,7 +257,7 @@ async function listItemsForCategory(req, res) {
     .groupBy(...ITEM_COLUMNS)
     .select(ITEM_COLUMNS);
 
-  res.json({ items: await attachRatings(items) });
+  res.json({ items: (await attachRatings(items)).map(presentPortion) });
 }
 
 /**
@@ -284,7 +285,7 @@ async function searchItems(req, res) {
   }
 
   const items = await query.groupBy(...ITEM_COLUMNS).select(ITEM_COLUMNS);
-  res.json({ items: await attachRatings(items) });
+  res.json({ items: (await attachRatings(items)).map(presentPortion) });
 }
 
 /**
@@ -313,7 +314,7 @@ async function getPopularItems(req, res) {
     .orderBy("items.id")
     .select(ITEM_COLUMNS);
 
-  const rated = await attachRatings(items);
+  const rated = (await attachRatings(items)).map(presentPortion);
 
   const positionInCategory = new Map();
   const seenPerCategory = {};
@@ -380,6 +381,10 @@ function validateItemFields(body, { partial }) {
     }
     fields.image_url = image_url || null; // null / "" removes the photo
   }
+  // Portion size ("3 pc", "500 gm"): both quantity_value and quantity_unit, or both null.
+  const portion = parsePortionInput(body);
+  if (portion.error) return { error: portion.error };
+  if (portion.fields) Object.assign(fields, portion.fields);
   return { fields };
 }
 
@@ -418,7 +423,7 @@ async function updateItem(req, res) {
     return res.status(400).json({ error: "category_id cannot be changed" });
   }
 
-  const EDITABLE = ["name", "price", "is_veg", "image_url", "description"];
+  const EDITABLE = ["name", "price", "is_veg", "image_url", "description", "quantity_value", "quantity_unit"];
   if (type === "admin" && body.is_active !== undefined) {
     if (typeof body.is_active !== "boolean") return res.status(400).json({ error: "is_active must be true or false" });
   } else if (body.is_active !== undefined) {
@@ -434,7 +439,7 @@ async function updateItem(req, res) {
   if (type === "admin" && body.is_active !== undefined) validated.fields.is_active = body.is_active;
 
   await db("items").where({ id }).update({ ...validated.fields, updated_at: db.fn.now() });
-  res.json({ item: await db("items").where({ id }).first() });
+  res.json({ item: presentPortion(await db("items").where({ id }).first()) });
 }
 
 /**
@@ -477,6 +482,8 @@ async function createItem(req, res) {
     price: fields.price,
     image_url: fields.image_url || null,
     is_veg: fields.is_veg === true,
+    quantity_value: fields.quantity_value ?? null,
+    quantity_unit: fields.quantity_unit ?? null,
     created_by_type: type,
     created_by_restaurant_id: type === "restaurant" ? actorId : null,
   });
@@ -486,7 +493,7 @@ async function createItem(req, res) {
     await db("restaurant_items").insert({ restaurant_id: actorId, item_id: id, is_available: true });
   }
 
-  const item = await db("items").where({ id }).first();
+  const item = presentPortion(await db("items").where({ id }).first());
   res.status(201).json({ item });
 }
 

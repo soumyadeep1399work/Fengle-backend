@@ -1,4 +1,5 @@
 const db = require("../config/db");
+const { presentLinePortion } = require("../utils/portion");
 const wallet = require("../services/wallet.service");
 const { paginationParams } = require("../utils/pagination");
 const { scrubDeliveryOtp } = require("./order.controller");
@@ -113,7 +114,8 @@ async function getOrder(req, res) {
     .join("categories", "categories.id", "order_items.category_id")
     .where("order_items.order_id", id)
     .orderBy("order_items.id")
-    .select("order_items.*", db.raw("COALESCE(order_items.item_name, items.name) as name"), "categories.name as category_name");
+    .select("order_items.*", db.raw("COALESCE(order_items.item_name, items.name) as name"), "categories.name as category_name")
+    .then((rows) => rows.map(presentLinePortion));
   const walletLedger = await db("wallet_ledger").where({ related_order_id: id }).orderBy("created_at", "asc");
 
   const { delivery_otp, ...safeOrder } = order;

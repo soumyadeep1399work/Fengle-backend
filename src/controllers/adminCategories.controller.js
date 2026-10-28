@@ -1,4 +1,5 @@
 const db = require("../config/db");
+const { portionLabel } = require("../utils/portion");
 const { normalizeCategoryName, validateCategoryName } = require("../utils/categoryName");
 const categoryService = require("../services/category.service");
 const { paginationParams } = require("../utils/pagination");
@@ -179,6 +180,8 @@ async function listItems(req, res) {
     items: rows.map((r) => ({
       id: r.id, name: r.name, description: r.description, price: Number(r.price), image_url: r.image_url,
       is_veg: Boolean(r.is_veg), is_active: Boolean(r.is_active), category_id: r.category_id, category_name: r.category_name,
+      quantity_value: r.quantity_value == null ? null : Number(r.quantity_value), quantity_unit: r.quantity_unit || null,
+      portion_label: portionLabel(r.quantity_value, r.quantity_unit),
       created_by_type: r.created_by_type, created_by_restaurant_id: r.created_by_restaurant_id, created_at: r.created_at,
     })),
   });

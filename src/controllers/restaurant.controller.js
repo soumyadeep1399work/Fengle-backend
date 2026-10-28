@@ -4,6 +4,7 @@ const categoryService = require("../services/category.service");
 const { paginationParams } = require("../utils/pagination");
 const { CURRENT_AGREEMENT_VERSION, agreementRequired } = require("../utils/agreement");
 const storage = require("../services/storage.service");
+const { portionLabel } = require("../utils/portion");
 const { reviewPartner } = require("../services/partnerVerification.service");
 const partnerDocuments = require("../services/partnerDocuments.service");
 
@@ -309,7 +310,7 @@ async function getMyMenu(req, res) {
     .orderBy([{ column: "categories.name" }, { column: "items.id" }])
     .select(
       "items.id", "items.name", "items.description", "items.price", "items.image_url", "items.is_veg",
-      "items.category_id", "categories.name as category_name", "restaurant_items.is_available"
+      "items.category_id", "items.quantity_value", "items.quantity_unit", "categories.name as category_name", "restaurant_items.is_available"
     );
 
   res.json({
@@ -323,6 +324,9 @@ async function getMyMenu(req, res) {
       category_id: r.category_id,
       category_name: r.category_name,
       is_available: Boolean(r.is_available),
+      quantity_value: r.quantity_value == null ? null : Number(r.quantity_value),
+      quantity_unit: r.quantity_unit || null,
+      portion_label: portionLabel(r.quantity_value, r.quantity_unit),
     })),
   });
 }

@@ -433,6 +433,16 @@ Portal login is the normal OTP flow (`purpose: restaurant_login | rider_login`) 
 - **Current vs effective**: a partner's latest upload of a type is what's shown; their latest *approved* upload is what counts. A renewed licence awaiting review doesn't interrupt a partner whose previous one is approved and in date.
 - **Blocking** (`PARTNER_DOCUMENTS_ENFORCED=true`, off by default): routing, the customer catalog, rider auto-assignment and admin rider reassignment (400 `documents_required`) skip partners whose `documents_valid_until` is NULL or before today (IST). That column is recomputed on every upload/review: the earliest expiry among effective required documents, `9999-12-31` when none expire, NULL when one is missing. An expired licence therefore blocks on its own, with no scheduled job. It's a routing/assignment gate, not an API gate — the apps keep working (no new error code they don't know).
 
+## Dish portion size (added 2026-10-28)
+
+Every dish can show its quantity ("Butter Chicken — 3 pc", "Biryani — 500 gm"). Client requirement; optional per item.
+
+- **Fields**: `items.quantity_value` (DECIMAL(8,2) > 0, up to 99999.99) + `items.quantity_unit` (one of `pc`, `gm`, `kg`, `ml`, `ltr`; accepted case-insensitively, stored lowercase). **Both set or both null** — sending only one is 400. `null`/`""` for both clears it.
+- **Writes**: `POST /items` and `PATCH /items/:id` (restaurant or admin) accept `quantity_value` + `quantity_unit`. A `PATCH` that doesn't mention them leaves the portion untouched.
+- **Reads**: every endpoint that returns items carries `quantity_value` (a number), `quantity_unit` and a server-built **`portion_label`** — `"3 pc"`, `"500 gm"`, `"1.5 ltr"` (trailing zeros trimmed: 500.00 → `500`), `null` when unset. That covers `GET /categories/:id/items`, `GET /categories/:id` (popular + more), `GET /items/search`, `GET /items/popular`, `GET /favorites`, `GET /restaurants/me/menu`, `GET /admin/items`, and the `item` returned by `POST`/`PATCH /items`.
+- **Orders snapshot it**: `order_items.portion_value` / `portion_unit` are copied from the item when the order is placed (same idea as the `item_name` snapshot), so editing a dish later never rewrites an old order. Each line of `GET /orders/:id` (all parties — customer, restaurant, rider, admin), `GET /orders` and `GET /admin/orders/:id` carries `portion_label` (and `portion_value`/`portion_unit` on the detail endpoints). Orders placed before this feature, and lines with no snapshot, read `null` — nothing is guessed from today's item.
+- `src/utils/portion.js` is the single place for the unit list, label format and validation.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**

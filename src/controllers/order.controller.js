@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const { portionLabel, presentLinePortion } = require("../utils/portion");
 const db = require("../config/db");
 const routing = require("../services/routing.service");
 const commission = require("../services/commission.service");
@@ -121,6 +122,8 @@ async function placeOrder(req, res) {
     itemId: i.item_id,
     categoryId: itemById[i.item_id].category_id,
     name: itemById[i.item_id].name, // snapshotted onto order_items so later renames don't rewrite history
+    portionValue: itemById[i.item_id].quantity_value, // same for the portion ("3 pc")
+    portionUnit: itemById[i.item_id].quantity_unit,
     quantity: i.quantity,
     unitPrice: Number(itemById[i.item_id].price),
   }));
@@ -288,6 +291,8 @@ async function createOrderForRestaurant({ customerId, restaurant, distanceKm, ca
         order_id: orderId,
         item_id: i.itemId,
         item_name: i.name,
+        portion_value: i.portionValue ?? null,
+        portion_unit: i.portionUnit ?? null,
         category_id: i.categoryId,
         quantity: i.quantity,
         unit_price: i.unitPrice,
@@ -771,7 +776,8 @@ async function getOrder(req, res) {
     .join("categories", "categories.id", "order_items.category_id")
     .where("order_items.order_id", id)
     .orderBy("order_items.id")
-    .select("order_items.*", db.raw("COALESCE(order_items.item_name, items.name) as name"), "categories.name as category_name");
+    .select("order_items.*", db.raw("COALESCE(order_items.item_name, items.name) as name"), "categories.name as category_name")
+    .then((rows) => rows.map(presentLinePortion));
   const categories = distinctCategories(items);
   const rider = order.rider_id ? await db("riders").where({ id: order.rider_id }).select("name", "phone").first() : null;
   const restaurant = await db("restaurants").where({ id: order.restaurant_id }).select("name", "address", "lat", "lng").first();
@@ -1014,6 +1020,7 @@ async function listMyOrders(req, res) {
         .orderBy("order_items.id")
         .select(
           "order_items.order_id", "order_items.item_id", "order_items.quantity", "order_items.category_id",
+          "order_items.portion_value", "order_items.portion_unit",
           db.raw("COALESCE(order_items.item_name, items.name) as name"), "categories.name as category_name"
         )
     : [];
@@ -1021,6 +1028,7 @@ async function listMyOrders(req, res) {
   for (const row of orderItemRows) {
     (itemsByOrderId[row.order_id] ||= []).push({
       item_id: row.item_id, name: row.name, quantity: row.quantity,
+      portion_label: portionLabel(row.portion_value, row.portion_unit),
       category_id: row.category_id, category_name: row.category_name,
     });
   }
