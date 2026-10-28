@@ -60,7 +60,7 @@ async function requestOtp(req, res) {
  * On first-time login, a user/rider/restaurant record is created automatically (self-serve signup).
  */
 async function verifyOtp(req, res) {
-  const { phone, otp, purpose = "login", name } = req.body;
+  const { phone, otp, purpose = "login", name, existing_only: existingOnly } = req.body;
 
   if (!phone || !otp) {
     return res.status(400).json({ error: "phone and otp are required" });
@@ -99,6 +99,12 @@ async function verifyOtp(req, res) {
     // an OTP verifying successfully for an unknown restaurant phone means it hasn't been
     // onboarded yet, not that we should create one on the fly.
     return res.status(404).json({ error: "This number is not registered as a partner restaurant. Please contact admin for onboarding." });
+  }
+
+  if (!userRow && existingOnly === true) {
+    // The partner document portal (partner.fengle.in) logs in existing partners only —
+    // rider self-signup stays in the Rider app, where the profile + selfie steps are.
+    return res.status(404).json({ error: "No partner account uses this number. Sign up in the Fengle Rider app first, or contact Fengle." });
   }
 
   if (!userRow) {

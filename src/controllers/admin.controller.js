@@ -4,6 +4,7 @@ const { paginationParams } = require("../utils/pagination");
 const { listOrdersForOwner } = require("./adminOrders.controller");
 const storage = require("../services/storage.service");
 const { reviewPartner } = require("../services/partnerVerification.service");
+const partnerDocuments = require("../services/partnerDocuments.service");
 
 // Never password_hash — every admin-facing rider read goes through this
 // column list rather than select("*")/first() on the raw table.
@@ -63,6 +64,7 @@ async function listRiders(req, res) {
     ? await db("orders").whereIn("rider_id", riderIds).andWhere({ status: "delivered" }).whereNull("rider_settled_at").select("rider_id").count({ n: "*" }).groupBy("rider_id")
     : [];
   const unsettledByRider = Object.fromEntries(unsettledRows.map((r) => [r.rider_id, Number(r.n)]));
+  const docSummaries = await partnerDocuments.summariesFor("rider", riderIds);
 
   res.json({
     riders: riders.map((r) => ({
@@ -75,6 +77,7 @@ async function listRiders(req, res) {
       agreementAcceptedAt: r.agreementAcceptedAt, agreementVersion: r.agreementVersion,
       hasAgreementSelfie: !!r.hasAgreementSelfie,
       verificationStatus: r.verificationStatus, verificationDeniedReason: r.verificationDeniedReason,
+      documents: docSummaries.get(Number(r.id)),
     })),
     page, limit, total: Number(total),
   });

@@ -6,6 +6,7 @@ const adminCustomers = require("../controllers/adminCustomers.controller");
 const adminCategories = require("../controllers/adminCategories.controller");
 const adminCoupons = require("../controllers/adminCoupons.controller");
 const adminAdmins = require("../controllers/adminAdmins.controller");
+const partnerDocuments = require("../controllers/partnerDocuments.controller");
 
 const router = express.Router();
 
@@ -55,6 +56,13 @@ router.get("/customers", adminCustomers.listCustomers);
 router.get("/customers/:id", adminCustomers.getCustomer);
 router.patch("/customers/:id", staff, adminCustomers.updateCustomerStatus);
 router.post("/customers/:id/wallet-credit", superOnly, adminCustomers.creditCustomerWallet);
+
+// Partner documents (KYC / licences). Every role may view; approve/reject is ops + super_admin,
+// same as the selfie review.
+router.get("/documents", partnerDocuments.listDocuments);
+router.get("/documents/:id/file", partnerDocuments.getDocumentFile);
+router.post("/documents/:id/review", staff, partnerDocuments.reviewDocument);
+router.get("/documents/:ownerType/:ownerId", partnerDocuments.getOwnerDocuments);
 
 // Admin accounts (super_admin only) + self-service password change (any admin)
 router.get("/admins", superOnly, adminAdmins.listAdmins);

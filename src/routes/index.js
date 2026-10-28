@@ -15,6 +15,7 @@ const favoriteRoutes = require("./favorite.routes");
 const notificationRoutes = require("./notification.routes");
 const uploadRoutes = require("./upload.routes");
 const couponRoutes = require("./coupon.routes");
+const partnerDocumentRoutes = require("./partnerDocuments.routes");
 
 const router = express.Router();
 
@@ -35,6 +36,7 @@ router.use("/favorites", favoriteRoutes);
 router.use("/notifications", notificationRoutes);
 router.use("/uploads", uploadRoutes);
 router.use("/coupons", couponRoutes);
+router.use("/partner", partnerDocumentRoutes); // partner.fengle.in document portal
 
 // Dev/test tools (last-otp, advance order, add credit) exist only outside production.
 if (process.env.NODE_ENV !== "production") {

@@ -10,6 +10,7 @@ const invoice = require("../services/invoice.service");
 const { haversineDistanceKm } = require("../utils/geo");
 const { notifyLater } = require("../services/push.service");
 const orderPush = require("../services/orderNotifications.service");
+const { applyDocumentsGate } = require("../services/partnerDocuments.service");
 
 const MIN_ORDER_VALUE = 50;
 // How long after placing an order a customer can still cancel it for free —
@@ -619,6 +620,7 @@ async function autoAssignRider(orderId) {
 
   const candidates = await db("riders")
     .where({ status: "active", verification_status: "approved" })
+    .modify((qb) => applyDocumentsGate(qb, "documents_valid_until"))
     .whereNotNull("last_known_lat")
     .whereNotNull("last_known_lng")
     .modify((qb) => {

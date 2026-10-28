@@ -395,6 +395,44 @@ Coupons are never "for everyone" by default — every coupon has a `target_type`
 - **Invoice**: a redeemed order's `GET /orders/:id/invoice` (and PDF) gets an extra `"Coupon discount (CODE)"` line with a negative amount; `invoiceTotal` already nets it since `grand_total` was computed that way at placement.
 - **Not enforced server-side beyond redemption bookkeeping** — same app-level posture as the two agreement features above: this doesn't add any new order-placement blocking rule beyond what's described here.
 
+## Partner documents (added 2026-10-28)
+
+Restaurants and riders upload KYC/licence documents through the partner web portal
+(**partner.fengle.in**, `PARTNER_PORTAL_URL`); an admin approves or rejects each one.
+
+| Partner | Document (`doc_type`) | Required | Number | Expiry |
+|---|---|---|---|---|
+| restaurant | `aadhaar` (owner's, **masked**) | yes | — | — |
+| restaurant | `fssai` | yes | 14 digits | yes |
+| restaurant | `trade_license` | yes | yes | yes |
+| rider | `aadhaar` (masked) | yes | — | — |
+| rider | `driving_license` | **no** | yes | yes |
+
+**Partner portal** (restaurant or rider token; `allowUnverified`, so a partner whose selfie is still pending can upload):
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/partner/documents` | `{ partner, ownerType, enforced, requirements[], documents: { [doc_type]: current or null }, summary }`. `current.approvedVersion` is the older approved upload when a newer one is waiting for review. |
+| POST | `/partner/documents` | multipart: `file` (JPEG/PNG/WebP/PDF by magic bytes, 5 MB cap), `doc_type`, `doc_number?`, `expiry_date?` (YYYY-MM-DD, not in the past). 201 `{ document }` (status `pending`). 400 on a bad type/number/date/file, 413 too large. |
+| GET | `/partner/documents/:id/file` | Streams the partner's **own** upload (404 for anyone else's). |
+
+Portal login is the normal OTP flow (`purpose: restaurant_login | rider_login`) plus **`existing_only: true`** on `POST /auth/otp/verify`: an unknown rider phone gets 404 instead of a new account (rider self-signup stays in the app).
+
+**Admin** (all roles may view; review is `ops` + `super_admin`):
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/admin/documents?status=&owner_type=&page=&limit=` | Review queue with `ownerName`/`ownerPhone`. `status=pending` is oldest first. |
+| GET | `/admin/documents/:ownerType/:ownerId` | `{ owner, requirements, documents, summary, history[] }` (`ownerType` = `restaurant`\|`rider`). |
+| GET | `/admin/documents/:id/file` | Streams the file (`Cache-Control: private, no-store`). |
+| POST | `/admin/documents/:id/review` | `{ decision: 'approve'\|'reject', reason? }` — reason required to reject; pushes the partner. |
+
+`GET /admin/restaurants` and `GET /admin/riders` rows, and `GET /restaurants/me` / `GET /riders/me`, carry `documents: { status, complete, validUntil, missing[], pendingCount }` (`status` ∈ `complete`, `expiring` (≤30 days), `pending`, `rejected`, `expired`, `missing`); the `/me` endpoints also return `documentsPortalUrl`.
+
+- **Storage is private**: `AWS_S3_PRIVATE_BUCKET` (Block Public Access on, read by the EC2 role) when set, otherwise the server's `partner-documents/` directory, which is never statically served. **Never** `AWS_S3_BUCKET` — its policy makes every key public. No response ever contains the storage path.
+- **Current vs effective**: a partner's latest upload of a type is what's shown; their latest *approved* upload is what counts. A renewed licence awaiting review doesn't interrupt a partner whose previous one is approved and in date.
+- **Blocking** (`PARTNER_DOCUMENTS_ENFORCED=true`, off by default): routing, the customer catalog, rider auto-assignment and admin rider reassignment (400 `documents_required`) skip partners whose `documents_valid_until` is NULL or before today (IST). That column is recomputed on every upload/review: the earliest expiry among effective required documents, `9999-12-31` when none expire, NULL when one is missing. An expired licence therefore blocks on its own, with no scheduled job. It's a routing/assignment gate, not an API gate — the apps keep working (no new error code they don't know).
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**

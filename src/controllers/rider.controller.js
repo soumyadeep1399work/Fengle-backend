@@ -2,6 +2,7 @@ const db = require("../config/db");
 const { RIDER_RATE_PER_KM, MIN_EARNING_PER_DELIVERY } = require("../services/settlement.service");
 const { CURRENT_AGREEMENT_VERSION, agreementRequired } = require("../utils/agreement");
 const storage = require("../services/storage.service");
+const partnerDocuments = require("../services/partnerDocuments.service");
 
 const VEHICLE_TYPES = ["bike", "scooter", "bicycle", "car"];
 
@@ -37,6 +38,8 @@ async function getMyProfile(req, res) {
       agreementRequired: agreementRequired(rider),
       verificationStatus: rider.verification_status,
       verificationDeniedReason: rider.verification_denied_reason,
+      documents: (await partnerDocuments.summariesFor("rider", [rider.id])).get(rider.id),
+      documentsPortalUrl: partnerDocuments.PORTAL_URL,
     },
   });
 }

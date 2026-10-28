@@ -2,6 +2,7 @@ const db = require("../config/db");
 const wallet = require("../services/wallet.service");
 const { paginationParams } = require("../utils/pagination");
 const { scrubDeliveryOtp } = require("./order.controller");
+const { partnerMeetsDocuments } = require("../services/partnerDocuments.service");
 
 const ORDER_STATUSES = ["placed", "accepted", "picked_up", "on_the_way", "delivered", "cancelled"];
 const PAYMENT_METHODS = ["upi", "card", "netbanking", "cod", "wallet"];
@@ -206,6 +207,9 @@ async function reassignRider(req, res) {
   const rider = await db("riders").where({ id: rider_id }).first();
   if (!rider) return res.status(404).json({ error: "Rider not found" });
   if (rider.status !== "active") return res.status(400).json({ error: "Rider must be active to be assigned" });
+  if (!partnerMeetsDocuments(rider)) {
+    return res.status(400).json({ error: "This rider's documents aren't approved yet (or have expired)", code: "documents_required" });
+  }
 
   await db("orders").where({ id }).update({ rider_id });
   res.json({ order: scrubDeliveryOtp(await db("orders").where({ id }).first(), "admin") });

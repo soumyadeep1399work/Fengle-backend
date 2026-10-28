@@ -143,6 +143,22 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   admin or changing their role is instant despite the 30-day JWT. Any NEW admin
   write route needs an explicit `requireRole` — without one every role,
   `support` included, can call it. Full table in `docs/API.md`.
+- **Partner documents** (added 2026-10-28, client request): restaurants upload
+  the owner's **masked** Aadhaar, FSSAI licence and trade licence; riders upload
+  masked Aadhaar and, optionally, a driving licence — through the partner web
+  portal (partner.fengle.in, OTP login with `existing_only: true`, so the portal
+  never creates a rider account). An admin (`ops`/`super_admin`) approves or
+  rejects each upload. Files are identity documents: they live in
+  `AWS_S3_PRIVATE_BUCKET` or the private `partner-documents/` directory, **never**
+  the public `AWS_S3_BUCKET`, and no response ever carries their storage path.
+  Blocking (client's choice) is a **routing/assignment gate**, not an API gate:
+  with `PARTNER_DOCUMENTS_ENFORCED=true`, routing, the catalog, rider
+  auto-assignment and admin reassignment skip partners whose
+  `documents_valid_until` is NULL or past (recomputed on every upload/review;
+  expiry blocks on its own). A partner's latest *approved* upload is what counts,
+  so a renewal awaiting review never interrupts them. `services/partnerDocuments.service.js`
+  is the single place these rules live — any new place that picks a kitchen or a
+  rider must apply `applyDocumentsGate`.
 - **Customer app T&C popup** (added 2026-09-30, unrelated to the bullet
   above): a lightweight, one-time terms-acceptance checkbox for customers
   only — no selfie, no admin review. `agreementRequired` on `GET /profile/me`,
@@ -259,7 +275,7 @@ min-order override), `restaurant_categories`, `items` (`is_veg`),
 `cgst_amount`/`sgst_amount`, rider + restaurant rating columns),
 `order_items`, `wallet_ledger`, `favorites`, `device_tokens`,
 `commission_config_history`, `otp_verifications`, `admins`, `coupons`,
-`coupon_redemptions`.
+`coupon_redemptions`, `partner_documents`.
 
 Read the migration files before adding new tables — most of what you need
 has a home in this schema already.

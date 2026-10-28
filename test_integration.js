@@ -1603,6 +1603,187 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 36: Partner documents — portal upload, private storage, admin review, validity + routing gate ---");
+  {
+    const http = require("http");
+    const fs = require("fs");
+    const path = require("path");
+    const { signToken } = require("./src/utils/jwt");
+    const { hashOtp } = require("./src/utils/otp");
+    const docsService = require("./src/services/partnerDocuments.service");
+    const app = require("./src/app");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const savedEnforced = process.env.PARTNER_DOCUMENTS_ENFORCED;
+    const savedPrivateBucket = process.env.AWS_S3_PRIVATE_BUCKET;
+    delete process.env.AWS_S3_PRIVATE_BUCKET; // disk mode: the private partner-documents/ directory
+
+    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32, 7)]);
+    const pdf = Buffer.from("%PDF-1.4\n%fake but correctly headed pdf\n");
+    const future = (days) => docsService.todayIST(days);
+
+    const [kitchenId] = await db("restaurants").insert({
+      name: "Docs Kitchen", phone: "9100000036", address: "Docs St", lat: 22.58, lng: 88.46, radius_km: 5, commission_rate_percent: 15, status: "active",
+    });
+    const [otherKitchenId] = await db("restaurants").insert({
+      name: "Other Kitchen", phone: "9100000037", address: "Other St", lat: 22.58, lng: 88.46, radius_km: 5, commission_rate_percent: 15, status: "active",
+    });
+    const [docRiderId] = await db("riders").insert({ name: "Docs Rider", phone: "9100000038", status: "active" });
+    const kitchen = { token: signToken({ id: kitchenId, type: "restaurant" }) };
+    const otherKitchen = { token: signToken({ id: otherKitchenId, type: "restaurant" }) };
+    const docRider = { token: signToken({ id: docRiderId, type: "rider" }) };
+    const [superDocId] = await db("admins").insert({ name: "docs-super", email: "super@docs.test", password_hash: "x", role: "super_admin" });
+    const [opsDocId] = await db("admins").insert({ name: "docs-ops", email: "ops@docs.test", password_hash: "x", role: "ops" });
+    const [supDocId] = await db("admins").insert({ name: "docs-support", email: "support@docs.test", password_hash: "x", role: "support" });
+    const superDoc = { token: signToken({ id: superDocId, type: "admin" }) };
+    const opsDoc = { token: signToken({ id: opsDocId, type: "admin" }) };
+    const supDoc = { token: signToken({ id: supDocId, type: "admin" }) };
+
+    const call = async (who, method, p, body) => {
+      const res = await fetch(base + p, {
+        method,
+        headers: { ...(who ? { Authorization: `Bearer ${who.token}` } : {}), ...(body ? { "Content-Type": "application/json" } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const type = res.headers.get("content-type") || "";
+      const buf = Buffer.from(await res.arrayBuffer());
+      let json = null;
+      if (type.includes("json")) json = JSON.parse(buf.toString());
+      return { status: res.status, body: json, buf, type, headers: res.headers };
+    };
+    const upload = async (who, fields, file) => {
+      const form = new FormData();
+      for (const [k, v] of Object.entries(fields)) form.append(k, v);
+      if (file) form.append("file", new Blob([file]), "upload.bin");
+      const res = await fetch(base + "/partner/documents", { method: "POST", headers: { Authorization: `Bearer ${who.token}` }, body: form });
+      return { status: res.status, body: await res.json() };
+    };
+
+    try {
+      // Requirements + empty state.
+      const first = await call(kitchen, "GET", "/partner/documents");
+      check("GET /partner/documents for a kitchen lists aadhaar, fssai, trade_license (all required)",
+        first.status === 200 && first.body.requirements.map((r) => r.type).join() === "aadhaar,fssai,trade_license" && first.body.requirements.every((r) => r.required));
+      check("...nothing uploaded yet -> summary 'missing' with all three listed", first.body.summary.status === "missing" && first.body.summary.missing.length === 3);
+      const riderFirst = await call(docRider, "GET", "/partner/documents");
+      check("a rider needs aadhaar (required) and driving_license (optional)",
+        riderFirst.body.requirements.map((r) => `${r.type}:${r.required}`).join() === "aadhaar:true,driving_license:false");
+      check("no token -> 401", (await call(null, "GET", "/partner/documents")).status === 401);
+      check("a customer token can't use the portal -> 403", (await call({ token: signToken({ id: 1, type: "customer" }) }, "GET", "/partner/documents")).status === 403);
+
+      // Validation.
+      check("a rider can't upload a kitchen-only doc type -> 400", (await upload(docRider, { doc_type: "fssai", doc_number: "12345678901234", expiry_date: future(100) }, png)).status === 400);
+      check("FSSAI number must be 14 digits -> 400", (await upload(kitchen, { doc_type: "fssai", doc_number: "1234", expiry_date: future(100) }, png)).status === 400);
+      check("FSSAI without an expiry date -> 400", (await upload(kitchen, { doc_type: "fssai", doc_number: "12345678901234" }, png)).status === 400);
+      check("an already-expired licence -> 400", (await upload(kitchen, { doc_type: "fssai", doc_number: "12345678901234", expiry_date: "2020-01-01" }, png)).status === 400);
+      check("a file that isn't JPEG/PNG/WebP/PDF -> 400", (await upload(kitchen, { doc_type: "aadhaar" }, Buffer.from("just some text, not a document"))).status === 400);
+      check("no file -> 400", (await upload(kitchen, { doc_type: "aadhaar" }, null)).status === 400);
+
+      // Uploads.
+      const aadhaar = await upload(kitchen, { doc_type: "aadhaar" }, png);
+      check("Aadhaar (PNG) upload -> 201 pending, no number/expiry needed", aadhaar.status === 201 && aadhaar.body.document.status === "pending" && aadhaar.body.document.docNumber === null);
+      check("...the response never exposes where the file is stored", !JSON.stringify(aadhaar.body).includes("storage_path") && !JSON.stringify(aadhaar.body).includes("partner-documents"));
+      const fssai = await upload(kitchen, { doc_type: "fssai", doc_number: "1234 5678 9012 34", expiry_date: future(200) }, pdf);
+      check("FSSAI (PDF) upload -> 201; spaces in the number are stripped", fssai.status === 201 && fssai.body.document.docNumber === "12345678901234" && fssai.body.document.contentType === "application/pdf");
+      const trade = await upload(kitchen, { doc_type: "trade_license", doc_number: "tl/2026-778", expiry_date: future(20) }, png);
+      check("Trade licence upload -> 201; number upper-cased", trade.status === 201 && trade.body.document.docNumber === "TL/2026-778");
+      const dbRow = await db("partner_documents").where({ id: aadhaar.body.document.id }).first();
+      check("the file is stored in the private partner-documents directory (not uploads/)",
+        fs.existsSync(path.join(__dirname, "partner-documents", dbRow.storage_path)) && !fs.existsSync(path.join(__dirname, "uploads", dbRow.storage_path)));
+      check("partner-documents is not served statically", (await fetch(base.replace("/api/v1", "") + `/partner-documents/${dbRow.storage_path}`)).status === 404);
+
+      const pendingSummary = (await call(kitchen, "GET", "/partner/documents")).body;
+      check("all three uploaded, none reviewed -> summary 'pending'", pendingSummary.summary.status === "pending" && pendingSummary.summary.missing.length === 0);
+      check("...and documents_valid_until is still NULL", (await db("restaurants").where({ id: kitchenId }).first()).documents_valid_until === null);
+
+      // File access.
+      const own = await call(kitchen, "GET", `/partner/documents/${aadhaar.body.document.id}/file`);
+      check("a partner can view their own upload", own.status === 200 && own.type.startsWith("image/png") && own.buf.equals(png));
+      check("...but not another kitchen's (404)", (await call(otherKitchen, "GET", `/partner/documents/${aadhaar.body.document.id}/file`)).status === 404);
+      const adminFile = await call(supDoc, "GET", `/admin/documents/${fssai.body.document.id}/file`);
+      check("any admin role can view a document; served private + no-store",
+        adminFile.status === 200 && adminFile.type.startsWith("application/pdf") && (adminFile.headers.get("cache-control") || "").includes("no-store"));
+
+      // Queue + review permissions.
+      const queue = await call(supDoc, "GET", "/admin/documents?status=pending");
+      check("GET /admin/documents?status=pending lists the uploads with owner name",
+        queue.status === 200 && queue.body.documents.filter((d) => d.ownerId === kitchenId && d.ownerType === "restaurant").length === 3 && queue.body.documents.some((d) => d.ownerName === "Docs Kitchen"));
+      check("support can't review -> 403 forbidden_role", (await call(supDoc, "POST", `/admin/documents/${aadhaar.body.document.id}/review`, { decision: "approve" })).body.code === "forbidden_role");
+      check("rejecting needs a reason -> 400", (await call(opsDoc, "POST", `/admin/documents/${aadhaar.body.document.id}/review`, { decision: "reject" })).status === 400);
+      const rej = await call(opsDoc, "POST", `/admin/documents/${aadhaar.body.document.id}/review`, { decision: "reject", reason: "Photo is blurry" });
+      check("ops can reject with a reason", rej.status === 200 && rej.body.document.status === "rejected" && rej.body.document.rejectionReason === "Photo is blurry");
+      check("...the partner sees status 'rejected' + the reason", (await call(kitchen, "GET", "/partner/documents")).body.documents.aadhaar.rejectionReason === "Photo is blurry");
+
+      const aadhaar2 = await upload(kitchen, { doc_type: "aadhaar" }, png);
+      for (const id of [aadhaar2.body.document.id, fssai.body.document.id, trade.body.document.id]) {
+        await call(opsDoc, "POST", `/admin/documents/${id}/review`, { decision: "approve" });
+      }
+      const k1 = await db("restaurants").where({ id: kitchenId }).first();
+      check("all required approved -> documents_valid_until = the earliest expiry (trade licence, +20 days)",
+        docsService.toDateString(k1.documents_valid_until) === future(20));
+      const okSummary = (await call(superDoc, "GET", `/admin/documents/restaurant/${kitchenId}`)).body;
+      check("admin owner view: summary 'expiring' (within 30 days) + owner + full history",
+        okSummary.summary.status === "expiring" && okSummary.owner.name === "Docs Kitchen" && okSummary.history.length === 4);
+
+      // Renewal doesn't interrupt; rejecting the renewal keeps the old approved one.
+      const renewal = await upload(kitchen, { doc_type: "trade_license", doc_number: "TL/2027-001", expiry_date: future(400) }, png);
+      check("re-uploading a renewed licence -> pending, but the approved one still counts (valid_until unchanged)",
+        renewal.status === 201 && docsService.toDateString((await db("restaurants").where({ id: kitchenId }).first()).documents_valid_until) === future(20));
+      const view = (await call(kitchen, "GET", "/partner/documents")).body;
+      check("...the portal shows the new upload as current, with the approved version alongside",
+        view.documents.trade_license.status === "pending" && view.documents.trade_license.approvedVersion && view.documents.trade_license.approvedVersion.docNumber === "TL/2026-778");
+      await call(opsDoc, "POST", `/admin/documents/${renewal.body.document.id}/review`, { decision: "approve" });
+      check("approving the renewal moves valid_until to the next-earliest expiry (FSSAI, +200 days)",
+        docsService.toDateString((await db("restaurants").where({ id: kitchenId }).first()).documents_valid_until) === future(200));
+
+      // The gate.
+      const gated = async () => (await db("restaurants").whereIn("id", [kitchenId, otherKitchenId]).modify((qb) => docsService.applyDocumentsGate(qb, "restaurants.documents_valid_until")).select("id")).map((r) => r.id);
+      process.env.PARTNER_DOCUMENTS_ENFORCED = "false";
+      check("enforcement off: both kitchens qualify (no change for live partners until it's switched on)", (await gated()).length === 2);
+      process.env.PARTNER_DOCUMENTS_ENFORCED = "true";
+      check("enforcement on: only the kitchen with approved, in-date documents qualifies", (await gated()).join() === String(kitchenId));
+      const restaurantList = (await call(superDoc, "GET", "/admin/restaurants?limit=500")).body.restaurants;
+      check("GET /admin/restaurants rows carry a documents summary",
+        restaurantList.find((r) => r.id === kitchenId).documents.status === "complete" && restaurantList.find((r) => r.id === otherKitchenId).documents.status === "missing");
+
+      // Expiry blocks on its own (no job): push the effective FSSAI's expiry into the past.
+      await db("partner_documents").where({ id: fssai.body.document.id }).update({ expiry_date: "2020-01-01" });
+      await docsService.recomputeValidity("restaurant", kitchenId);
+      check("an approved licence that has expired -> excluded by the gate", (await gated()).length === 0);
+      check("...summary 'expired'", (await call(kitchen, "GET", "/partner/documents")).body.summary.status === "expired");
+
+      // Rider: Aadhaar alone is enough; reassignment respects the gate.
+      const rAadhaar = await upload(docRider, { doc_type: "aadhaar" }, png);
+      check("rider without approved Aadhaar: partnerMeetsDocuments is false while enforced",
+        !docsService.partnerMeetsDocuments(await db("riders").where({ id: docRiderId }).first()));
+      await call(opsDoc, "POST", `/admin/documents/${rAadhaar.body.document.id}/review`, { decision: "approve" });
+      const riderRow = await db("riders").where({ id: docRiderId }).first();
+      check("rider: approved Aadhaar alone (DL optional) -> valid with no expiry (9999-12-31)",
+        docsService.toDateString(riderRow.documents_valid_until) === "9999-12-31" && docsService.partnerMeetsDocuments(riderRow));
+      const meRider = await call(docRider, "GET", "/riders/me");
+      check("GET /riders/me carries the documents summary + portal URL", meRider.body.rider.documents.status === "complete" && !!meRider.body.rider.documentsPortalUrl);
+      const meKitchen = await call(kitchen, "GET", "/restaurants/me");
+      check("GET /restaurants/me carries the documents summary", meKitchen.body.restaurant.documents.status === "expired");
+
+      // Portal login never creates a rider account.
+      const otpHash = await hashOtp("482913");
+      await db("otp_verifications").insert({ phone: "9100000039", otp_hash: otpHash, purpose: "rider_login", expires_at: new Date(Date.now() + 300000) });
+      const portalLogin = await call(null, "POST", "/auth/otp/verify", { phone: "9100000039", otp: "482913", purpose: "rider_login", existing_only: true });
+      check("portal login (existing_only) for an unknown rider phone -> 404 and no account created",
+        portalLogin.status === 404 && !(await db("riders").where({ phone: "9100000039" }).first()));
+      await db("otp_verifications").insert({ phone: "9100000038", otp_hash: otpHash, purpose: "rider_login", expires_at: new Date(Date.now() + 300000) });
+      const knownLogin = await call(null, "POST", "/auth/otp/verify", { phone: "9100000038", otp: "482913", purpose: "rider_login", existing_only: true });
+      check("portal login for an existing rider -> 200 with a token", knownLogin.status === 200 && !!knownLogin.body.token);
+    } finally {
+      if (savedEnforced === undefined) delete process.env.PARTNER_DOCUMENTS_ENFORCED; else process.env.PARTNER_DOCUMENTS_ENFORCED = savedEnforced;
+      if (savedPrivateBucket !== undefined) process.env.AWS_S3_PRIVATE_BUCKET = savedPrivateBucket;
+      await new Promise((resolve) => server.close(resolve));
+      const rows = await db("partner_documents").whereIn("owner_id", [kitchenId, otherKitchenId, docRiderId]).select("storage_path");
+      for (const r of rows) await fs.promises.unlink(path.join(__dirname, "partner-documents", r.storage_path)).catch(() => {});
+      await db("admins").where("email", "like", "%@docs.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

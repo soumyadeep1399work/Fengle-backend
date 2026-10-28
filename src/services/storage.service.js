@@ -139,4 +139,63 @@ async function readAgreementSelfie(storedPath) {
   return { buffer, contentType };
 }
 
-module.exports = { UPLOAD_DIR, detectImageType, saveImage, saveAgreementSelfie, readAgreementSelfie };
+// Partner KYC/licence documents (Aadhaar, FSSAI, trade/driving licence) are
+// identity documents: they must NEVER land in AWS_S3_BUCKET, whose policy makes
+// every key publicly readable. They go to AWS_S3_PRIVATE_BUCKET when that is set
+// (a bucket with Block Public Access on, readable only by the EC2 instance role),
+// otherwise to this directory, which — like agreement-selfies/ — is not mounted
+// by express.static. Only the authenticated streaming endpoints read them back.
+const PARTNER_DOCUMENT_DIR = path.join(__dirname, "../../partner-documents");
+fs.mkdirSync(PARTNER_DOCUMENT_DIR, { recursive: true });
+
+const DOCUMENT_CONTENT_TYPE = { ...CONTENT_TYPE, pdf: "application/pdf" };
+
+/** Like detectImageType, plus PDF ("%PDF-" header). Returns the extension to store under, or null. */
+function detectDocumentType(buf) {
+  if (Buffer.isBuffer(buf) && buf.length >= 5 && buf.subarray(0, 5).toString("latin1") === "%PDF-") return "pdf";
+  return detectImageType(buf);
+}
+
+/**
+ * Saves an already-validated document. Returns { storagePath, contentType }:
+ * storagePath is a private-bucket key ("partner-documents/<uuid>.<ext>") or a bare
+ * file name on disk — never a URL, and never sent to any client.
+ */
+async function savePartnerDocument(buffer, ext) {
+  const name = `${crypto.randomUUID()}.${ext}`;
+  const contentType = DOCUMENT_CONTENT_TYPE[ext] || "application/octet-stream";
+  const bucket = process.env.AWS_S3_PRIVATE_BUCKET;
+
+  if (bucket) {
+    const { PutObjectCommand } = require("@aws-sdk/client-s3");
+    const key = `partner-documents/${name}`;
+    await getS3Client().send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: buffer, ContentType: contentType }));
+    return { storagePath: key, contentType };
+  }
+
+  await fs.promises.writeFile(path.join(PARTNER_DOCUMENT_DIR, name), buffer, { flag: "wx" });
+  return { storagePath: name, contentType };
+}
+
+/**
+ * Reads back a value savePartnerDocument() produced. storedPath always comes from
+ * our own DB row, never from the request, so the plain path.join is safe. A key
+ * with the "partner-documents/" prefix was written to the private bucket.
+ */
+async function readPartnerDocument(storedPath) {
+  if (storedPath.startsWith("partner-documents/")) {
+    const bucket = process.env.AWS_S3_PRIVATE_BUCKET;
+    if (!bucket) throw new Error("AWS_S3_PRIVATE_BUCKET is not set but this document is stored in it");
+    const { GetObjectCommand } = require("@aws-sdk/client-s3");
+    const result = await getS3Client().send(new GetObjectCommand({ Bucket: bucket, Key: storedPath }));
+    const chunks = [];
+    for await (const chunk of result.Body) chunks.push(chunk);
+    return Buffer.concat(chunks);
+  }
+  return fs.promises.readFile(path.join(PARTNER_DOCUMENT_DIR, storedPath));
+}
+
+module.exports = {
+  UPLOAD_DIR, detectImageType, saveImage, saveAgreementSelfie, readAgreementSelfie,
+  detectDocumentType, savePartnerDocument, readPartnerDocument,
+};

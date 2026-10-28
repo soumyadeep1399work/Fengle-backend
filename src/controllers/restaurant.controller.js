@@ -5,6 +5,7 @@ const { paginationParams } = require("../utils/pagination");
 const { CURRENT_AGREEMENT_VERSION, agreementRequired } = require("../utils/agreement");
 const storage = require("../services/storage.service");
 const { reviewPartner } = require("../services/partnerVerification.service");
+const partnerDocuments = require("../services/partnerDocuments.service");
 
 // Never password_hash — every admin-facing restaurant read goes through this
 // column list rather than select("*")/first() on the raw table.
@@ -74,9 +75,12 @@ async function listRestaurants(req, res) {
   const ids = restaurants.map((r) => r.id);
   const orderCountRows = ids.length ? await db("orders").whereIn("restaurant_id", ids).select("restaurant_id").count({ n: "*" }).groupBy("restaurant_id") : [];
   const orderCountById = Object.fromEntries(orderCountRows.map((r) => [r.restaurant_id, Number(r.n)]));
+  const docSummaries = await partnerDocuments.summariesFor("restaurant", ids);
 
   res.json({
-    restaurants: restaurants.map((r) => ({ ...r, hasAgreementSelfie: !!r.hasAgreementSelfie, order_count: orderCountById[r.id] || 0 })),
+    restaurants: restaurants.map((r) => ({
+      ...r, hasAgreementSelfie: !!r.hasAgreementSelfie, order_count: orderCountById[r.id] || 0, documents: docSummaries.get(Number(r.id)),
+    })),
     page, limit, total: Number(total),
   });
 }
@@ -212,6 +216,8 @@ async function getMyRestaurant(req, res) {
       agreementRequired: agreementRequired(restaurant),
       verificationStatus: restaurant.verification_status,
       verificationDeniedReason: restaurant.verification_denied_reason,
+      documents: (await partnerDocuments.summariesFor("restaurant", [restaurant.id])).get(restaurant.id),
+      documentsPortalUrl: partnerDocuments.PORTAL_URL,
     },
   });
 }

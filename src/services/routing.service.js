@@ -1,5 +1,6 @@
 const db = require("../config/db");
 const { haversineDistanceKm } = require("../utils/geo");
+const { applyDocumentsGate } = require("./partnerDocuments.service");
 
 const CASCADE_CEILING_KM = 7; // hard outer search limit, per confirmed business rule
 const DEFAULT_DELIVERY_RATE_PER_KM = 5; // ₹/km beyond a restaurant's own free radius
@@ -37,6 +38,7 @@ async function findCandidates({ items, customerLat, customerLng }) {
     .whereIn("restaurant_categories.category_id", categoryIds)
     .andWhere("restaurants.status", "active")
     .andWhere("restaurants.verification_status", "approved")
+    .modify((qb) => applyDocumentsGate(qb, "restaurants.documents_valid_until"))
     .groupBy("restaurants.id")
     .havingRaw("COUNT(DISTINCT restaurant_categories.category_id) = ?", [categoryIds.length])
     .select("restaurants.*");

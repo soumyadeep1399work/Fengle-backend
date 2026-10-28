@@ -2,6 +2,7 @@ const db = require("../config/db");
 const { haversineDistanceKm } = require("../utils/geo");
 const { normalizeCategoryName } = require("../utils/categoryName");
 const categoryService = require("../services/category.service");
+const { applyDocumentsGate } = require("../services/partnerDocuments.service");
 
 const CATALOG_RANGE_KM = 7; // matches the cascade ceiling in routing.service.js — never show an item that couldn't actually route
 const GLOBAL_MIN_ORDER_VALUE = 50; // keep in sync with order.controller.js's MIN_ORDER_VALUE
@@ -15,7 +16,10 @@ const ITEM_COLUMNS = ["items.id", "items.name", "items.description", "items.pric
  * so they all agree on what "nearby" means.
  */
 async function getInRangeRestaurantIds(lat, lng, categoryId) {
-  let query = db("restaurants").where("restaurants.status", "active").andWhere("restaurants.verification_status", "approved");
+  let query = db("restaurants")
+    .where("restaurants.status", "active")
+    .andWhere("restaurants.verification_status", "approved")
+    .modify((qb) => applyDocumentsGate(qb, "restaurants.documents_valid_until"));
   if (categoryId) {
     query = query
       .join("restaurant_categories", "restaurants.id", "restaurant_categories.restaurant_id")
