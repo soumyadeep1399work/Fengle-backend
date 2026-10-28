@@ -2118,6 +2118,123 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 39: COD cash — rider handovers (ledger credit) and the expected/collected/handed-over reconciliation ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const { dayKey, parseRange } = require("./src/utils/reportRange");
+    const app = require("./src/app");
+    const devtools = require("./src/services/devtools.service");
+    const adminOrdersCtl = require("./src/controllers/adminOrders.controller");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const mkAdmin = async (name, role) => {
+      const [id] = await db("admins").insert({ name, email: `${name}@cod.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role });
+      return { id, token: signToken({ id, type: "admin" }) };
+    };
+    const superA = await mkAdmin("cod-super", "super_admin");
+    const opsA = await mkAdmin("cod-ops", "ops");
+    const supA = await mkAdmin("cod-support", "support");
+    const call = async (who, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { Authorization: `Bearer ${who.token}`, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* csv */ }
+      return { status: r.status, body: json, text, type: r.headers.get("content-type") };
+    };
+    const otherRiders = await db("riders").select("id", "status");
+    const today = dayKey(new Date());
+    const yesterday = dayKey(new Date(Date.now() - 86400e3));
+    const tomorrow = dayKey(new Date(Date.now() + 86400e3));
+    try {
+      await db("riders").update({ status: "inactive" }); // only the rider below can be auto-assigned
+      const [codRiderId] = await db("riders").insert({ name: "COD Rider", phone: "8500000039", status: "active", last_known_lat: 22.5810, last_known_lng: 88.4610, wallet_balance: 0 });
+
+      const place = async (phone) => {
+        const [custId] = await db("users").insert({ name: "COD Customer", phone, wallet_balance: 0 });
+        const r = fakeRes();
+        await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605, delivery_address: "COD St", payment_method: "cod" }, {}, { id: custId, type: "customer" }), r);
+        return r.body.order.id;
+      };
+      const oDelivered = await place("8000000391");
+      await devtools.advanceOrder(oDelivered, { to: "delivered" });
+      const oShort = await place("8000000392");
+      await devtools.advanceOrder(oShort, { to: "delivered" });
+      const oCancelled = await place("8000000393");
+      await db("orders").where({ id: oCancelled }).update({ rider_id: codRiderId }); // the rider already had it when it was cancelled
+      const cancelRes = fakeRes();
+      await adminOrdersCtl.cancelOrder(fakeReq({ reason: "test" }, { id: String(oCancelled) }, { id: 1, type: "admin" }), cancelRes);
+
+      const delivered = await db("orders").where({ id: oDelivered }).first();
+      const grand = Number(delivered.grand_total);
+      const wallet0 = Number((await db("riders").where({ id: codRiderId }).first()).wallet_balance);
+      check("setup: the rider owes the COD they collected (negative wallet = both delivered orders' totals)", wallet0 < 0 && Math.abs(wallet0 + grand + Number((await db("orders").where({ id: oShort }).first()).grand_total)) < 0.01);
+
+      // Make two anomalies the live flow can't produce but a reconciliation must catch.
+      const shortLedger = await db("wallet_ledger").where({ owner_type: "rider", owner_id: codRiderId, related_order_id: oShort, reason: "cod_collected" }).first();
+      await db("wallet_ledger").where({ id: shortLedger.id }).update({ amount: Number(shortLedger.amount) - 20 }); // rider confirmed ₹20 less than the total
+      await db("wallet_ledger").insert({ owner_type: "rider", owner_id: codRiderId, entry_type: "debit", amount: 100, balance_after: 0, reason: "cod_collected", related_order_id: oCancelled, notes: "cash taken before the cancellation" });
+
+      // ---- reconciliation (JSON)
+      const rec = await call(supA, "GET", `/admin/cod/reconciliation?from=${yesterday}&to=${tomorrow}&rider_id=${codRiderId}`);
+      check("GET /admin/cod/reconciliation is open to every role (support) -> 200", rec.status === 200);
+      const byId = Object.fromEntries(rec.body.orders.map((o) => [o.order_id, o]));
+      check("includes delivered AND cancelled COD orders (3 rows)", rec.body.total_orders === 3 && !!byId[oDelivered] && !!byId[oShort] && !!byId[oCancelled]);
+      check("a clean delivered order: expected = collected = grand_total, difference 0, no flag", byId[oDelivered].expected === grand && byId[oDelivered].collected === grand && byId[oDelivered].difference === 0 && byId[oDelivered].flag === null);
+      check("a short one: difference -20, flag 'short'", byId[oShort].difference === -20 && byId[oShort].flag === "short");
+      check("a cancelled order that has cash recorded: expected 0, collected 100, flag 'unexpected_collection'", byId[oCancelled].status === "cancelled" && byId[oCancelled].expected === 0 && byId[oCancelled].collected === 100 && byId[oCancelled].flag === "unexpected_collection");
+      const riderRow = rec.body.riders.find((r) => r.rider_id === codRiderId);
+      const shortGrand = Number((await db("orders").where({ id: oShort }).first()).grand_total);
+      check("rider row: delivered 2, expected = both totals, collected = expected - 20 + 100 (the cancelled one's cash counts), 2 flagged",
+        riderRow.delivered_cod_orders === 2 && Math.abs(riderRow.expected - (grand + shortGrand)) < 0.01 && Math.abs(riderRow.collected - (grand + shortGrand - 20 + 100)) < 0.01 && riderRow.flagged_orders === 2 && riderRow.handed_over === 0);
+      check("flagged=1 limits the order rows to the two anomalies", (await call(supA, "GET", `/admin/cod/reconciliation?from=${yesterday}&to=${tomorrow}&rider_id=${codRiderId}&flagged=1`)).body.total_orders === 2);
+      check("a range in the past is empty; a bad / reversed range is a 400", (await call(supA, "GET", `/admin/cod/reconciliation?from=2020-01-01&to=2020-01-31&rider_id=${codRiderId}`)).body.total_orders === 0 && (await call(supA, "GET", "/admin/cod/reconciliation?from=nonsense")).status === 400 && (await call(supA, "GET", "/admin/cod/reconciliation?from=2026-02-01&to=2026-01-01")).status === 400);
+      check("date-only 'to' covers the whole IST day (23:59:59.999)", parseRange({ from: "2026-10-28", to: "2026-10-28" }).to.getTime() - parseRange({ from: "2026-10-28" }).from.getTime() === 86400e3 - 1);
+
+      // ---- handovers
+      const outstanding0 = Math.max(0, -wallet0);
+      check("support can't record a handover (403 forbidden_role)", (await call(supA, "POST", `/admin/riders/${codRiderId}/cash-handovers`, { amount: 10 })).body.code === "forbidden_role");
+      check("amount 0 / negative / text -> 400", (await call(opsA, "POST", `/admin/riders/${codRiderId}/cash-handovers`, { amount: 0 })).status === 400 && (await call(opsA, "POST", `/admin/riders/${codRiderId}/cash-handovers`, { amount: -5 })).status === 400 && (await call(opsA, "POST", `/admin/riders/${codRiderId}/cash-handovers`, { amount: "abc" })).status === 400);
+      check("a handover in the future -> 400", (await call(opsA, "POST", `/admin/riders/${codRiderId}/cash-handovers`, { amount: 10, received_at: new Date(Date.now() + 86400e3).toISOString() })).status === 400);
+      check("unknown rider -> 404", (await call(opsA, "POST", "/admin/riders/999999/cash-handovers", { amount: 10 })).status === 404);
+      const tooMuch = await call(opsA, "POST", `/admin/riders/${codRiderId}/cash-handovers`, { amount: outstanding0 + 1 });
+      check("more than the rider owes -> 409 saying how much is outstanding (typo guard)", tooMuch.status === 409 && tooMuch.body.outstanding === outstanding0);
+
+      const hand1 = await call(opsA, "POST", `/admin/riders/${codRiderId}/cash-handovers`, { amount: 200, reference: "RCPT-1", notes: "Handed over at the office", received_at: new Date(Date.now() - 3600e3).toISOString() });
+      check("ops records a handover -> 201 with balance_after and outstanding_after", hand1.status === 201 && hand1.body.handover.amount === 200 && Math.abs(hand1.body.handover.outstanding_after - (outstanding0 - 200)) < 0.01 && hand1.body.handover.received_by_admin_id === opsA.id);
+      const wallet1 = Number((await db("riders").where({ id: codRiderId }).first()).wallet_balance);
+      check("the rider's wallet balance rose by exactly the handover", Math.abs(wallet1 - (wallet0 + 200)) < 0.01);
+      const ledgerRow = await db("wallet_ledger").where({ owner_type: "rider", owner_id: codRiderId, reason: "cash_handover" }).first();
+      check("a wallet_ledger CREDIT with reason cash_handover was written and is linked from the handover", ledgerRow && ledgerRow.entry_type === "credit" && Number(ledgerRow.amount) === 200 && (await db("cash_handovers").where({ id: hand1.body.handover.id }).first()).ledger_entry_id === ledgerRow.id);
+      const dupe = await call(opsA, "POST", `/admin/riders/${codRiderId}/cash-handovers`, { amount: 50, reference: "RCPT-1" });
+      check("the same reference again -> 409 and no second credit", dupe.status === 409 && Number((await db("riders").where({ id: codRiderId }).first()).wallet_balance) === wallet1);
+      const hand2 = await call(superA, "POST", `/admin/riders/${codRiderId}/cash-handovers`, { amount: 25.5 });
+      check("a second handover without a reference works (super_admin too)", hand2.status === 201);
+
+      const hist = await call(supA, "GET", `/admin/cash-handovers?rider_id=${codRiderId}`);
+      check("GET /admin/cash-handovers (any role): newest first, rider name, who recorded it, total_amount", hist.status === 200 && hist.body.handovers.length === 2 && hist.body.total === 2 && hist.body.total_amount === 225.5 && hist.body.handovers[0].rider_name === "COD Rider" && hist.body.handovers.some((h) => h.received_by_admin_name === "cod-ops" && h.reference === "RCPT-1"));
+      check("history filters by date and rider", (await call(supA, "GET", `/admin/cash-handovers?rider_id=${codRiderId}&from=2020-01-01&to=2020-01-02`)).body.total === 0 && (await call(supA, "GET", "/admin/cash-handovers?rider_id=999999")).body.total === 0);
+
+      const rec2 = await call(supA, "GET", `/admin/cod/reconciliation?from=${yesterday}&to=${tomorrow}&rider_id=${codRiderId}`);
+      const row2 = rec2.body.riders.find((r) => r.rider_id === codRiderId);
+      check("reconciliation now shows handed_over 225.5, net_cash_in_period = collected - handed_over, outstanding = what the wallet still owes",
+        row2.handed_over === 225.5 && Math.abs(row2.net_cash_in_period - (row2.collected - 225.5)) < 0.01 && Math.abs(row2.outstanding - Math.max(0, -(wallet0 + 225.5))) < 0.01);
+      check("the full amount can be handed over: outstanding reaches 0, then nothing more is accepted",
+        (await call(opsA, "POST", `/admin/riders/${codRiderId}/cash-handovers`, { amount: row2.outstanding })).status === 201 && (await call(opsA, "POST", `/admin/riders/${codRiderId}/cash-handovers`, { amount: 1 })).status === 409);
+
+      // ---- CSV
+      const csvOrders = await call(supA, "GET", `/admin/cod/reconciliation.csv?from=${yesterday}&to=${tomorrow}&rider_id=${codRiderId}`);
+      const lines = csvOrders.text.trim().split("\r\n");
+      check("orders CSV: text/csv, header row, one line per order, a negative difference stays a plain number", csvOrders.type.startsWith("text/csv") && lines[0].startsWith("order_id,closed_at,status") && lines.length === 4 && lines.some((l) => l.includes(",-20,")));
+      const csvRiders = await call(supA, "GET", `/admin/cod/reconciliation.csv?view=riders&from=${yesterday}&to=${tomorrow}&rider_id=${codRiderId}`);
+      check("riders CSV (view=riders): header + the rider's row", csvRiders.text.startsWith("rider_id,rider_name,rider_phone") && csvRiders.text.trim().split("\r\n").length === 2);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      for (const r of otherRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      await db("admins").where("email", "like", "%@cod.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

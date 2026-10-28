@@ -13,7 +13,7 @@ const OWNER_TABLE = { customer: "users", rider: "riders" };
  * @param {number} params.ownerId
  * @param {'credit'|'debit'} params.entryType
  * @param {number} params.amount - always positive; direction comes from entryType
- * @param {'cod_collected'|'settlement_payout'|'settlement_deduction'|'order_refund'|'manual_adjustment'} params.reason
+ * @param {'cod_collected'|'settlement_payout'|'settlement_deduction'|'order_refund'|'manual_adjustment'|'cash_handover'} params.reason
  * @param {number} [params.relatedOrderId]
  * @param {string} [params.notes]
  * @param {import('knex').Knex.Transaction} [trx] - pass an existing transaction to

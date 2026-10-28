@@ -7,6 +7,7 @@ const adminCategories = require("../controllers/adminCategories.controller");
 const adminCoupons = require("../controllers/adminCoupons.controller");
 const adminAdmins = require("../controllers/adminAdmins.controller");
 const adminSettings = require("../controllers/adminSettings.controller");
+const adminCod = require("../controllers/adminCod.controller");
 const partnerDocuments = require("../controllers/partnerDocuments.controller");
 
 const router = express.Router();
@@ -38,6 +39,12 @@ router.get("/riders/:id/agreement-selfie", adminController.getRiderAgreementSelf
 router.post("/riders/:id/verification", staff, adminController.reviewRiderVerification);
 router.patch("/riders/:id", staff, adminController.updateRiderStatus);
 router.post("/riders/:riderId/settle", superOnly, adminController.settleRider);
+
+// COD cash: record what riders hand over (ops + super_admin); the history and the reconciliation report are open to every role.
+router.post("/riders/:id/cash-handovers", staff, adminCod.createCashHandover);
+router.get("/cash-handovers", adminCod.listCashHandovers);
+router.get("/cod/reconciliation", adminCod.codReconciliation);
+router.get("/cod/reconciliation.csv", adminCod.codReconciliationCsv);
 router.get("/settlements", adminController.listSettlements);
 
 // Categories & items

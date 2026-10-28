@@ -103,6 +103,13 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   rider must explicitly confirm the exact amount collected at the
   "Mark Delivered" step for a COD order — this is the trigger that creates
   the ledger entry. Do not skip this confirmation step in the UI.
+- **COD cash handovers** (2026-10-28): outstanding COD is the rider's negative
+  wallet balance. An admin (`ops`/`super_admin`) records cash a rider hands
+  over via `POST /admin/riders/:id/cash-handovers`, which writes a
+  `cash_handover` ledger credit (can't exceed what the rider owes; `reference`
+  is unique per rider). `GET /admin/cod/reconciliation` compares expected vs
+  collected vs handed over per rider and per order (cancelled/refunded COD
+  orders included) and flags mismatches. Report dates are IST days.
 - **Rider pay is admin-configurable** (2026-10-28): `payout = max(min_payout,
   base_payout + per_km_rate × distance_km) + incentive_per_delivery`, set by a
   super_admin (`PUT /admin/settings/rider-pay`, append-only history) and
