@@ -88,15 +88,14 @@ async function saveImage(buffer, ext) {
  * an S3 key (prefixed "agreement-selfies/") in S3 mode. Never a URL: nothing
  * downstream should be able to construct a public link from this value.
  *
- * NOTE: in S3 mode this bucket's policy grants public s3:GetObject on every
- * key (see AWS deployment notes) — namespacing under a prefix keeps it out
- * of the public catalog-image listing/UI, but an attacker who somehow
- * learned the random key could still fetch it directly from S3. Revisit
- * (e.g. a second, non-public bucket) if this needs to be airtight.
+ * Selfies go to AWS_S3_PRIVATE_BUCKET (Block Public Access on) when it's set —
+ * the same private bucket as partner documents (2026-10-28). Only when it isn't
+ * set do they fall back to AWS_S3_BUCKET, whose policy makes every key publicly
+ * readable; scripts/move-selfies-to-private-bucket.js moves those older ones over.
  */
 async function saveAgreementSelfie(buffer, ext) {
   const name = `${crypto.randomUUID()}.${ext}`;
-  const bucket = process.env.AWS_S3_BUCKET;
+  const bucket = process.env.AWS_S3_PRIVATE_BUCKET || process.env.AWS_S3_BUCKET;
 
   if (bucket) {
     const { PutObjectCommand } = require("@aws-sdk/client-s3");
@@ -123,16 +122,25 @@ async function saveAgreementSelfie(buffer, ext) {
  * surface here despite the plain path.join.
  */
 async function readAgreementSelfie(storedPath) {
-  const bucket = process.env.AWS_S3_BUCKET;
   const ext = path.extname(storedPath).slice(1);
   const contentType = CONTENT_TYPE[ext] || "application/octet-stream";
 
-  if (bucket) {
-    const { GetObjectCommand } = require("@aws-sdk/client-s3");
-    const result = await getS3Client().send(new GetObjectCommand({ Bucket: bucket, Key: storedPath }));
-    const chunks = [];
-    for await (const chunk of result.Body) chunks.push(chunk);
-    return { buffer: Buffer.concat(chunks), contentType: result.ContentType || contentType };
+  // An S3 key has the "agreement-selfies/" prefix; the same key may live in the private
+  // bucket (current) or, for selfies saved before it existed and not yet moved, the public one.
+  if (storedPath.startsWith("agreement-selfies/")) {
+    const buckets = [process.env.AWS_S3_PRIVATE_BUCKET, process.env.AWS_S3_BUCKET].filter(Boolean);
+    let lastErr = new Error("No S3 bucket is configured for agreement selfies");
+    for (const bucket of buckets) {
+      try {
+        const buffer = await getS3Object(bucket, storedPath);
+        return { buffer, contentType };
+      } catch (err) {
+        // Without s3:ListBucket a missing key answers AccessDenied rather than NoSuchKey.
+        if (!["NoSuchKey", "AccessDenied", "NotFound"].includes(err.name)) throw err;
+        lastErr = err;
+      }
+    }
+    throw lastErr;
   }
 
   const buffer = await fs.promises.readFile(path.join(AGREEMENT_SELFIE_DIR, storedPath));
@@ -186,16 +194,20 @@ async function readPartnerDocument(storedPath) {
   if (storedPath.startsWith("partner-documents/")) {
     const bucket = process.env.AWS_S3_PRIVATE_BUCKET;
     if (!bucket) throw new Error("AWS_S3_PRIVATE_BUCKET is not set but this document is stored in it");
-    const { GetObjectCommand } = require("@aws-sdk/client-s3");
-    const result = await getS3Client().send(new GetObjectCommand({ Bucket: bucket, Key: storedPath }));
-    const chunks = [];
-    for await (const chunk of result.Body) chunks.push(chunk);
-    return Buffer.concat(chunks);
+    return getS3Object(bucket, storedPath);
   }
   return fs.promises.readFile(path.join(PARTNER_DOCUMENT_DIR, storedPath));
 }
 
+async function getS3Object(bucket, key) {
+  const { GetObjectCommand } = require("@aws-sdk/client-s3");
+  const result = await getS3Client().send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const chunks = [];
+  for await (const chunk of result.Body) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
 module.exports = {
-  UPLOAD_DIR, detectImageType, saveImage, saveAgreementSelfie, readAgreementSelfie,
+  UPLOAD_DIR, detectImageType, saveImage, saveAgreementSelfie, readAgreementSelfie, getS3Client, getS3Object,
   detectDocumentType, savePartnerDocument, readPartnerDocument,
 };
