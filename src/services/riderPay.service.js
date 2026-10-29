@@ -96,4 +96,4 @@ function parseBreakdown(value) {
   try { return JSON.parse(value); } catch { return null; }
 }
 
-module.exports = { FORMULA, getCurrentConfig, normalizeConfig, computePayout, recordPayoutOnDelivery, payoutForSettlement, parseBreakdown };
+module.exports = { FORMULA, getCurrentConfig, normalizeConfig, computePayout, orderDistanceKm, recordPayoutOnDelivery, payoutForSettlement, parseBreakdown };

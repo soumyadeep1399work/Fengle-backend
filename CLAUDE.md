@@ -103,6 +103,15 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   rider must explicitly confirm the exact amount collected at the
   "Mark Delivered" step for a COD order — this is the trigger that creates
   the ledger entry. Do not skip this confirmation step in the UI.
+- **Profit & loss is super_admin only** (2026-10-29): `GET /admin/finance/pnl`
+  and the expenses CRUD. Every order figure is keyed to the order's **placement
+  date in IST** so the P&L and `orders.csv` tie out. Fengle revenue is
+  `commission + delivery fees` (GST is a pass-through, never revenue);
+  restaurant payables are an INTERIM `item_total − commission` until the
+  settlement model is decided; net profit is revenue − rider payouts − coupon
+  discounts − gateway fees (`RAZORPAY_FEE_PERCENT`, default 2%) − expenses.
+  Every formula is written out in `docs/API.md` — keep them in sync with
+  `services/finance.service.js`.
 - **COD cash handovers** (2026-10-28): outstanding COD is the rider's negative
   wallet balance. An admin (`ops`/`super_admin`) records cash a rider hands
   over via `POST /admin/riders/:id/cash-handovers`, which writes a

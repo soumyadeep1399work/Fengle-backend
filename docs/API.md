@@ -478,6 +478,37 @@ A COD order can only be marked delivered when the rider confirms the exact `gran
   - **Rider row** (every rider with COD activity or a handover in the range, plus anyone who currently owes cash): `delivered_cod_orders`; `expected` (sum over delivered orders); `collected` (sum over all of that rider's rows, so cash recorded on a cancelled order counts); `difference` = `collected − expected`; `flagged_orders`; `handed_over` = handovers with `received_at` in the range; `net_cash_in_period` = `collected − handed_over`; `outstanding` = what the rider owes **right now** (`max(0, −wallet_balance)`; it nets settlements and handovers and is **not** limited to the range). `totals` sums the rider rows (+ `cod_orders`, `flagged_orders`).
   - **CSV** — `GET /admin/cod/reconciliation.csv` (same filters, every row, no paging): `view=orders` (default; columns `order_id, closed_at, status, payment_status, rider_id, rider_name, grand_total, expected, collected, difference, refunded, flag`) or `view=riders`.
 
+## Finance: expenses and profit & loss (added 2026-10-29) — super_admin only
+
+Every route here is **super_admin only** (ops/support get 403 `forbidden_role`). Dates are **IST days** (`REPORT_TZ_OFFSET_MINUTES`, default 330): `2026-03-31` means that whole IST day, and an order placed at 23:30 IST on 31 March belongs to March whatever the server clock says. With no `from`/`to` the reports default to the current month so far.
+
+**Expenses** — `POST /admin/expenses { date: "YYYY-MM-DD", category: marketing|operating|salaries|other, amount (>0), notes? }` → 201 `{ expense }`; `GET /admin/expenses?from=&to=&category=&page=&limit=` → `{ expenses, page, limit, total, total_amount, by_category }` (newest first); `PATCH /admin/expenses/:id` (any of the fields); `DELETE /admin/expenses/:id`. An expense is `{ id, date, category, amount, notes, created_by_admin_id, created_at, updated_at }`.
+
+**Profit & loss** — `GET /admin/finance/pnl?from=&to=&group=day|month` (default `day`) → `{ range, group, gateway_fee_percent, formulas, periods: [{ period, ...figures }], totals }`. `periods` only contains periods with activity (orders or expenses), oldest first; `totals` is the same figures over the whole range. CSV: `GET /admin/finance/pnl.csv` (same filters; one row per period plus a `TOTAL` row) and `GET /admin/finance/orders.csv` (order-wise transactions: one row per order placed in the range, exactly the rows the P&L sums, so the two always tie out).
+
+**One basis for every order figure: the order's placement date** (`created_at`, IST) — the P&L reports "orders placed in this period, and what became of them", so a late delivery still counts in the day it was placed. Expenses use their own `date`. Money comes from these order columns; only **delivered** orders carry revenue and costs.
+
+| Figure | Formula |
+|---|---|
+| `orders_placed` / `gross_order_value` | count / sum of `grand_total` of every order placed (any status) |
+| `delivered_orders` / `delivered_sales` | count / sum of `grand_total` of delivered orders (includes GST and the delivery fee, after coupons) |
+| `delivered_item_total`, `delivered_delivery_fees`, `gst_collected`, `commission` | sums over delivered orders of `item_total`, `delivery_fee`, `cgst_amount + sgst_amount`, `commission_amount` |
+| **`fengle_revenue`** | `commission + delivered_delivery_fees` — **GST is a pass-through and is never revenue** |
+| **`restaurant_payables_interim`** | **INTERIM** — sum over delivered orders of `item_total − commission_amount`, until the restaurant settlement model (per-dish price vs commission %) is decided. `item_total` is what the customer paid for the food, after any dish offer |
+| **`rider_payouts`** | sum over delivered orders of the payout frozen at delivery (`orders.rider_payout`); a delivered order without one (delivered before rider pay existed) uses the **current** rider-pay formula for that order. Split into `rider_payouts_stored`, `rider_payouts_estimated` and `rider_payouts_estimated_orders` (how many) |
+| **`coupon_discounts`** | sum of `coupon_discount_amount` over delivered orders — platform-funded, so a cost to Fengle |
+| **`gateway_charges`** | `RAZORPAY_FEE_PERCENT` % (default **2**) of `grand_total` over delivered orders paid by `upi`/`card`/`netbanking`. COD and wallet orders carry no fee. Fees on cancelled-and-refunded online orders are **not** included |
+| `expenses` / `expenses_total` | sum of expenses in the period, per category and overall |
+| **`net_profit`** | `fengle_revenue − rider_payouts − coupon_discounts − gateway_charges − expenses_total` |
+| `cancelled_orders` / `cancelled_value` | count / sum of `grand_total` of orders with status `cancelled` |
+| `in_progress_orders` / `in_progress_value` | orders placed in the period that are not yet delivered or cancelled |
+| `offer_discounts_info` | **informational, not deducted**: sum over delivered orders' confirmed lines of `(list_price − unit_price) × quantity`. Already inside the lower `item_total`, so deducting it again would double count |
+| `refunds_info` | **informational, not deducted**: customer wallet refunds (`order_refund`) for those orders. A delivered order's `grand_total` is already net of dropped items, and a cancelled order is never counted as a sale |
+
+Why `net_profit` leaves out restaurant payables and GST: the customer's money in is `grand_total = item_total + delivery_fee + GST − coupon`; out go the restaurant's `item_total − commission`, the rider payout, the GST to the government and the gateway fee — what remains is `commission + delivery_fee − coupon − rider payout − gateway fee`, i.e. `net_profit` before expenses.
+
+**orders.csv columns**: `order_id, placed_at, delivered_at, cancelled_at, status, payment_method, payment_status, item_total, delivery_fee, gst, coupon_discount, grand_total, commission, fengle_revenue, restaurant_payable, rider_payout, rider_payout_source (stored|estimated|empty), gateway_charge, offer_discount, refunded, net_contribution` — `net_contribution = fengle_revenue − rider_payout − coupon_discount − gateway_charge` for a delivered order, `0` otherwise; summed over the rows and minus expenses it equals `net_profit`.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**

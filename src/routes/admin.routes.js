@@ -8,6 +8,7 @@ const adminCoupons = require("../controllers/adminCoupons.controller");
 const adminAdmins = require("../controllers/adminAdmins.controller");
 const adminSettings = require("../controllers/adminSettings.controller");
 const adminCod = require("../controllers/adminCod.controller");
+const adminFinance = require("../controllers/adminFinance.controller");
 const partnerDocuments = require("../controllers/partnerDocuments.controller");
 
 const router = express.Router();
@@ -75,6 +76,15 @@ router.get("/documents/:ownerType/:ownerId", partnerDocuments.getOwnerDocuments)
 // Rider pay: every role can read it; only a super_admin can change it.
 router.get("/settings/rider-pay", adminSettings.getRiderPay);
 router.put("/settings/rider-pay", superOnly, adminSettings.updateRiderPay);
+
+// Finance (super_admin only): expenses CRUD, profit & loss, and its CSVs.
+router.post("/expenses", superOnly, adminFinance.createExpense);
+router.get("/expenses", superOnly, adminFinance.listExpenses);
+router.patch("/expenses/:id", superOnly, adminFinance.updateExpense);
+router.delete("/expenses/:id", superOnly, adminFinance.deleteExpense);
+router.get("/finance/pnl", superOnly, adminFinance.pnl);
+router.get("/finance/pnl.csv", superOnly, adminFinance.pnlCsv);
+router.get("/finance/orders.csv", superOnly, adminFinance.ordersCsv);
 
 // Admin accounts (super_admin only) + self-service password change (any admin)
 router.get("/admins", superOnly, adminAdmins.listAdmins);

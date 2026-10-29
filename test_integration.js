@@ -2235,6 +2235,120 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 40: Finance — expenses CRUD and the profit & loss report (formulas, IST boundaries, roles, CSV) ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const financeSvc = require("./src/services/finance.service");
+    const riderPaySvc40 = require("./src/services/riderPay.service");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const mkAdmin = async (name, role) => {
+      const [id] = await db("admins").insert({ name, email: `${name}@fin.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role });
+      return { id, token: signToken({ id, type: "admin" }) };
+    };
+    const superA = await mkAdmin("fin-super", "super_admin");
+    const opsA = await mkAdmin("fin-ops", "ops");
+    const supA = await mkAdmin("fin-support", "support");
+    const call = async (who, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { Authorization: `Bearer ${who.token}`, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* csv */ }
+      return { status: r.status, body: json, text, type: r.headers.get("content-type") };
+    };
+    try {
+      // ---- roles: finance is super_admin only
+      const probes = [["GET", "/admin/finance/pnl"], ["GET", "/admin/finance/pnl.csv"], ["GET", "/admin/finance/orders.csv"], ["GET", "/admin/expenses"], ["POST", "/admin/expenses", {}], ["PATCH", "/admin/expenses/1", {}], ["DELETE", "/admin/expenses/1"]];
+      let leaked = [];
+      for (const [m, p, b] of probes) for (const who of [["ops", opsA], ["support", supA]]) {
+        const r = await call(who[1], m, p, b);
+        if (!(r.status === 403 && r.body && r.body.code === "forbidden_role")) leaked.push(`${who[0]} ${m} ${p} -> ${r.status}`);
+      }
+      check(`ops and support get 403 forbidden_role on every finance route (leaks: ${leaked.join("; ") || "none"})`, leaked.length === 0);
+
+      // ---- expenses CRUD
+      const bad = [
+        { date: "2026-02-30", category: "marketing", amount: 10 }, { date: "26-03-10", category: "marketing", amount: 10 },
+        { date: "2026-03-10", category: "rent", amount: 10 }, { date: "2026-03-10", category: "marketing", amount: 0 },
+        { date: "2026-03-10", category: "marketing", amount: -3 }, { date: "2026-03-10", category: "marketing", amount: "abc" },
+        { date: "2026-03-10", category: "marketing", amount: 10, notes: "x".repeat(501) },
+      ];
+      check("expense validation: impossible date, wrong format, unknown category, zero/negative/text amount, long notes -> all 400", (await Promise.all(bad.map((b) => call(superA, "POST", "/admin/expenses", b)))).every((r) => r.status === 400));
+      const e1 = await call(superA, "POST", "/admin/expenses", { date: "2026-03-10", category: "marketing", amount: "500", notes: "Flyers" });
+      const e2 = await call(superA, "POST", "/admin/expenses", { date: "2026-03-15", category: "salaries", amount: 1000 });
+      const e3 = await call(superA, "POST", "/admin/expenses", { date: "2026-04-02", category: "operating", amount: 250.5 });
+      check("POST /admin/expenses -> 201 { expense } with date as YYYY-MM-DD and a numeric amount", e1.status === 201 && e1.body.expense.date === "2026-03-10" && e1.body.expense.amount === 500 && e1.body.expense.notes === "Flyers" && e1.body.expense.created_by_admin_id === superA.id);
+      const listed = await call(superA, "GET", "/admin/expenses?from=2026-03-01&to=2026-03-31");
+      check("GET /admin/expenses filters by date: 2 in March, total 1500, by_category", listed.body.total === 2 && listed.body.total_amount === 1500 && listed.body.by_category.marketing === 500 && listed.body.by_category.salaries === 1000 && listed.body.by_category.other === 0);
+      check("...and by category", (await call(superA, "GET", "/admin/expenses?category=operating")).body.total === 1 && (await call(superA, "GET", "/admin/expenses?category=rent")).status === 400);
+      const patched = await call(superA, "PATCH", `/admin/expenses/${e3.body.expense.id}`, { amount: 300, notes: "Internet" });
+      check("PATCH /admin/expenses/:id updates fields", patched.body.expense.amount === 300 && patched.body.expense.notes === "Internet" && patched.body.expense.category === "operating");
+      check("PATCH with no valid field / unknown id -> 400 / 404", (await call(superA, "PATCH", `/admin/expenses/${e3.body.expense.id}`, {})).status === 400 && (await call(superA, "PATCH", "/admin/expenses/999999", { amount: 5 })).status === 404);
+      const tmp = await call(superA, "POST", "/admin/expenses", { date: "2026-03-20", category: "other", amount: 1 });
+      check("DELETE /admin/expenses/:id removes it (and a second delete is 404)", (await call(superA, "DELETE", `/admin/expenses/${tmp.body.expense.id}`)).status === 200 && (await call(superA, "DELETE", `/admin/expenses/${tmp.body.expense.id}`)).status === 404);
+
+      // ---- fixed March orders (IST) with exactly known money
+      const [finCust] = await db("users").insert({ name: "Fin Customer", phone: "8000000040", wallet_balance: 0 });
+      const mkOrder = async (o) => (await db("orders").insert({
+        customer_id: finCust, restaurant_id: restA, delivery_lat: 22.5800, delivery_lng: 88.4600, delivery_address: "Fin St",
+        is_clubbed: false, ...o,
+      }))[0];
+      const A = await mkOrder({ status: "delivered", payment_method: "upi", payment_status: "paid", item_total: 400, delivery_fee: 30, cgst_amount: 10, sgst_amount: 10, coupon_discount_amount: 20, grand_total: 430, commission_amount: 60, rider_payout: 40, created_at: new Date("2026-03-10T10:00:00Z"), delivered_at: new Date("2026-03-10T11:00:00Z") });
+      const C = await mkOrder({ status: "cancelled", payment_method: "upi", payment_status: "refunded", item_total: 250, delivery_fee: 20, cgst_amount: 15, sgst_amount: 15, grand_total: 300, commission_amount: 0, created_at: new Date("2026-03-11T05:00:00Z"), cancelled_at: new Date("2026-03-11T05:30:00Z") });
+      const B = await mkOrder({ status: "delivered", payment_method: "cod", payment_status: "paid", item_total: 200, delivery_fee: 20, cgst_amount: 5, sgst_amount: 5, coupon_discount_amount: 0, grand_total: 230, commission_amount: 30, rider_payout: null, created_at: new Date("2026-03-12T06:00:00Z"), delivered_at: new Date("2026-03-12T07:00:00Z") });
+      const D = await mkOrder({ status: "placed", payment_method: "cod", payment_status: "pending", item_total: 90, delivery_fee: 10, grand_total: 100, commission_amount: 0, created_at: new Date("2026-03-31T18:00:00Z") }); // 23:30 IST on 31 March
+      const E = await mkOrder({ status: "delivered", payment_method: "cod", payment_status: "paid", item_total: 900, delivery_fee: 50, cgst_amount: 25, sgst_amount: 24, grand_total: 999, commission_amount: 100, rider_payout: 70, created_at: new Date("2026-03-31T19:00:00Z"), delivered_at: new Date("2026-03-31T20:00:00Z") }); // 00:30 IST on 1 April
+      await db("order_items").insert({ order_id: A, item_id: fishCurryId, item_name: "Fish Curry", category_id: bengaliCatId, quantity: 2, unit_price: 150, list_price: 200, subtotal: 300 });
+      await db("wallet_ledger").insert({ owner_type: "customer", owner_id: finCust, entry_type: "credit", amount: 10, balance_after: 10, reason: "order_refund", related_order_id: A, notes: "dropped item" });
+
+      const feePct = financeSvc.gatewayFeePercent();
+      const gateway = Number(((430 * feePct) / 100).toFixed(2));
+      const fallbackB = riderPaySvc40.computePayout({ distanceKm: 0, config: await riderPaySvc40.getCurrentConfig() }).payout; // order B has no stored payout and sits on its kitchen
+      const riderTotal = Number((40 + fallbackB).toFixed(2));
+      const expectedNet = Number((140 - riderTotal - 20 - gateway - 1500).toFixed(2));
+
+      const month = await call(superA, "GET", "/admin/finance/pnl?from=2026-03-01&to=2026-03-31&group=month");
+      const t = month.body.totals;
+      check("P&L month: 1 period (2026-03); the order at 00:30 IST on 1 April is NOT in March, the one at 23:30 IST on 31 March IS", month.status === 200 && month.body.periods.length === 1 && month.body.periods[0].period === "2026-03" && t.orders_placed === 4);
+      check("gross order value = 430 + 300 + 230 + 100 = 1060; delivered 2 orders, delivered_sales 660", t.gross_order_value === 1060 && t.delivered_orders === 2 && t.delivered_sales === 660);
+      check("delivered item_total 600, delivery fees 50, GST collected 30 (kept out of revenue), commission 90", t.delivered_item_total === 600 && t.delivered_delivery_fees === 50 && t.gst_collected === 30 && t.commission === 90);
+      check("Fengle revenue = commission + delivery fees = 140 (GST excluded)", t.fengle_revenue === 140);
+      check("restaurant payables (interim) = (400-60) + (200-30) = 510", t.restaurant_payables_interim === 510);
+      check(`rider payouts = stored 40 + estimated for the order without one (${fallbackB}) = ${riderTotal}; stored/estimated split and count reported`, t.rider_payouts === riderTotal && t.rider_payouts_stored === 40 && t.rider_payouts_estimated === fallbackB && t.rider_payouts_estimated_orders === 1);
+      check("coupon discounts 20 (delivered orders); offer discounts 100 and refunds 10 reported as info", t.coupon_discounts === 20 && t.offer_discounts_info === 100 && t.refunds_info === 10);
+      check(`gateway charges = ${feePct}% of the delivered ONLINE order only (430 -> ${gateway}); the COD order carries none`, t.gateway_charges === gateway);
+      check("cancelled: 1 order worth 300; in progress: 1 order worth 100", t.cancelled_orders === 1 && t.cancelled_value === 300 && t.in_progress_orders === 1 && t.in_progress_value === 100);
+      check("expenses by category (marketing 500, salaries 1000) total 1500", t.expenses.marketing === 500 && t.expenses.salaries === 1000 && t.expenses.operating === 0 && t.expenses_total === 1500);
+      check(`net profit = 140 - ${riderTotal} - 20 - ${gateway} - 1500 = ${expectedNet}`, t.net_profit === expectedNet);
+      check("the response documents every formula", month.body.formulas && ["fengle_revenue", "restaurant_payables_interim", "net_profit", "gateway_charges"].every((k) => typeof month.body.formulas[k] === "string") && month.body.gateway_fee_percent === feePct);
+
+      const day = await call(superA, "GET", "/admin/finance/pnl?from=2026-03-01&to=2026-03-31&group=day");
+      check("P&L by day: periods 03-10, 03-11, 03-12, 03-15 (expenses only), 03-31 (the 23:30 IST order), sorted", day.body.periods.map((p) => p.period).join() === "2026-03-10,2026-03-11,2026-03-12,2026-03-15,2026-03-31");
+      check("...the day periods add up to the same totals", Math.abs(day.body.periods.reduce((s, p) => s + p.net_profit, 0) - t.net_profit) < 0.02 && Math.abs(day.body.periods.reduce((s, p) => s + p.gross_order_value, 0) - t.gross_order_value) < 0.01);
+      const april = await call(superA, "GET", "/admin/finance/pnl?from=2026-04-01&to=2026-04-30&group=month");
+      check("April holds the 00:30 IST order (999 delivered, revenue 150) and the operating expense 300", april.body.totals.delivered_sales === 999 && april.body.totals.fengle_revenue === 150 && april.body.totals.expenses.operating === 300 && april.body.totals.rider_payouts === 70);
+      check("bad group / range -> 400", (await call(superA, "GET", "/admin/finance/pnl?group=year")).status === 400 && (await call(superA, "GET", "/admin/finance/pnl?from=2026-05-01&to=2026-04-01")).status === 400);
+      check("with no range it defaults to the current month so far (200)", (await call(superA, "GET", "/admin/finance/pnl")).status === 200);
+
+      // ---- CSVs
+      const pnlCsv = await call(superA, "GET", "/admin/finance/pnl.csv?from=2026-03-01&to=2026-03-31&group=month");
+      const pl = pnlCsv.text.trim().split("\r\n");
+      check("pnl.csv: text/csv, header, the month row and a TOTAL row", pnlCsv.type.startsWith("text/csv") && pl[0].startsWith("period,orders_placed,gross_order_value") && pl.length === 3 && pl[1].startsWith("2026-03,") && pl[2].startsWith("TOTAL,"));
+      const ordCsv = await call(superA, "GET", "/admin/finance/orders.csv?from=2026-03-01&to=2026-03-31");
+      const ol = ordCsv.text.trim().split("\r\n");
+      check("orders.csv: header + the 4 orders placed in March, A's line shows revenue 90 and payout 40 (stored)", ordCsv.type.startsWith("text/csv") && ol[0].startsWith("order_id,placed_at,delivered_at") && ol.length === 5 && ol.find((l) => l.startsWith(`${A},`)).includes(",90,") && ol.find((l) => l.startsWith(`${A},`)).includes("stored"));
+      check("orders.csv marks the fallback payout as estimated", ol.find((l) => l.startsWith(`${B},`)).includes("estimated"));
+      const csvNet = ol.slice(1).reduce((s, l) => s + Number(l.split(",").pop()), 0);
+      check("the net_contribution column of orders.csv sums to the P&L's net profit before expenses", Math.abs(csvNet - (t.net_profit + t.expenses_total)) < 0.02);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      await db("expenses").delete();
+      await db("admins").where("email", "like", "%@fin.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }
