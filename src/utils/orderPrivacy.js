@@ -1,7 +1,7 @@
 // What Fengle pays a kitchen, and what each dish costs it, is internal: customers, kitchens and riders
 // never see vendor costs or the payable. Admin controllers return their own shapes; every order row
 // or order line that can reach a customer/kitchen/rider app goes through these.
-const INTERNAL_ORDER_FIELDS = ["restaurant_payable", "payable_estimated"];
+const INTERNAL_ORDER_FIELDS = ["restaurant_payable", "payable_estimated", "delivery_fee_breakdown"];
 
 /** An order row without the internal settlement fields. */
 function stripInternalOrderFields(order) {

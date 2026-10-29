@@ -122,7 +122,8 @@ async function getOrder(req, res) {
     .then((rows) => rows.map(presentLinePortion));
   const walletLedger = await db("wallet_ledger").where({ related_order_id: id }).orderBy("created_at", "asc");
 
-  const { delivery_otp, rider_payout_breakdown, ...safeOrder } = order;
+  const { delivery_otp, rider_payout_breakdown, delivery_fee_breakdown, ...safeOrder } = order;
+  safeOrder.delivery_fee_breakdown = riderPay.parseBreakdown(delivery_fee_breakdown); // how the customer's delivery fee was worked out (admin-only)
   safeOrder.rider_payout = safeOrder.rider_payout == null ? null : Number(safeOrder.rider_payout);
   safeOrder.rider_payout_breakdown = riderPay.parseBreakdown(rider_payout_breakdown);
   // What Fengle owes the kitchen: nothing for a cancelled order; hidden from support (vendor costs are for super_admin + ops).

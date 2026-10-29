@@ -10,6 +10,7 @@ const adminSettings = require("../controllers/adminSettings.controller");
 const adminCod = require("../controllers/adminCod.controller");
 const adminFinance = require("../controllers/adminFinance.controller");
 const adminNotifications = require("../controllers/adminNotifications.controller");
+const adminShipping = require("../controllers/adminShipping.controller");
 const adminRestSettlement = require("../controllers/adminRestaurantSettlement.controller");
 const partnerDocuments = require("../controllers/partnerDocuments.controller");
 
@@ -89,6 +90,21 @@ router.post("/restaurants/:id/payments", staff, adminRestSettlement.createPaymen
 router.get("/restaurant-payments", staff, adminRestSettlement.listPayments);
 router.post("/restaurants/:id/adjustments", staff, adminRestSettlement.createAdjustment);
 router.get("/restaurant-adjustments", staff, adminRestSettlement.listAdjustments);
+
+// Shipping charges (zones + rules for the customer delivery fee and the rider payout): every admin role can read and use the
+// preview; only a super_admin changes anything.
+router.get("/shipping/zones", adminShipping.listZones);
+router.post("/shipping/zones", superOnly, adminShipping.createZone);
+router.post("/shipping/zones/reorder", superOnly, adminShipping.reorderZones);
+router.patch("/shipping/zones/:id", superOnly, adminShipping.updateZone);
+router.delete("/shipping/zones/:id", superOnly, adminShipping.deleteZone);
+router.get("/shipping/rules", adminShipping.listRules);
+router.post("/shipping/rules", superOnly, adminShipping.createRule);
+router.post("/shipping/rules/reorder", superOnly, adminShipping.reorderRules);
+router.patch("/shipping/rules/:id", superOnly, adminShipping.updateRule);
+router.delete("/shipping/rules/:id", superOnly, adminShipping.deleteRule);
+router.get("/shipping/history", adminShipping.history);
+router.post("/shipping/preview", adminShipping.preview);
 
 // Notification centre (super_admin only): compose, schedule, cancel and review push campaigns to customers.
 router.post("/notifications/preview", superOnly, adminNotifications.preview);

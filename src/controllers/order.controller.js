@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const { portionLabel, presentLinePortion } = require("../utils/portion");
 const { effectivePrice } = require("../utils/pricing");
 const riderPay = require("../services/riderPay.service");
+const shipping = require("../services/shippingRules.service");
 const restaurantPayable = require("../services/restaurantPayable.service");
 const { stripInternalOrderFields, stripInternalLineFields } = require("../utils/orderPrivacy");
 const db = require("../config/db");
@@ -254,7 +255,10 @@ async function attemptClubbedFallbackSplit({ customerId, cartItems, categoryIds,
 async function createOrderForRestaurant({ customerId, restaurant, distanceKm, cartItems, deliveryLat, deliveryLng, deliveryAddress, paymentMethod, isClubbed, cascadeAttempts, couponCode }) {
   return db.transaction(async (trx) => {
     const itemTotal = cartItems.reduce((sum, i) => sum + i.unitPrice * i.quantity, 0);
-    const deliveryFee = routing.computeDeliveryFee(distanceKm, restaurant);
+    const feeResult = await shipping.customerFee({
+      distanceKm, restaurant, orderValue: itemTotal, at: new Date(), dropoff: { lat: Number(deliveryLat), lng: Number(deliveryLng) }, conn: trx,
+    });
+    const deliveryFee = feeResult.fee;
     const commissionAmount = commission.computeCommission(itemTotal, restaurant); // unaffected by any coupon — platform-funded, not a restaurant cost
     const { cgstAmount, sgstAmount } = computeTax(itemTotal); // computed on the full, pre-discount item_total
 
@@ -291,6 +295,7 @@ async function createOrderForRestaurant({ customerId, restaurant, distanceKm, ca
       delivery_address: deliveryAddress,
       item_total: itemTotal,
       delivery_fee: deliveryFee,
+      delivery_fee_breakdown: JSON.stringify(feeResult.breakdown),
       commission_amount: commissionAmount, // legacy: no longer drives anything, kept so older reports still read
       restaurant_payable: payable,
       payable_estimated: estimated,
@@ -570,11 +575,17 @@ async function rejectOrder(req, res) {
 
   if (nextCandidate) {
     const commissionAmount = commission.computeCommission(Number(order.item_total), nextCandidate.restaurant);
-    const deliveryFee = routing.computeDeliveryFee(nextCandidate.distanceKm, nextCandidate.restaurant);
+    // Re-priced for the new kitchen, but at the ORDER'S placement time so a reassignment can't flip a time-of-day surcharge.
+    const feeResult = await shipping.customerFee({
+      distanceKm: nextCandidate.distanceKm, restaurant: nextCandidate.restaurant, orderValue: Number(order.item_total), at: new Date(order.created_at),
+      dropoff: { lat: Number(order.delivery_lat), lng: Number(order.delivery_lng) },
+    });
+    const deliveryFee = feeResult.fee;
     await db("orders").where({ id }).update({
       restaurant_id: nextCandidate.restaurant.id,
       commission_amount: commissionAmount,
       delivery_fee: deliveryFee,
+      delivery_fee_breakdown: JSON.stringify(feeResult.breakdown),
       grand_total: Number((Number(order.item_total) + deliveryFee + Number(order.cgst_amount) + Number(order.sgst_amount) - Number(order.coupon_discount_amount || 0)).toFixed(2)),
       cascade_attempts: (order.cascade_attempts || 1) + 1,
       status: "placed", // re-enters the queue for the new restaurant
@@ -822,7 +833,7 @@ async function getOrder(req, res) {
   const customer = type === "rider" || type === "admin" ? await db("users").where({ id: order.customer_id }).select("phone").first() : null;
   // What the rider would earn for a delivery still to be done (live config; the payout itself is frozen at delivery).
   const estimatedRiderPayout = type === "rider" || type === "admin"
-    ? riderPay.estimatePayout({ order, restaurant, config: await riderPay.getCurrentConfig() })
+    ? await riderPay.estimatePayout({ order, restaurant })
     : undefined;
 
   res.json({
@@ -1092,21 +1103,21 @@ async function listMyOrders(req, res) {
         (await db("users").whereIn("id", customerIds).select("id", "phone")).map((c) => [c.id, c])
       );
 
-  const liveRiderPay = type === "rider" || type === "admin" ? await riderPay.getCurrentConfig() : null;
+  const liveRiderPay = type === "rider" || type === "admin" ? await shipping.loadRuleSet(db, "rider_pay") : null;
   res.json({
-    orders: orders.map((o) => {
+    orders: await Promise.all(orders.map(async (o) => {
       const items = itemsByOrderId[o.id] || [];
       const categories = distinctCategories(items);
       return scrubRiderPay(scrubDeliveryOtp(
         {
           ...withCancelInfo(o), items, categories, category_name: categories.map((c) => c.name).join(" + "),
-          ...(liveRiderPay ? { estimated_rider_payout: riderPay.estimatePayout({ order: o, restaurant: restaurantById[o.restaurant_id], config: liveRiderPay }) } : {}),
+          ...(liveRiderPay ? { estimated_rider_payout: await riderPay.estimatePayout({ order: o, restaurant: restaurantById[o.restaurant_id], ruleSet: liveRiderPay }) } : {}),
           ...restaurantContactFields(type, restaurantById[o.restaurant_id]),
           ...customerContactFields(type, customerById[o.customer_id]),
         },
         type
       ), type);
-    }),
+    })),
   });
 }
 

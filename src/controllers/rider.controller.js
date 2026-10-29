@@ -13,10 +13,13 @@ const VEHICLE_TYPES = ["bike", "scooter", "bicycle", "car"];
  * confirmed with the client and the env vars change.
  */
 async function getMyRate(req, res) {
-  const c = await riderPay.getCurrentConfig();
+  // The simple numbers while the admin-managed rider rules are the simple shape; otherwise just the explanation
+  // (the real figure for an order is estimated_rider_payout on the order).
+  const c = await riderPay.simpleConfig();
+  if (!c) return res.json({ simple: false, formula: riderPay.FORMULA });
   // rate_per_km / min_earning_per_delivery are the original keys (older Rider app builds read them);
   // base_payout and incentive_per_delivery are new. The formula is on riderPay.FORMULA.
-  res.json({
+  res.json({ simple: true,
     rate_per_km: c.per_km_rate, min_earning_per_delivery: c.min_payout,
     base_payout: c.base_payout, incentive_per_delivery: c.incentive_per_delivery,
     tier_km: c.tier_km, per_km_rate_after_tier: c.per_km_rate_after_tier, // null = a single rate

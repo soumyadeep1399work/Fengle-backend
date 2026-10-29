@@ -1,9 +1,8 @@
 const db = require("../config/db");
 const riderPay = require("../services/riderPay.service");
 
-const MAX_AMOUNT = 100000;
-const MAX_TIER_KM = 1000;
-const FIELDS = ["base_payout", "per_km_rate", "min_payout", "incentive_per_delivery"];
+// Rider pay is now an admin-managed shipping RULE set (kind rider_pay, /admin/shipping/rules). This old endpoint is kept as a
+// read-only view of the simple shape (for older screens) plus the legacy single-config history; it can no longer change anything.
 
 async function history(limit = 100) {
   const rows = await db("rider_pay_config as c")
@@ -15,54 +14,24 @@ async function history(limit = 100) {
 }
 
 /**
- * GET /admin/settings/rider-pay — the live rider pay config, its formula, and the full
- * change history (newest first; the first row is the live one).
+ * GET /admin/settings/rider-pay — the live rider pay in the old single-config shape, ONLY while the rider rules really are that
+ * simple (`simple: true`); otherwise `settings` is null and `simple` false (see /admin/shipping/rules?kind=rider_pay for the real
+ * thing). `history` is the legacy single-config change log (read-only, from before the rules engine).
  */
 async function getRiderPay(req, res) {
-  const rows = await history();
-  res.json({ settings: rows[0] || (await riderPay.getCurrentConfig()), formula: riderPay.FORMULA, history: rows });
+  const simple = await riderPay.simpleConfig();
+  res.json({
+    settings: simple ? { id: null, ...simple, created_at: null, created_by_admin_id: null } : null,
+    simple: Boolean(simple),
+    formula: riderPay.FORMULA,
+    history: await history(),
+    managed_at: "/admin/shipping/rules?kind=rider_pay",
+  });
 }
 
-/**
- * PUT /admin/settings/rider-pay { base_payout, per_km_rate, min_payout, incentive_per_delivery, tier_km?, per_km_rate_after_tier? }
- * super_admin only. Appends a history row and makes it the live config. Applies to orders
- * delivered from now on — payouts already frozen on delivered orders never change.
- */
+/** PUT /admin/settings/rider-pay — retired: rider pay is managed under /admin/shipping/rules (kind rider_pay). */
 async function updateRiderPay(req, res) {
-  const body = req.body || {};
-  const values = {};
-  for (const key of FIELDS) {
-    const raw = body[key];
-    const n = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : raw;
-    if (typeof n !== "number" || !Number.isFinite(n) || n < 0 || n > MAX_AMOUNT) {
-      return res.status(400).json({ error: `${key} must be a number from 0 to ${MAX_AMOUNT}` });
-    }
-    values[key] = Number(n.toFixed(2));
-  }
-  // Optional two-rate distance pay: BOTH tier_km and per_km_rate_after_tier, or neither (omitted / null = a single rate).
-  const num = (v) => (typeof v === "string" && v.trim() !== "" ? Number(v) : v);
-  const blank = (v) => v === undefined || v === null || v === "";
-  if (blank(body.tier_km) !== blank(body.per_km_rate_after_tier)) {
-    return res.status(400).json({ error: "tier_km and per_km_rate_after_tier must be set together (or both left out for a single rate)" });
-  }
-  if (blank(body.tier_km)) {
-    values.tier_km = null;
-    values.per_km_rate_after_tier = null;
-  } else {
-    const tier = num(body.tier_km);
-    const after = num(body.per_km_rate_after_tier);
-    if (typeof tier !== "number" || !Number.isFinite(tier) || tier <= 0 || tier > MAX_TIER_KM) return res.status(400).json({ error: `tier_km must be a number above 0 (up to ${MAX_TIER_KM})` });
-    if (typeof after !== "number" || !Number.isFinite(after) || after < 0 || after > MAX_AMOUNT) return res.status(400).json({ error: `per_km_rate_after_tier must be a number from 0 to ${MAX_AMOUNT}` });
-    values.tier_km = Number(tier.toFixed(2));
-    values.per_km_rate_after_tier = Number(after.toFixed(2));
-  }
-  if (FIELDS.every((key) => values[key] === 0) && values.tier_km === null) {
-    return res.status(400).json({ error: "At least one of the pay values must be above 0 — riders would earn nothing" });
-  }
-
-  const [id] = await db("rider_pay_config").insert({ ...values, created_by_admin_id: req.auth.id });
-  const rows = await history(1);
-  res.json({ settings: rows[0], formula: riderPay.FORMULA, id });
+  res.status(410).json({ error: "Rider pay is managed under /admin/shipping/rules (kind rider_pay)", code: "moved_to_shipping_rules" });
 }
 
 module.exports = { getRiderPay, updateRiderPay };

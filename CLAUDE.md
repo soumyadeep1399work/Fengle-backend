@@ -146,15 +146,24 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   is unique per rider). `GET /admin/cod/reconciliation` compares expected vs
   collected vs handed over per rider and per order (cancelled/refunded COD
   orders included) and flags mismatches. Report dates are IST days.
-- **Rider pay is admin-configurable** (2026-10-28): `payout = max(min_payout,
-  base_payout + per_km_rate × min(d, tier_km) + per_km_rate_after_tier ×
-  max(0, d − tier_km)) + incentive_per_delivery` (two-rate distance, added
-  2026-10-29; no tier = one rate), set by a
-  super_admin (`PUT /admin/settings/rider-pay`, append-only history) and
-  **frozen on the order at delivery** (`orders.rider_payout` + breakdown), so a
-  later rate change never rewrites earnings; settlement pays the frozen figure
-  (older orders without one use the current formula). Customers and
-  restaurants never see it. See `services/riderPay.service.js`.
+- **Shipping charges are admin-managed rules** (2026-10-29, client decision;
+  supersedes the single rider-pay config and the hard-coded delivery fee): zones
+  (circles; no pincode exists yet) + rules (`base` bands / `add` / `min` / `max` /
+  `free`) with conditions (distance, order value, IST time window, zone), for two
+  kinds — `customer_fee` (what the customer pays) and `rider_pay` (what a rider
+  earns). `services/shippingRules.service.js` is the single source of truth:
+  the cart quote, order placement and the reject-cascade all call it, so a quote
+  and an order can't disagree. Order of evaluation: base → adds → min/max → free
+  (free is customer-fee only). The customer fee uses the order's **placement
+  time**; rider pay uses **delivery time**, is **frozen on the order at delivery**
+  (`orders.rider_payout` + breakdown) so a later rule edit never rewrites
+  earnings, and `estimated_rider_payout` shows riders the live-rules estimate for
+  active orders. Per kind there must always be an active, undated, unconditional
+  everywhere base rule (409 `last_everywhere_base`); with no rule at all the old
+  behaviour answers. Reads: any admin; writes: super_admin; every change is in
+  `shipping_history`. `PUT /admin/settings/rider-pay` is retired (410). Customers,
+  kitchens and riders never see `delivery_fee_breakdown`. Any new place that
+  prices a delivery must call the engine, not recompute.
 - **Wallet** is shared infrastructure for both customer refunds/credits and
   rider COD reconciliation — see `wallet_ledger` table (owner_type/owner_id
   polymorphic pattern).

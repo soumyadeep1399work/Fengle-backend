@@ -56,7 +56,14 @@ async function buildOrderEconomics({ from, to }) {
     for (const r of lines) offers[r.order_id] = Number(r.s);
   }
 
-  const config = await riderPay.getCurrentConfig();
+  // Delivered orders without a frozen payout (delivered before it existed): estimated with the live rider rules.
+  const riderRules = await require("./shippingRules.service").loadRuleSet(db, "rider_pay");
+  const estimatedPayout = {};
+  for (const o of orders) {
+    if (o.status === "delivered" && o.rider_payout == null && o.r_lat != null) {
+      estimatedPayout[o.id] = (await riderPay.riderPayout({ order: o, restaurant: { lat: o.r_lat, lng: o.r_lng }, ruleSet: riderRules })).payout;
+    }
+  }
   const feePct = gatewayFeePercent();
 
   return orders.map((o) => {
@@ -72,11 +79,7 @@ async function buildOrderEconomics({ from, to }) {
     let riderSource = "";
     if (delivered) {
       if (o.rider_payout != null) { riderPayout = Number(o.rider_payout); riderSource = "stored"; }
-      else if (o.r_lat != null) {
-        const km = riderPay.orderDistanceKm ? riderPay.orderDistanceKm(o, { lat: o.r_lat, lng: o.r_lng }) : 0;
-        riderPayout = riderPay.computePayout({ distanceKm: km, config }).payout;
-        riderSource = "estimated";
-      }
+      else if (estimatedPayout[o.id] !== undefined) { riderPayout = estimatedPayout[o.id]; riderSource = "estimated"; }
     }
     // The stored payable; an order that somehow has none falls back to the old formula and counts as estimated.
     const payableStored = o.restaurant_payable != null ? Number(o.restaurant_payable) : money(itemTotal - commission);

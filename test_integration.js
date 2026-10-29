@@ -18,6 +18,19 @@ function check(label, condition) {
   else { fail++; console.log(`FAIL  ${label}`); }
 }
 
+
+// Replaces the rider_pay shipping rules with a simple set (what an admin would build in the panel): a base rule (flat + 1-2 per-km
+// bands), an optional `min` and an optional flat `add`. Used by the rider-pay tests; rule behaviour itself is tested in Test 45.
+async function setRiderRules({ base = 0, perKm, min = 0, incentive = 0, tier = null, after = null }) {
+  const J = JSON.stringify;
+  await db("shipping_rules").where({ kind: "rider_pay" }).delete();
+  const bands = tier ? [{ from_km: 0, to_km: tier, per_km: perKm }, { from_km: tier, to_km: null, per_km: after }] : [{ from_km: 0, to_km: null, per_km: perKm }];
+  const ins = (row) => db("shipping_rules").insert({ kind: "rider_pay", zone_id: null, is_active: true, conditions: J({}), ...row });
+  await ins({ name: "Rider base pay", priority: 1, type: "base", charge: J({ ...(base > 0 ? { flat: base } : {}), bands }) });
+  if (min > 0) await ins({ name: "Minimum rider pay", priority: 2, type: "min", charge: J({ amount: min }) });
+  if (incentive > 0) await ins({ name: "Delivery incentive", priority: 3, type: "add", charge: J({ flat: incentive }) });
+}
+
 async function main() {
   console.log("--- Seeding ---");
   // Newtown-ish coordinates, spread across a few km
@@ -2012,7 +2025,7 @@ async function main() {
     check("admin create with offer >= price -> 400", (await create({ category_id: bengaliCatId, name: `BadOffer ${tag}`, price: 100, offer_price: 100 }, admin)).statusCode === 400);
   }
 
-  console.log("\n--- Test 38: Admin-configurable rider pay — settings + history, payout frozen at delivery, visibility, settlement ---");
+  console.log("\n--- Test 38: Rider pay (now shipping rules) — read-only settings view, payout frozen at delivery, visibility, settlement ---");
   {
     const http = require("http");
     const bcrypt = require("bcrypt");
@@ -2034,31 +2047,29 @@ async function main() {
       let json = null; try { json = await r.json(); } catch { /* none */ }
       return { status: r.status, body: json };
     };
+    // Independent expectation: rules apply base -> adds -> min, so payout = max(min, base + per_km x km + incentive).
+    const expectedPay = (km, c) => Number(Math.max(c.min || 0, (c.base || 0) + c.perKm * km + (c.incentive || 0)).toFixed(2));
     const otherRiders = await db("riders").select("id", "status");
     try {
-      // ---- the pure formula
+      // ---- the legacy pure formula still exists as the fallback
       const cfg = { base_payout: 10, per_km_rate: 6, min_payout: 20, incentive_per_delivery: 5 };
       const far = riderPaySvc.computePayout({ distanceKm: 2.5, config: cfg });
-      check("payout = max(min, base + per_km x km) + incentive: 2.5 km -> max(20, 10+15) + 5 = 30", far.payout === 30 && far.breakdown.min_applied === false && far.breakdown.distance_pay === 15 && far.breakdown.subtotal === 25);
+      check("legacy formula (the fallback when no rule prices a trip): 2.5 km -> max(20, 10+15) + 5 = 30", far.payout === 30 && far.breakdown.min_applied === false);
       const near = riderPaySvc.computePayout({ distanceKm: 0.5, config: cfg });
-      check("a short trip hits the minimum: 0.5 km -> max(20, 10+3) + 5 = 25, min_applied true", near.payout === 25 && near.breakdown.min_applied === true);
-      check("the breakdown carries the formula text", typeof far.breakdown.formula === "string" && far.breakdown.formula.includes("incentive_per_delivery"));
+      check("...a short trip hits the minimum: 0.5 km -> 25, min_applied true", near.payout === 25 && near.breakdown.min_applied === true);
 
-      // ---- settings: read, validate, history, roles
+      // ---- the old settings endpoint: read-only view of the simple shape, legacy history, PUT retired
       const first = await call(opsA, "GET", "/admin/settings/rider-pay");
-      check("GET /admin/settings/rider-pay (any role) -> live config seeded from the old env placeholders (0 / 8 / 15 / 0), one history row",
-        first.status === 200 && first.body.settings.base_payout === 0 && first.body.settings.per_km_rate === 8 && first.body.settings.min_payout === 15 && first.body.settings.incentive_per_delivery === 0 && first.body.history.length === 1 && typeof first.body.formula === "string");
-      check("PUT by ops -> 403 forbidden_role", (await call(opsA, "PUT", "/admin/settings/rider-pay", cfg)).body.code === "forbidden_role");
-      check("PUT with a missing field -> 400", (await call(superA, "PUT", "/admin/settings/rider-pay", { base_payout: 10, per_km_rate: 6, min_payout: 20 })).status === 400);
-      check("PUT with a negative / text value -> 400", (await call(superA, "PUT", "/admin/settings/rider-pay", { ...cfg, per_km_rate: -1 })).status === 400 && (await call(superA, "PUT", "/admin/settings/rider-pay", { ...cfg, base_payout: "abc" })).status === 400);
-      check("PUT with every value 0 -> 400 (riders would earn nothing)", (await call(superA, "PUT", "/admin/settings/rider-pay", { base_payout: 0, per_km_rate: 0, min_payout: 0, incentive_per_delivery: 0 })).status === 400);
-      const put = await call(superA, "PUT", "/admin/settings/rider-pay", cfg);
-      check("PUT by super_admin -> 200 and it is now the live config", put.status === 200 && put.body.settings.base_payout === 10 && put.body.settings.incentive_per_delivery === 5);
-      const hist = await call(opsA, "GET", "/admin/settings/rider-pay");
-      check("history keeps both rows, newest first, with who changed it", hist.body.history.length === 2 && hist.body.settings.id === hist.body.history[0].id && hist.body.history[0].created_by_admin_name === "pay-super" && hist.body.history[1].created_by_admin_id === null);
+      check("GET /admin/settings/rider-pay (any role): simple true, the seeded rules as 0 / 8 / 15 / 0, the legacy history row, a pointer to the rules",
+        first.status === 200 && first.body.simple === true && first.body.settings.base_payout === 0 && first.body.settings.per_km_rate === 8 && first.body.settings.min_payout === 15 && first.body.settings.incentive_per_delivery === 0 && first.body.history.length === 1 && /shipping\/rules/.test(first.body.managed_at) && typeof first.body.formula === "string");
+      check("PUT /admin/settings/rider-pay is retired: ops 403, super_admin 410 moved_to_shipping_rules", (await call(opsA, "PUT", "/admin/settings/rider-pay", cfg)).body.code === "forbidden_role" && (await call(superA, "PUT", "/admin/settings/rider-pay", cfg)).body.code === "moved_to_shipping_rules" && (await call(superA, "PUT", "/admin/settings/rider-pay", cfg)).status === 410);
+      await setRiderRules({ base: 10, perKm: 6, min: 20, incentive: 5 });
+      const cfgPay = { base: 10, perKm: 6, min: 20, incentive: 5 };
+      const simple = await call(opsA, "GET", "/admin/settings/rider-pay");
+      check("after the rules change, the view follows them (10 / 6 / 20 / 5)", simple.body.simple === true && simple.body.settings.base_payout === 10 && simple.body.settings.per_km_rate === 6 && simple.body.settings.min_payout === 20 && simple.body.settings.incentive_per_delivery === 5);
       const rateRes = fakeRes();
       await riderCtl.getMyRate(fakeReq({}, {}, { id: riderId, type: "rider" }), rateRes);
-      check("GET /riders/me/rate follows the live config and keeps the old keys", rateRes.body.rate_per_km === 6 && rateRes.body.min_earning_per_delivery === 20 && rateRes.body.base_payout === 10 && rateRes.body.incentive_per_delivery === 5);
+      check("GET /riders/me/rate follows the rules and keeps the old keys", rateRes.body.rate_per_km === 6 && rateRes.body.min_earning_per_delivery === 20 && rateRes.body.base_payout === 10 && rateRes.body.incentive_per_delivery === 5);
 
       // ---- deliver an order: the payout is frozen on it
       await db("riders").update({ status: "inactive" }); // so the auto-assigner can only pick the rider below
@@ -2075,12 +2086,12 @@ async function main() {
       const o1 = await db("orders").where({ id: d1.oid }).first();
       const kitchen1 = await db("restaurants").where({ id: o1.restaurant_id }).first();
       const km1 = haversineDistanceKm(Number(kitchen1.lat), Number(kitchen1.lng), Number(o1.delivery_lat), Number(o1.delivery_lng));
-      const expected1 = riderPaySvc.computePayout({ distanceKm: km1, config: cfg }).payout;
-      check("the order was delivered by the rider and has a frozen rider_payout under the live config", o1.status === "delivered" && o1.rider_id === payRiderId && Number(o1.rider_payout) === expected1 && o1.rider_pay_config_id === put.body.settings.id);
+      const expected1 = expectedPay(km1, cfgPay);
+      check("the order was delivered by the rider and has a frozen rider_payout from the rules in force at delivery", o1.status === "delivered" && o1.rider_id === payRiderId && Math.abs(Number(o1.rider_payout) - expected1) < 0.011 && o1.rider_pay_config_id === null);
 
-      // ---- changing the config later never rewrites it
-      await call(superA, "PUT", "/admin/settings/rider-pay", { base_payout: 0, per_km_rate: 100, min_payout: 0, incentive_per_delivery: 0 });
-      check("a later rate change does NOT touch an already-delivered order's payout", Number((await db("orders").where({ id: d1.oid }).first()).rider_payout) === expected1);
+      // ---- changing the rules later never rewrites it
+      await setRiderRules({ perKm: 100 });
+      check("a later rule change does NOT touch an already-delivered order's payout", Number((await db("orders").where({ id: d1.oid }).first()).rider_payout) === Number(o1.rider_payout));
 
       // ---- who sees it
       const orderAs = async (auth) => { const r = fakeRes(); await orderController.getOrder(fakeReq({}, { id: String(d1.oid) }, auth), r); return r.body.order; };
@@ -2089,29 +2100,31 @@ async function main() {
       const asRider = await orderAs({ id: payRiderId, type: "rider" });
       check("customer and restaurant views never carry the payout, breakdown or config id",
         ["rider_payout", "rider_payout_breakdown", "rider_pay_config_id"].every((k) => !(k in asCustomer) && !(k in asKitchen)));
-      check("the rider sees their payout and a readable breakdown", asRider.rider_payout === expected1 && asRider.rider_payout_breakdown && asRider.rider_payout_breakdown.payout === expected1 && asRider.rider_payout_breakdown.distance_km > 0);
+      check("the rider sees their payout and a readable breakdown (with the rules that applied)", Math.abs(asRider.rider_payout - expected1) < 0.011 && asRider.rider_payout_breakdown && Math.abs(asRider.rider_payout_breakdown.payout - expected1) < 0.011 && asRider.rider_payout_breakdown.distance_km > 0 && asRider.rider_payout_breakdown.applied.length >= 1);
       const listAs = async (auth) => { const r = fakeRes(); await orderController.listMyOrders(fakeReq({}, {}, auth, {}), r); return r.body.orders.find((x) => x.id === d1.oid); };
-      check("GET /orders list: the customer's rows have no payout; the rider's rows do", !("rider_payout" in (await listAs({ id: d1.custId, type: "customer" }))) && (await listAs({ id: payRiderId, type: "rider" })).rider_payout === expected1);
+      check("GET /orders list: the customer's rows have no payout; the rider's rows do", !("rider_payout" in (await listAs({ id: d1.custId, type: "customer" }))) && Math.abs((await listAs({ id: payRiderId, type: "rider" })).rider_payout - expected1) < 0.011);
       const adminOrder = await call(opsA, "GET", `/admin/orders/${d1.oid}`);
-      check("GET /admin/orders/:id shows rider_payout (number), the breakdown object and the config id", adminOrder.body.order.rider_payout === expected1 && adminOrder.body.order.rider_payout_breakdown.formula && adminOrder.body.order.rider_pay_config_id === put.body.settings.id);
+      check("GET /admin/orders/:id shows rider_payout (number) and the breakdown object", Math.abs(adminOrder.body.order.rider_payout - expected1) < 0.011 && adminOrder.body.order.rider_payout_breakdown.formula);
       const adminList = await call(opsA, "GET", `/admin/orders?rider_id=${payRiderId}`);
-      check("GET /admin/orders rows carry rider_payout", adminList.body.orders.find((x) => x.id === d1.oid).rider_payout === expected1);
+      check("GET /admin/orders rows carry rider_payout", Math.abs(adminList.body.orders.find((x) => x.id === d1.oid).rider_payout - expected1) < 0.011);
       const riderDetail = await call(opsA, "GET", `/admin/riders/${payRiderId}`);
       check("GET /admin/riders/:id has the payout history: orders with rider_payout and totals (earned / unsettled)",
-        riderDetail.body.payouts.deliveries === 1 && riderDetail.body.payouts.total_earned === expected1 && riderDetail.body.payouts.unsettled === expected1 && riderDetail.body.orders.find((x) => x.id === d1.oid).rider_payout === expected1);
+        riderDetail.body.payouts.deliveries === 1 && Math.abs(riderDetail.body.payouts.total_earned - expected1) < 0.011 && Math.abs(riderDetail.body.payouts.unsettled - expected1) < 0.011 && Math.abs(riderDetail.body.orders.find((x) => x.id === d1.oid).rider_payout - expected1) < 0.011);
 
-      // ---- settlement pays the frozen payout; a pre-feature order (NULL payout) uses the current formula
+      // ---- settlement pays the frozen payout; a pre-feature order (NULL payout) uses the current rules
+      await setRiderRules({ perKm: 100 });
       const d2 = await deliverOne("8000000039", 22.5900, 88.4700);
       const o2 = await db("orders").where({ id: d2.oid }).first();
       const kitchen2 = await db("restaurants").where({ id: o2.restaurant_id }).first();
       const km2 = haversineDistanceKm(Number(kitchen2.lat), Number(kitchen2.lng), Number(o2.delivery_lat), Number(o2.delivery_lng));
       await db("orders").where({ id: d2.oid }).update({ rider_payout: null, rider_payout_breakdown: null, rider_pay_config_id: null }); // as if delivered before this feature
-      const liveCfg = await riderPaySvc.getCurrentConfig();
-      const fallback2 = riderPaySvc.computePayout({ distanceKm: km2, config: liveCfg }).payout;
+      await setRiderRules({ perKm: 8, min: 15 });
+      const fallback2 = expectedPay(km2, { perKm: 8, min: 15 });
       const settled = await settlement.settleRider(payRiderId);
-      check("settlement = frozen payout of the new order + the CURRENT formula for the old one (rate x100 does not touch the frozen one)",
-        settled.ordersSettled === 2 && Math.abs(settled.totalEarnings - (expected1 + fallback2)) < 0.01);
+      check("settlement = the frozen payout of the first order + the CURRENT rules for the one with none (the x100 rate in between never touches the frozen one)",
+        settled.ordersSettled === 2 && Math.abs(settled.totalEarnings - (Number(o1.rider_payout) + fallback2)) < 0.02);
     } finally {
+      await setRiderRules({ perKm: 8, min: 15 }); // back to the seeded defaults
       await new Promise((resolve) => server.close(resolve));
       for (const r of otherRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
       await db("admins").where("email", "like", "%@pay.test").delete();
@@ -2305,7 +2318,7 @@ async function main() {
 
       const feePct = financeSvc.gatewayFeePercent();
       const gateway = Number(((430 * feePct) / 100).toFixed(2));
-      const fallbackB = riderPaySvc40.computePayout({ distanceKm: 0, config: await riderPaySvc40.getCurrentConfig() }).payout; // order B has no stored payout and sits on its kitchen
+      const fallbackB = (await riderPaySvc40.riderPayout({ order: { delivery_lat: 22.5800, delivery_lng: 88.4600, item_total: 200 }, restaurant: { lat: 22.58, lng: 88.46, radius_km: 5 } })).payout; // order B has no stored payout and sits on its kitchen
       const riderTotal = Number((40 + fallbackB).toFixed(2));
       const expectedNet = Number((140 - riderTotal - 20 - gateway - 1500).toFixed(2));
 
@@ -2792,68 +2805,38 @@ async function main() {
     }
   }
 
-  console.log("\n--- Test 44: Rider pay distance tier + estimated_rider_payout on orders ---");
+  console.log("\n--- Test 44: Two-rate rider pay (bands) and estimated_rider_payout on orders ---");
   {
-    const http = require("http");
-    const bcrypt = require("bcrypt");
-    const { signToken } = require("./src/utils/jwt");
-    const app = require("./src/app");
     const riderPaySvc = require("./src/services/riderPay.service");
     const devtools = require("./src/services/devtools.service");
     const { haversineDistanceKm } = require("./src/utils/geo");
-    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
-    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
-    const mkAdmin = async (name, role) => {
-      const [id] = await db("admins").insert({ name, email: `${name}@tier.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role });
-      return { id, token: signToken({ id, type: "admin" }) };
-    };
-    const superA = await mkAdmin("tier-super", "super_admin");
-    const opsA = await mkAdmin("tier-ops", "ops");
-    const call = async (who, method, p, body) => {
-      const r = await fetch(base + p, { method, headers: { Authorization: `Bearer ${who.token}`, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
-      let json = null; try { json = await r.json(); } catch { /* none */ }
-      return { status: r.status, body: json };
-    };
-    const put = (body) => call(superA, "PUT", "/admin/settings/rider-pay", body);
     const otherRiders = await db("riders").select("id", "status");
+    // Independent expectation of "first tier_km at per_km, the rest at after": flat + per_km x min(km, tier) + after x max(0, km - tier), clamped at min.
+    const expectedTier = (km, c) => Number(Math.max(c.min || 0, (c.base || 0) + c.perKm * Math.min(km, c.tier) + c.after * Math.max(0, km - c.tier)).toFixed(2));
     try {
-      // ---- the formula
-      const tiered = { base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, tier_km: 5, per_km_rate_after_tier: 7 };
-      const at = (km, cfg = tiered) => riderPaySvc.computePayout({ distanceKm: km, config: cfg });
-      check("within the tier it is the single rate: 3 km -> 30, exactly 5 km -> 50, nothing extra", at(3).payout === 30 && at(5).payout === 50 && at(5).breakdown.extra_distance_km === 0 && at(5).breakdown.extra_distance_pay === 0);
-      const eight = at(8);
-      check("beyond the tier the after-rate applies to the extra km only: 8 km -> 10x5 + 7x3 = 71, extra 3 km / 21", eight.payout === 71 && eight.breakdown.extra_distance_km === 3 && eight.breakdown.extra_distance_pay === 21 && eight.breakdown.distance_pay === 71);
-      check("the minimum still applies: 0.5 km -> 5 -> min 15, min_applied true", at(0.5).payout === 15 && at(0.5).breakdown.min_applied === true);
-      const full = at(6, { base_payout: 10, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 5, tier_km: 5, per_km_rate_after_tier: 7 });
-      check("base + incentive compose with the tier: 6 km -> max(15, 10 + 50 + 7) + 5 = 72", full.payout === 72 && full.breakdown.subtotal === 67);
-      check("every existing breakdown key is still there, plus tier_km / per_km_rate_after_tier / extra_distance_km / extra_distance_pay",
-        ["formula", "distance_km", "base_payout", "per_km_rate", "distance_pay", "subtotal", "min_payout", "min_applied", "incentive_per_delivery", "payout", "tier_km", "per_km_rate_after_tier", "extra_distance_km", "extra_distance_pay"].every((k) => k in eight.breakdown));
-      const single = at(8, { base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0 });
-      check("a config with no tier fields (every row before this change) behaves exactly as before: 8 km -> 80, tier keys null/0", single.payout === 80 && single.breakdown.tier_km === null && single.breakdown.extra_distance_km === 0);
-      check("a tier with no after-rate is ignored (single rate)", at(8, { ...tiered, per_km_rate_after_tier: null }).payout === 80 && at(8, { ...tiered, tier_km: 0 }).payout === 80);
-      check("FORMULA describes the tier", /tier_km/.test(riderPaySvc.FORMULA) && /per_km_rate_after_tier/.test(riderPaySvc.FORMULA));
+      // ---- the rule engine's two-band maths through the rider-pay path
+      await setRiderRules({ perKm: 10, min: 15, tier: 5, after: 7 });
+      const probe = async (km) => (await riderPaySvc.riderPayout({
+        order: { delivery_lat: 22.58 + km / 111.195, delivery_lng: 88.46, item_total: 200 }, restaurant: { lat: 22.58, lng: 88.46, radius_km: 5 },
+      }));
+      const p3 = await probe(3), p5 = await probe(5), p8 = await probe(8), p05 = await probe(0.5);
+      check("within the tier it is the single rate: 3 km -> 30, exactly 5 km -> 50 (no extra km)", Math.abs(p3.payout - 30) < 0.05 && Math.abs(p5.payout - 50) < 0.05 && p5.breakdown.extra_distance_km === 0);
+      check("beyond the tier the after-rate applies to the extra km only: 8 km -> 10x5 + 7x3 = 71, extra 3 km / 21", Math.abs(p8.payout - 71) < 0.05 && Math.abs(p8.breakdown.extra_distance_km - 3) < 0.02 && Math.abs(p8.breakdown.extra_distance_pay - 21) < 0.1);
+      check("the minimum still applies: 0.5 km -> 5 -> min 15 (min_applied true)", p05.payout === 15 && p05.breakdown.min_applied === true);
+      check("the frozen-breakdown keys are there (old ones + tier_km / per_km_rate_after_tier / extra_distance_km / extra_distance_pay) plus the rules that applied",
+        ["formula", "distance_km", "base_payout", "per_km_rate", "distance_pay", "subtotal", "min_payout", "min_applied", "incentive_per_delivery", "payout", "tier_km", "per_km_rate_after_tier", "extra_distance_km", "extra_distance_pay", "applied"].every((k) => k in p8.breakdown) && p8.breakdown.tier_km === 5 && p8.breakdown.per_km_rate_after_tier === 7 && p8.breakdown.applied.some((a) => a.type === "base"));
+      await setRiderRules({ base: 10, perKm: 10, min: 15, incentive: 5, tier: 5, after: 7 });
+      const p6 = await probe(6);
+      check("base + incentive compose with the tier: 6 km -> 10 + 50 + 7 + 5 = 72", Math.abs(p6.payout - 72) < 0.05 && p6.breakdown.base_payout === 10 && p6.breakdown.incentive_per_delivery === 5);
+      await setRiderRules({ perKm: 10, min: 15 });
+      check("a single-band rule set (no tier) behaves like the old single rate: 8 km -> 80, tier keys null", Math.abs((await probe(8)).payout - 80) < 0.05 && (await probe(8)).breakdown.tier_km === null);
+      check("FORMULA describes the rules and the simple shape", /rules/i.test(riderPaySvc.FORMULA) && /tier_km/.test(riderPaySvc.FORMULA));
+      const rateTier = await (async () => { await setRiderRules({ perKm: 10, min: 15, tier: 5, after: 7 }); const r = fakeRes(); await riderCtl.getMyRate(fakeReq({}, {}, { id: riderId, type: "rider" }), r); return r.body; })();
+      check("GET /riders/me/rate returns the tier alongside the existing keys while the rules are simple", rateTier.tier_km === 5 && rateTier.per_km_rate_after_tier === 7 && rateTier.rate_per_km === 10 && rateTier.min_earning_per_delivery === 15);
 
-      // ---- settings
-      check("PUT with tier_km but no after-rate -> 400; after-rate but no tier -> 400",
-        (await put({ base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, tier_km: 5 })).status === 400 && (await put({ base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, per_km_rate_after_tier: 7 })).status === 400);
-      check("PUT with tier_km 0 / negative / text / absurd, or a negative after-rate -> 400",
-        (await Promise.all([{ tier_km: 0, per_km_rate_after_tier: 7 }, { tier_km: -1, per_km_rate_after_tier: 7 }, { tier_km: "abc", per_km_rate_after_tier: 7 }, { tier_km: 5000, per_km_rate_after_tier: 7 }, { tier_km: 5, per_km_rate_after_tier: -2 }]
-          .map((t) => put({ base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, ...t })))).every((r) => r.status === 400));
-      check("PUT by ops is still 403 forbidden_role", (await call(opsA, "PUT", "/admin/settings/rider-pay", { ...tiered })).body.code === "forbidden_role");
-      const ok = await put({ ...tiered });
-      check("PUT with both tier fields -> 200; settings carry tier_km 5 and per_km_rate_after_tier 7", ok.status === 200 && ok.body.settings.tier_km === 5 && ok.body.settings.per_km_rate_after_tier === 7 && ok.body.settings.per_km_rate === 10);
-      const hist = await call(opsA, "GET", "/admin/settings/rider-pay");
-      check("GET settings + history show the tier, and the earlier rows show null (a single rate)", hist.body.settings.tier_km === 5 && hist.body.history[0].per_km_rate_after_tier === 7 && hist.body.history[hist.body.history.length - 1].tier_km === null);
-      const rateRes = fakeRes();
-      await riderCtl.getMyRate(fakeReq({}, {}, { id: riderId, type: "rider" }), rateRes);
-      check("GET /riders/me/rate returns the tier alongside the existing keys", rateRes.body.tier_km === 5 && rateRes.body.per_km_rate_after_tier === 7 && rateRes.body.rate_per_km === 10 && rateRes.body.min_earning_per_delivery === 15 && rateRes.body.base_payout === 0);
-      check("a tier alone is a valid config even when every other value is 0 (riders still earn beyond the tier)", (await put({ base_payout: 0, per_km_rate: 0, min_payout: 0, incentive_per_delivery: 0, tier_km: 5, per_km_rate_after_tier: 10 })).status === 200);
-      const cleared = await put({ base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0 });
-      check("a PUT that leaves the tier out saves a single-rate config (tier_km null)", cleared.status === 200 && cleared.body.settings.tier_km === null && cleared.body.settings.per_km_rate_after_tier === null);
-      check("both null / empty also means no tier", (await put({ base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, tier_km: null, per_km_rate_after_tier: "" })).body.settings.tier_km === null);
-
-      // ---- estimate on orders: a tier of 1 km after-rate 7, so the order below is on the second rate
-      const live = (await put({ base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, tier_km: 1, per_km_rate_after_tier: 7 })).body.settings;
+      // ---- estimate on orders: a tier of 1 km, so the order below is on the second rate
+      const live = { perKm: 10, min: 15, tier: 1, after: 7 };
+      await setRiderRules(live);
       await db("riders").update({ status: "inactive" });
       const [estRider] = await db("riders").insert({ name: "Estimate Rider", phone: "8500000044", status: "active", last_known_lat: 22.5810, last_known_lng: 88.4610, wallet_balance: 0 });
       const place = async (phone) => {
@@ -2869,33 +2852,269 @@ async function main() {
       check("a placed (not yet accepted) order has no estimate (null): there is nothing to deliver yet", (await getAs(o1.id, { id: 1, type: "admin" })).estimated_rider_payout === null);
       await devtools.advanceOrder(o1.id, { to: "accepted" });
       const { km: km1, restaurantId } = await kmOf(o1.id);
-      const expected1 = riderPaySvc.computePayout({ distanceKm: km1, config: live }).payout;
+      const expected1 = expectedTier(km1, live);
       const riderAuth = { id: estRider, type: "rider" };
       const asRider = await getAs(o1.id, riderAuth);
-      check("GET /orders/:id for the assigned rider: estimated_rider_payout = the LIVE config applied to kitchen->drop-off distance (tier included)", asRider.rider_id === estRider && asRider.estimated_rider_payout === expected1 && expected1 > 0);
+      check("GET /orders/:id for the assigned rider: estimated_rider_payout = the LIVE rules applied to kitchen->drop-off distance (tier included)", asRider.rider_id === estRider && Math.abs(asRider.estimated_rider_payout - expected1) < 0.011 && expected1 > 0);
       check("the order is far enough to use the second rate (more than 1 km, so cheaper than 10/km all the way)", km1 > 1 && expected1 < Number((km1 * 10).toFixed(2)));
-      check("GET /orders list (rider): the same estimate on the active order", (await listAs(riderAuth, o1.id)).estimated_rider_payout === expected1);
-      check("admin sees it too", (await getAs(o1.id, { id: 1, type: "admin" })).estimated_rider_payout === expected1);
+      check("GET /orders list (rider): the same estimate on the active order", Math.abs((await listAs(riderAuth, o1.id)).estimated_rider_payout - expected1) < 0.011);
+      check("admin sees it too", Math.abs((await getAs(o1.id, { id: 1, type: "admin" })).estimated_rider_payout - expected1) < 0.011);
       const asCustomer = await getAs(o1.id, { id: o1.custId, type: "customer" });
       const asKitchen = await getAs(o1.id, { id: restaurantId, type: "restaurant" });
       check("customers and kitchens never get the key (GET /orders/:id)", !("estimated_rider_payout" in asCustomer) && !("estimated_rider_payout" in asKitchen));
       check("...nor in their GET /orders lists", !("estimated_rider_payout" in (await listAs({ id: o1.custId, type: "customer" }, o1.id))) && !("estimated_rider_payout" in (await listAs({ id: restaurantId, type: "restaurant" }, o1.id))));
 
-      // the estimate follows the live config; the payout freezes whatever is live at delivery
-      const newer = (await put({ base_payout: 0, per_km_rate: 20, min_payout: 15, incentive_per_delivery: 0, tier_km: 1, per_km_rate_after_tier: 12 })).body.settings;
-      const expected2 = riderPaySvc.computePayout({ distanceKm: km1, config: newer }).payout;
-      check("change the config while the order is active: the estimate changes with it", expected2 !== expected1 && (await getAs(o1.id, riderAuth)).estimated_rider_payout === expected2);
+      // the estimate follows the live rules; the payout freezes whatever is live at delivery
+      const newer = { perKm: 20, min: 15, tier: 1, after: 12 };
+      await setRiderRules(newer);
+      const expected2 = expectedTier(km1, newer);
+      check("change the rules while the order is active: the estimate changes with them", Math.abs(expected2 - expected1) > 0.5 && Math.abs((await getAs(o1.id, riderAuth)).estimated_rider_payout - expected2) < 0.011);
       await devtools.advanceOrder(o1.id, { to: "delivered" });
       const delivered = await getAs(o1.id, riderAuth);
-      check("once delivered: no estimate (null), and the frozen rider_payout equals the estimate under the config live at delivery", delivered.estimated_rider_payout === null && delivered.rider_payout === expected2);
+      check("once delivered: no estimate (null), and the frozen rider_payout equals the estimate under the rules live at delivery", delivered.estimated_rider_payout === null && Math.abs(delivered.rider_payout - expected2) < 0.011);
       check("the frozen breakdown explains the tier: tier_km 1, extra km beyond it, extra pay at the after-rate",
-        delivered.rider_payout_breakdown.tier_km === 1 && delivered.rider_payout_breakdown.per_km_rate_after_tier === 12 && Math.abs(delivered.rider_payout_breakdown.extra_distance_km - (km1 - 1)) < 0.011 && Math.abs(delivered.rider_payout_breakdown.extra_distance_pay - 12 * delivered.rider_payout_breakdown.extra_distance_km) < 0.02);
+        delivered.rider_payout_breakdown.tier_km === 1 && delivered.rider_payout_breakdown.per_km_rate_after_tier === 12 && Math.abs(delivered.rider_payout_breakdown.extra_distance_km - (km1 - 1)) < 0.011 && Math.abs(delivered.rider_payout_breakdown.extra_distance_pay - 12 * delivered.rider_payout_breakdown.extra_distance_km) < 0.1);
       check("estimatePayout is null when there is no kitchen to measure from, or the order isn't active",
-        riderPaySvc.estimatePayout({ order: { status: "accepted", delivery_lat: 1, delivery_lng: 1 }, restaurant: null, config: live }) === null && riderPaySvc.estimatePayout({ order: { status: "delivered", delivery_lat: 1, delivery_lng: 1 }, restaurant: { lat: 1, lng: 1 }, config: live }) === null);
+        (await riderPaySvc.estimatePayout({ order: { status: "accepted", delivery_lat: 1, delivery_lng: 1, item_total: 100 }, restaurant: null })) === null &&
+        (await riderPaySvc.estimatePayout({ order: { status: "delivered", delivery_lat: 1, delivery_lng: 1, item_total: 100 }, restaurant: { lat: 1, lng: 1 } })) === null);
+    } finally {
+      await setRiderRules({ perKm: 8, min: 15 }); // back to the seeded defaults
+      for (const r of otherRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+    }
+  }
+
+  console.log("\n--- Test 45: Shipping rules engine — zones, rules, conditions, ordering, invariants, quote==order, history, migration ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const shippingSvc = require("./src/services/shippingRules.service");
+    const routingSvc = require("./src/services/routing.service");
+    const riderPaySvc = require("./src/services/riderPay.service");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const mkAdmin = async (name, role) => {
+      const [id] = await db("admins").insert({ name, email: `${name}@ship.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role });
+      return { id, token: signToken({ id, type: "admin" }) };
+    };
+    const superA = await mkAdmin("ship-super", "super_admin");
+    const opsA = await mkAdmin("ship-ops", "ops");
+    const supA = await mkAdmin("ship-support", "support");
+    const call = async (who, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { Authorization: `Bearer ${who.token}`, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      let json = null; try { json = await r.json(); } catch { /* none */ }
+      return { status: r.status, body: json };
+    };
+    const sup = (m, p, b) => call(superA, m, p, b);
+    const created = { rules: [], zones: [] };
+    const mkRule = async (body) => { const r = await sup("POST", "/admin/shipping/rules", { kind: "customer_fee", ...body }); if (r.status === 201) created.rules.push(r.body.rule.id); return r; };
+    const mkZone = async (body) => { const r = await sup("POST", "/admin/shipping/zones", body); if (r.status === 201) created.zones.push(r.body.zone.id); return r; };
+    const preview = (b) => call(opsA, "POST", "/admin/shipping/preview", { kind: "customer_fee", restaurant_id: restA, ...b });
+    const amountOf = async (b) => (await preview(b)).body.amount;
+    try {
+      // ---- the seeds reproduce today's behaviour exactly
+      const feeMatches = [];
+      for (const [d, radius] of [[3, 5], [5, 5], [7, 5], [12.34, 5], [2, 1.5], [0, 5]]) {
+        const fee = (await shippingSvc.customerFee({ distanceKm: d, restaurant: { radius_km: radius }, orderValue: 300, dropoff: { lat: 22.58, lng: 88.46 } })).fee;
+        feeMatches.push(fee === routingSvc.computeDeliveryFee(d, { radius_km: radius }));
+      }
+      check("seeded customer rule == the old hard-coded fee (free inside the kitchen's radius, then Rs 5/km) at 6 distances/radii", feeMatches.every(Boolean));
+      await setRiderRules({ perKm: 8, min: 15 });
+      const ridersMatch = [];
+      for (const km of [0.5, 1, 3, 10]) {
+        const r = await riderPaySvc.riderPayout({ order: { delivery_lat: 22.58 + km / 111.195, delivery_lng: 88.46, item_total: 200 }, restaurant: { lat: 22.58, lng: 88.46 } });
+        ridersMatch.push(Math.abs(r.payout - riderPaySvc.computePayout({ distanceKm: km, config: { base_payout: 0, per_km_rate: 8, min_payout: 15, incentive_per_delivery: 0 } }).payout) < 0.05);
+      }
+      check("seeded rider rules == the old single-config payout (8/km, min 15) at 4 distances", ridersMatch.every(Boolean));
+
+      // ---- roles
+      const rulesList = await call(supA, "GET", "/admin/shipping/rules");
+      check("reads (zones, rules, history, preview) are open to every admin role", rulesList.status === 200 && (await call(supA, "GET", "/admin/shipping/zones")).status === 200 && (await call(supA, "GET", "/admin/shipping/history")).status === 200 && (await call(supA, "POST", "/admin/shipping/preview", { kind: "customer_fee", distance_km: 3, restaurant_id: restA })).status === 200);
+      const writes = [["POST", "/admin/shipping/zones", { name: "x", match: { circles: [{ lat: 1, lng: 1, radius_km: 1 }] } }], ["POST", "/admin/shipping/zones/reorder", { ids: [1] }], ["PATCH", "/admin/shipping/zones/1", { name: "y" }], ["DELETE", "/admin/shipping/zones/1"], ["POST", "/admin/shipping/rules", { kind: "customer_fee", name: "x", type: "free", charge: {} }], ["POST", "/admin/shipping/rules/reorder", { kind: "customer_fee", ids: [1] }], ["PATCH", "/admin/shipping/rules/1", { name: "y" }], ["DELETE", "/admin/shipping/rules/1"]];
+      const leaked = [];
+      for (const [m, p, b] of writes) for (const [n, who] of [["ops", opsA], ["support", supA]]) { const r = await call(who, m, p, b); if (!(r.status === 403 && r.body.code === "forbidden_role")) leaked.push(`${n} ${m} ${p} -> ${r.status}`); }
+      check(`every write is super_admin only (leaks: ${leaked.join("; ") || "none"})`, leaked.length === 0);
+
+      // ---- rule list extras + invariant
+      const customerRules = (await call(opsA, "GET", "/admin/shipping/rules?kind=customer_fee")).body.rules;
+      const seedBase = customerRules.find((r) => r.type === "base" && r.zone_id === null);
+      check("the seeded base rule: is_last_everywhere_base true, is_in_effect_now true, zone_name null", seedBase.is_last_everywhere_base === true && seedBase.is_in_effect_now === true && seedBase.zone_name === null && seedBase.charge.after_kitchen_radius === true);
+      const tryBreak = async (patch) => { const r = await sup("PATCH", `/admin/shipping/rules/${seedBase.id}`, patch); return r.status === 409 && r.body.code === "last_everywhere_base"; };
+      check("the last everywhere base rule can't be deactivated, dated, conditioned or moved to a zone, nor deleted (409 last_everywhere_base)",
+        (await tryBreak({ is_active: false })) && (await tryBreak({ valid_to: new Date(Date.now() + 86400e3).toISOString() })) && (await tryBreak({ conditions: { distance_km: { max: 10 } } })) && (await tryBreak({ type: "add", charge: { flat: 1 } })) && (await sup("DELETE", `/admin/shipping/rules/${seedBase.id}`)).body.code === "last_everywhere_base");
+      check("...and nothing was changed by the refused attempts", (await db("shipping_rules").where({ id: seedBase.id }).first()).is_active === 1 && (await db("shipping_rules").where({ id: seedBase.id }).first()).is_deleted === 0);
+      const second = await mkRule({ name: "Second everywhere base", type: "base", charge: { flat: 1, bands: [{ from_km: 0, to_km: null, per_km: 5 }], after_kitchen_radius: true }, is_active: false });
+      check("an INACTIVE second base doesn't relax the invariant (the seed is still the last one)", (await call(opsA, "GET", "/admin/shipping/rules?kind=customer_fee")).body.rules.find((r) => r.id === seedBase.id).is_last_everywhere_base === true && second.body.rule.is_in_effect_now === false);
+      await sup("PATCH", `/admin/shipping/rules/${second.body.rule.id}`, { is_active: true, name: "Second everywhere base (active)" });
+      check("with a second qualifying base, neither is 'last' any more and the first can be switched off", (await call(opsA, "GET", "/admin/shipping/rules?kind=customer_fee")).body.rules.filter((r) => r.type === "base").every((r) => r.is_last_everywhere_base === false) && (await sup("PATCH", `/admin/shipping/rules/${seedBase.id}`, { is_active: false })).status === 200);
+      check("...but then the remaining one is protected instead", (await sup("DELETE", `/admin/shipping/rules/${second.body.rule.id}`)).body.code === "last_everywhere_base");
+      await sup("PATCH", `/admin/shipping/rules/${seedBase.id}`, { is_active: true });
+      await sup("DELETE", `/admin/shipping/rules/${second.body.rule.id}`);
+      const future = await mkRule({ name: "Future promo", type: "add", charge: { flat: 1 }, valid_from: new Date(Date.now() + 86400e3).toISOString() });
+      check("a rule dated in the future shows is_in_effect_now false (so the panel can badge it 'scheduled')", future.body.rule.is_in_effect_now === false);
+      await sup("DELETE", `/admin/shipping/rules/${future.body.rule.id}`);
+
+      // ---- validation
+      const bad = (body) => sup("POST", "/admin/shipping/rules", { kind: "customer_fee", name: "bad", ...body });
+      const band = (...b) => ({ type: "base", charge: { bands: b } });
+      const invalid = [
+        { type: "base", charge: {} }, band({ from_km: 1, to_km: null, per_km: 5 }), band({ from_km: 0, to_km: 5, per_km: 5 }, { from_km: 6, to_km: null, per_km: 7 }),
+        band({ from_km: 0, to_km: 5, per_km: 5 }, { from_km: 4, to_km: null, per_km: 7 }), band({ from_km: 0, to_km: null, per_km: 5 }, { from_km: 5, to_km: null, per_km: 7 }),
+        band({ from_km: 0, to_km: 5, per_km: -1 }), band({ from_km: 0, to_km: 0, per_km: 5 }), { type: "base", charge: { flat: 1e9 } },
+        { type: "base", charge: { flat: 1, bogus: true } }, { type: "add", charge: {} }, { type: "min", charge: {} }, { type: "max", charge: { amount: -1 } },
+        { type: "free", charge: { amount: 1 } }, { type: "free", charge: {}, conditions: { bogus: 1 } }, { type: "free", charge: {}, conditions: { distance_km: { min: 5, max: 5 } } },
+        { type: "free", charge: {}, conditions: { time: { from: "22:00" } } }, { type: "free", charge: {}, conditions: { time: { from: "25:00", to: "06:00" } } },
+        { type: "free", charge: {}, conditions: { time: { from: "10:00", to: "10:00" } } }, { type: "free", charge: {}, conditions: { time: { days: [7] } } },
+        { type: "free", charge: {}, zone_id: 999999 }, { type: "wizard", charge: {} }, { type: "free", charge: {}, valid_from: "2030-01-02", valid_to: "2030-01-01" },
+        { type: "base", charge: { flat: 1, after_kitchen_radius: "yes" } }, { type: "free", charge: {}, name: "" },
+      ];
+      check(`validation: ${invalid.length} bad rule bodies (bands that don't start at 0 / have gaps / overlap / null not last, bad amounts, unknown keys and conditions, time windows, unknown zone, bad type, reversed dates…) are all 400`, (await Promise.all(invalid.map(bad))).every((r) => r.status === 400));
+      check("kind-specific rules: a 'free' rule and after_kitchen_radius are refused for rider_pay; a bad kind is 400",
+        (await sup("POST", "/admin/shipping/rules", { kind: "rider_pay", name: "x", type: "free", charge: {} })).status === 400 && (await sup("POST", "/admin/shipping/rules", { kind: "rider_pay", name: "x", type: "base", charge: { flat: 1, after_kitchen_radius: true } })).status === 400 && (await sup("POST", "/admin/shipping/rules", { kind: "courier", name: "x", type: "free", charge: {} })).status === 400);
+      check("PATCH can't change a rule's kind; an empty PATCH or unknown id is refused", (await sup("PATCH", `/admin/shipping/rules/${seedBase.id}`, { kind: "rider_pay" })).status === 400 && (await sup("PATCH", `/admin/shipping/rules/${seedBase.id}`, {})).status === 400 && (await sup("PATCH", "/admin/shipping/rules/999999", { name: "x" })).status === 404);
+
+      // ---- rule semantics through the preview (restaurant radius 5 km). Seed base: Rs 5/km beyond the radius.
+      check("base only: 7 km from a 5 km kitchen -> 2 chargeable km x 5 = 10; inside the radius -> 0", (await amountOf({ distance_km: 7 })) === 10 && (await amountOf({ distance_km: 3 })) === 0);
+      const pv = await preview({ distance_km: 7 });
+      check("the preview explains itself: chargeable_km 2, base_amount 10, one applied base rule with before/after, no warnings", pv.body.breakdown.chargeable_km === 2 && pv.body.breakdown.base_amount === 10 && pv.body.applied.length === 1 && pv.body.applied[0].effect.after === 10 && pv.body.warnings.length === 0 && pv.body.fallback === false);
+      const noKitchen = await call(opsA, "POST", "/admin/shipping/preview", { kind: "customer_fee", distance_km: 7 });
+      check("without a restaurant_id the kitchen radius is unknown: treated as 0 with a warning", noKitchen.body.amount === 35 && noKitchen.body.warnings.includes("restaurant_radius_unknown_treated_as_0"));
+
+      const rFree = await mkRule({ name: "Free over 500", type: "free", charge: {}, conditions: { order_value: { min: 500 } } });
+      const rMin = await mkRule({ name: "Minimum fee", type: "min", charge: { amount: 20 } });
+      check("min applies before free: a Rs 600 order is FREE (0), a Rs 400 order pays the minimum (20), even inside the radius", (await amountOf({ distance_km: 7, order_value: 600 })) === 0 && (await amountOf({ distance_km: 7, order_value: 400 })) === 20 && (await amountOf({ distance_km: 3, order_value: 400 })) === 20);
+      check("order_value min is inclusive: exactly Rs 500 is free; 499.99 is not", (await amountOf({ distance_km: 7, order_value: 500 })) === 0 && (await amountOf({ distance_km: 7, order_value: 499.99 })) === 20);
+      const steps = (await preview({ distance_km: 7, order_value: 600 })).body.applied.map((a) => a.type).join();
+      check("applied order is base, min, free (so the UI can show the running amount)", steps === "base,min,free");
+      await sup("PATCH", `/admin/shipping/rules/${rMin.body.rule.id}`, { is_active: false });
+      check("switching the min rule off: a Rs 400 order pays the plain 10", (await amountOf({ distance_km: 7, order_value: 400 })) === 10);
+      const rAdd = await mkRule({ name: "Handling", type: "add", charge: { flat: 5, percent: 10 } });
+      check("add: flat + percent of the running amount (10 + 5 + 10% of 10 = 16)", (await amountOf({ distance_km: 7, order_value: 400 })) === 16);
+      const rMax = await mkRule({ name: "Cap", type: "max", charge: { amount: 12 } });
+      check("max clamps after adds: 16 -> 12; free still wins last (0)", (await amountOf({ distance_km: 7, order_value: 400 })) === 12 && (await amountOf({ distance_km: 7, order_value: 600 })) === 0);
+      for (const r of [rAdd, rMax]) await sup("DELETE", `/admin/shipping/rules/${r.body.rule.id}`);
+
+      // time windows (IST), wrapping midnight; 2026-10-30 is a Friday
+      const rNight = await mkRule({ name: "Friday night", type: "add", charge: { flat: 15 }, conditions: { time: { days: [5], from: "22:00", to: "06:00" } } });
+      const night = async (iso) => (await amountOf({ distance_km: 3, order_value: 100, at: iso })) === 15;
+      check("night window 22:00-06:00 on Fridays: Fri 22:00 IST yes, Fri 23:00 yes, Sat 03:00 IST (the window began Friday) yes, Sat 05:59 yes",
+        (await night("2026-10-30T16:30:00Z")) && (await night("2026-10-30T17:30:00Z")) && (await night("2026-10-30T21:30:00Z")) && (await night("2026-10-31T00:29:00Z")));
+      check("...Fri 21:59 no, Sat 06:00 (end exclusive) no, Sat 23:00 (Saturday isn't a window day) no, Fri 03:00 IST (that window began Thursday) no",
+        !(await night("2026-10-30T16:29:00Z")) && !(await night("2026-10-31T00:30:00Z")) && !(await night("2026-10-31T17:30:00Z")) && !(await night("2026-10-29T21:30:00Z")));
+      await sup("DELETE", `/admin/shipping/rules/${rNight.body.rule.id}`);
+      const rDay = await mkRule({ name: "Sunday lunch", type: "add", charge: { flat: 4 }, conditions: { time: { days: [0], from: "12:00", to: "15:00" } } });
+      check("a same-day window: Sunday 12:00 IST yes, 15:00 (exclusive) no, Monday 13:00 no", (await amountOf({ distance_km: 3, order_value: 100, at: "2026-11-01T06:30:00Z" })) === 4 && (await amountOf({ distance_km: 3, order_value: 100, at: "2026-11-01T09:30:00Z" })) === 0 && (await amountOf({ distance_km: 3, order_value: 100, at: "2026-11-02T07:30:00Z" })) === 0);
+      await sup("DELETE", `/admin/shipping/rules/${rDay.body.rule.id}`);
+      const rLong = await mkRule({ name: "Long distance", type: "add", charge: { flat: 3 }, conditions: { distance_km: { min: 10, max: 20 } } });
+            const d10 = await amountOf({ distance_km: 10, order_value: 100 }), d20 = await amountOf({ distance_km: 20, order_value: 100 }), d999 = await amountOf({ distance_km: 9.99, order_value: 100 });
+      check("(exact) 10 km = 25 + 3, 20 km = 75 (no surcharge), 9.99 km = 24.95", d10 === 28 && d20 === 75 && d999 === 24.95);
+      await sup("DELETE", `/admin/shipping/rules/${rLong.body.rule.id}`);
+      const rPromo = await mkRule({ name: "Week promo", type: "add", charge: { flat: 100 }, valid_from: "2031-01-01T00:00:00Z", valid_to: "2031-01-08T00:00:00Z" });
+      check("a dated rule only applies inside its window (the preview's `at`): before no, during +100, after no", (await amountOf({ distance_km: 3, at: "2030-12-31T00:00:00Z" })) === 0 && (await amountOf({ distance_km: 3, at: "2031-01-03T00:00:00Z" })) === 100 && (await amountOf({ distance_km: 3, at: "2031-01-08T00:00:00Z" })) === 0);
+      await sup("DELETE", `/admin/shipping/rules/${rPromo.body.rule.id}`);
+      for (const r of [rFree, rMin]) await sup("DELETE", `/admin/shipping/rules/${r.body.rule.id}`);
+
+      // ---- zones: precedence + soft delete
+      check("zone validation: no circle/pincode, bad lat, radius 0 or > 100, bad pincode, unknown key, empty name -> 400",
+        (await Promise.all([{ name: "z", match: {} }, { name: "z", match: { circles: [{ lat: 95, lng: 1, radius_km: 1 }] } }, { name: "z", match: { circles: [{ lat: 1, lng: 1, radius_km: 0 }] } }, { name: "z", match: { circles: [{ lat: 1, lng: 1, radius_km: 101 }] } }, { name: "z", match: { pincodes: ["12"] } }, { name: "z", match: { circles: [{ lat: 1, lng: 1, radius_km: 1 }], shape: 1 } }, { name: "", match: { pincodes: ["700156"] } }].map((b) => sup("POST", "/admin/shipping/zones", b)))).every((r) => r.status === 400));
+      const z1 = await mkZone({ name: "Newtown core", match: { circles: [{ lat: 22.605, lng: 88.485, radius_km: 2 }] } });
+      check("POST zone -> 201 with priority, match and no extras", z1.status === 201 && z1.body.zone.priority >= 1 && z1.body.zone.match.circles[0].radius_km === 2 && z1.body.zone.is_active === true);
+      const zBase = await mkRule({ name: "Core zone rate", zone_id: z1.body.zone.id, type: "base", charge: { bands: [{ from_km: 0, to_km: null, per_km: 9 }], after_kitchen_radius: true } });
+      check("rule list shows zone_name for a zone rule", (await call(opsA, "GET", `/admin/shipping/rules?kind=customer_fee&zone_id=${z1.body.zone.id}`)).body.rules[0].zone_name === "Newtown core");
+      const inside = await preview({ distance_km: 7, dropoff: { lat: 22.605, lng: 88.485 } });
+      const outside = await preview({ distance_km: 7, dropoff: { lat: 23.5, lng: 88.5 } });
+      check("a drop-off inside the zone uses the zone's base (2 km x 9 = 18, zone reported); outside it falls back to the everywhere base (10, zone null)", inside.body.amount === 18 && inside.body.zone.name === "Newtown core" && outside.body.amount === 10 && outside.body.zone === null);
+      check("preview by explicit zone_id (and null = everywhere) gives the same answers", (await amountOf({ distance_km: 7, zone_id: z1.body.zone.id })) === 18 && (await amountOf({ distance_km: 7, zone_id: null })) === 10);
+      const z2 = await mkZone({ name: "Overlapping zone", match: { circles: [{ lat: 22.605, lng: 88.485, radius_km: 5 }] } });
+      await mkRule({ name: "Overlap rate", zone_id: z2.body.zone.id, type: "base", charge: { bands: [{ from_km: 0, to_km: null, per_km: 20 }], after_kitchen_radius: true } });
+      check("two zones contain the drop-off: the one with the lower priority number wins (Core, 18)", (await amountOf({ distance_km: 7, dropoff: { lat: 22.605, lng: 88.485 } })) === 18);
+      const reordered = await sup("POST", "/admin/shipping/zones/reorder", { ids: [z2.body.zone.id, z1.body.zone.id] });
+      check("reorder zones -> the overlapping zone now wins (2 km x 20 = 40)", reordered.status === 200 && reordered.body.zones.map((z) => z.id).slice(0, 2).join() === `${z2.body.zone.id},${z1.body.zone.id}` && (await amountOf({ distance_km: 7, dropoff: { lat: 22.605, lng: 88.485 } })) === 40);
+      check("reorder refuses an id list that misses an active zone or has a stranger", (await sup("POST", "/admin/shipping/zones/reorder", { ids: [z1.body.zone.id] })).status === 400 && (await sup("POST", "/admin/shipping/zones/reorder", { ids: [z2.body.zone.id, z1.body.zone.id, 999999] })).status === 400);
+      await sup("PATCH", `/admin/shipping/zones/${z2.body.zone.id}`, { is_active: false });
+      check("an inactive zone is ignored by the engine (back to Core, 18)", (await amountOf({ distance_km: 7, dropoff: { lat: 22.605, lng: 88.485 } })) === 18);
+      const zoneAdd = await mkRule({ name: "Everywhere handling", type: "add", charge: { flat: 2 } });
+      const zoneAdd2 = await mkRule({ name: "Core handling", zone_id: z1.body.zone.id, type: "add", charge: { flat: 3 } });
+      check("add rules from the zone AND the everywhere set both apply (18 + 3 + 2 = 23); outside the zone only the everywhere one (10 + 2 = 12)", (await amountOf({ distance_km: 7, dropoff: { lat: 22.605, lng: 88.485 } })) === 23 && (await amountOf({ distance_km: 7, dropoff: { lat: 23.5, lng: 88.5 } })) === 12);
+      await sup("DELETE", `/admin/shipping/rules/${zoneAdd.body.rule.id}`);
+      const delZone = await sup("DELETE", `/admin/shipping/zones/${z1.body.zone.id}`);
+      check("deleting a zone is soft and takes its rules with it: gone from the lists, the engine ignores it (back to 10)", delZone.status === 200 && !(await call(opsA, "GET", "/admin/shipping/zones")).body.zones.some((z) => z.id === z1.body.zone.id) && !(await call(opsA, "GET", "/admin/shipping/rules?kind=customer_fee")).body.rules.some((r) => r.id === zBase.body.rule.id || r.id === zoneAdd2.body.rule.id) && (await amountOf({ distance_km: 7, dropoff: { lat: 22.605, lng: 88.485 } })) === 10);
+      await sup("DELETE", `/admin/shipping/zones/${z2.body.zone.id}`);
+
+      // ---- rule reorder
+      const ra = await mkRule({ name: "Order A", type: "add", charge: { flat: 1 } });
+      const rb = await mkRule({ name: "Order B", type: "add", charge: { flat: 2 } });
+      const everywhereIds = (await call(opsA, "GET", "/admin/shipping/rules?kind=customer_fee&zone_id=null")).body.rules.map((r) => r.id);
+      const flipped = [...everywhereIds].reverse();
+      const ro = await sup("POST", "/admin/shipping/rules/reorder", { kind: "customer_fee", zone_id: null, ids: flipped });
+      check("reorder rules (kind + zone) assigns priorities in the given order", ro.status === 200 && ro.body.rules.map((r) => r.id).join() === flipped.join());
+      const someActive = (await call(opsA, "GET", "/admin/shipping/rules?kind=customer_fee&zone_id=null")).body.rules.find((r) => r.is_active).id;
+      check("reorder refuses a missing active rule or a stranger", (await sup("POST", "/admin/shipping/rules/reorder", { kind: "customer_fee", zone_id: null, ids: flipped.filter((id) => id !== someActive) })).status === 400 && (await sup("POST", "/admin/shipping/rules/reorder", { kind: "customer_fee", zone_id: null, ids: [...flipped, 999999] })).status === 400);
+      await sup("POST", "/admin/shipping/rules/reorder", { kind: "customer_fee", zone_id: null, ids: everywhereIds });
+      for (const r of [ra, rb]) await sup("DELETE", `/admin/shipping/rules/${r.body.rule.id}`);
+
+      // ---- quote == order == reject-cascade, and rule edits never rewrite a placed order
+      const handling = await mkRule({ name: "Handling Rs 7", type: "add", charge: { flat: 7 } });
+      const [feeCust] = await db("users").insert({ name: "Fee Customer", phone: "8000004501", wallet_balance: 0 });
+      const cart = { items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.5805, delivery_lng: 88.4605 };
+      const quote = fakeRes();
+      await cartController.quoteCart(fakeReq(cart, {}, { id: feeCust, type: "customer" }), quote);
+      const placed = fakeRes();
+      await orderController.placeOrder(fakeReq({ ...cart, delivery_address: "Fee St", payment_method: "cod" }, {}, { id: feeCust, type: "customer" }), placed);
+      check("quote and order agree on the delivery fee (inside the radius: 0 + the Rs 7 handling rule = 7)", quote.body.deliveryFee === 7 && Number(placed.body.order.delivery_fee) === 7 && quote.body.grandTotal === Number(placed.body.order.grand_total));
+      const feeOrderId = placed.body.order.id;
+      const adminFee = await call(opsA, "GET", `/admin/orders/${feeOrderId}`);
+      check("admins see how the fee was worked out (delivery_fee_breakdown: rules source, applied rules); the customer's response has no such key",
+        adminFee.body.order.delivery_fee_breakdown.source === "rules" && adminFee.body.order.delivery_fee_breakdown.applied.some((a) => a.name === "Handling Rs 7") && !("delivery_fee_breakdown" in placed.body.order) && !("delivery_fee_breakdown" in (await (async () => { const r = fakeRes(); await orderController.getOrder(fakeReq({}, { id: String(feeOrderId) }, { id: feeCust, type: "customer" }), r); return r.body.order; })())));
+      await sup("PATCH", `/admin/shipping/rules/${handling.body.rule.id}`, { charge: { flat: 9 } });
+      check("editing the rule later leaves the placed order's stored delivery_fee alone (7), while a fresh quote follows the new rule (9)", Number((await db("orders").where({ id: feeOrderId }).first()).delivery_fee) === 7 && (await (async () => { const q = fakeRes(); await cartController.quoteCart(fakeReq(cart, {}, { id: feeCust, type: "customer" }), q); return q.body.deliveryFee; })()) === 9);
+      await sup("PATCH", `/admin/shipping/rules/${handling.body.rule.id}`, { charge: { flat: 7 } });
+      // reject-cascade: the first kitchen rejects, the order is re-priced for the next one through the same engine
+      const [feeCust2] = await db("users").insert({ name: "Fee Customer 2", phone: "8000004502", wallet_balance: 0 });
+      const placed2 = fakeRes();
+      await orderController.placeOrder(fakeReq({ ...cart, delivery_address: "Fee St 2", payment_method: "cod" }, {}, { id: feeCust2, type: "customer" }), placed2);
+      const firstKitchen = placed2.body.order.restaurant_id;
+      const rej = fakeRes();
+      await orderController.rejectOrder(fakeReq({}, { id: String(placed2.body.order.id) }, { id: firstKitchen, type: "restaurant" }), rej);
+      const after = await db("orders").where({ id: placed2.body.order.id }).first();
+      check("reject-cascade re-prices through the engine (fee 7 for the next kitchen, a breakdown stored) — not the old function (0)", rej.body.reassigned === true && after.restaurant_id !== firstKitchen && Number(after.delivery_fee) === 7 && JSON.parse(after.delivery_fee_breakdown).source === "rules");
+      await sup("DELETE", `/admin/shipping/rules/${handling.body.rule.id}`);
+
+      // ---- no rule at all: the legacy behaviour answers instead of leaving a delivery unpriced
+      await db("shipping_rules").where({ kind: "customer_fee" }).update({ is_deleted: true });
+      const legacy = fakeRes();
+      await cartController.quoteCart(fakeReq({ ...cart, delivery_lat: 22.6050, delivery_lng: 88.4850 }, {}, { id: feeCust, type: "customer" }), legacy);
+      const legacyFee = await shippingSvc.customerFee({ distanceKm: 7, restaurant: { radius_km: 5 }, orderValue: 100, dropoff: { lat: 22.6, lng: 88.4 } });
+      check("with every customer rule gone the fee falls back to the old behaviour (10 for 7 km / 5 km radius), flagged legacy in the breakdown", legacyFee.fee === 10 && legacyFee.breakdown.source === "legacy" && typeof legacy.body.deliveryFee === "number");
+      await db("shipping_rules").where({ kind: "customer_fee" }).update({ is_deleted: false });
+
+      // ---- history
+      const hist = await call(opsA, "GET", "/admin/shipping/history?limit=200");
+      const actions = new Set(hist.body.history.map((h) => `${h.entity}:${h.action}`));
+      check("history records rule/zone create, update, delete and reorder with the admin's name, newest first", hist.status === 200 && ["rule:create", "rule:update", "rule:delete", "rule:reorder", "zone:create", "zone:update", "zone:delete", "zone:reorder"].every((a) => actions.has(a)) && hist.body.history[0].admin_name === "ship-super" && hist.body.history[0].id > hist.body.history[1].id);
+      check("an update row carries the before and after snapshots (flat 7 -> 9)", hist.body.history.some((h) => h.entity === "rule" && h.action === "update" && h.entity_id === handling.body.rule.id && h.before.charge.flat === 7 && h.after.charge.flat === 9));
+      check("history filters by entity, kind and rule_id; a bad entity is 400", (await call(opsA, "GET", "/admin/shipping/history?entity=zone")).body.history.every((h) => h.entity === "zone") && (await call(opsA, "GET", `/admin/shipping/history?rule_id=${handling.body.rule.id}`)).body.history.every((h) => h.entity === "rule" && h.entity_id === handling.body.rule.id) && (await call(opsA, "GET", "/admin/shipping/history?entity=bogus")).status === 400);
+
+      // ---- the migration's conversion of the legacy rider_pay_config (incl. a tier) into rules gives the same payouts
+      const migration = require("./src/migrations/20261029000044_shipping_rules_engine");
+      await migration.down(db);
+      await db("rider_pay_config").insert({ base_payout: 10, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, tier_km: 5, per_km_rate_after_tier: 7 });
+      await migration.up(db);
+      const converted = await riderPaySvc.simpleConfig();
+      const probes = [];
+      for (const km of [0.5, 2, 5, 8, 12]) {
+        const r = await riderPaySvc.riderPayout({ order: { delivery_lat: 22.58 + km / 111.195, delivery_lng: 88.46, item_total: 200 }, restaurant: { lat: 22.58, lng: 88.46 } });
+        probes.push(Math.abs(r.payout - riderPaySvc.computePayout({ distanceKm: km, config: { base_payout: 10, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, tier_km: 5, per_km_rate_after_tier: 7 } }).payout) < 0.1);
+      }
+      check("migrating a legacy config with a tier into rules: the simple view shows it and payouts are identical at 5 distances", converted && converted.base_payout === 10 && converted.tier_km === 5 && converted.per_km_rate_after_tier === 7 && probes.every(Boolean));
+      check("the migration also seeds the customer base rule (Rs 5/km after the kitchen radius)", (await db("shipping_rules").where({ kind: "customer_fee", type: "base", is_deleted: 0 })).length === 1);
+      await db("rider_pay_config").where({ tier_km: 5 }).delete();
+      await migration.down(db);
+      await migration.up(db); // back to the seeded defaults for anything after this test
     } finally {
       await new Promise((resolve) => server.close(resolve));
-      for (const r of otherRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
-      await db("admins").where("email", "like", "%@tier.test").delete();
+      await db("admins").where("email", "like", "%@ship.test").delete();
     }
   }
 

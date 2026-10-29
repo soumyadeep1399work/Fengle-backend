@@ -33,11 +33,11 @@ async function settleRider(riderId) {
 
   // Each order pays what was frozen when it was delivered (admin-set rider pay at that moment);
   // orders delivered before that existed fall back to the current formula.
-  const config = await riderPay.getCurrentConfig();
+  const ruleSet = await require("./shippingRules.service").loadRuleSet(db, "rider_pay");
   let totalEarnings = 0;
   let storedCount = 0;
   for (const order of unsettledOrders) {
-    const { payout, stored } = riderPay.payoutForSettlement({ order, restaurant: restaurantById[order.restaurant_id], config });
+    const { payout, stored } = await riderPay.settlementPayout({ order, restaurant: restaurantById[order.restaurant_id], ruleSet });
     totalEarnings += payout;
     if (stored) storedCount += 1;
   }

@@ -1,4 +1,5 @@
 const db = require("../config/db");
+const shipping = require("../services/shippingRules.service");
 const { effectivePrice } = require("../utils/pricing");
 const routing = require("../services/routing.service");
 const { computeTax } = require("../services/tax.service");
@@ -74,7 +75,10 @@ async function quoteCart(req, res) {
     });
   }
 
-  const deliveryFee = routing.computeDeliveryFee(match.distanceKm, match.restaurant);
+  const deliveryFee = (await shipping.customerFee({
+    distanceKm: match.distanceKm, restaurant: match.restaurant, orderValue: itemTotal, at: new Date(),
+    dropoff: { lat: Number(delivery_lat), lng: Number(delivery_lng) },
+  })).fee; // same engine as order placement and the reject-cascade, so a quote can't disagree with the order
   const { cgstAmount, sgstAmount } = computeTax(itemTotal);
 
   // Preview only — nothing persisted, no redemption row, no trx/lock. The
