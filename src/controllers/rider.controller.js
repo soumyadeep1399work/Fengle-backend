@@ -19,6 +19,7 @@ async function getMyRate(req, res) {
   res.json({
     rate_per_km: c.per_km_rate, min_earning_per_delivery: c.min_payout,
     base_payout: c.base_payout, incentive_per_delivery: c.incentive_per_delivery,
+    tier_km: c.tier_km, per_km_rate_after_tier: c.per_km_rate_after_tier, // null = a single rate
     formula: riderPay.FORMULA,
   });
 }

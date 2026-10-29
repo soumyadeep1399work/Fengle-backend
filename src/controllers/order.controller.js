@@ -59,7 +59,7 @@ function scrubRiderPay(orderFields, requesterType) {
     const { rider_payout_breakdown, ...rest } = orderFields;
     return { ...rest, rider_payout: rest.rider_payout == null ? null : Number(rest.rider_payout), rider_payout_breakdown: riderPay.parseBreakdown(rider_payout_breakdown) };
   }
-  const { rider_payout, rider_payout_breakdown, rider_pay_config_id, ...rest } = orderFields;
+  const { rider_payout, rider_payout_breakdown, rider_pay_config_id, estimated_rider_payout, ...rest } = orderFields;
   return rest;
 }
 
@@ -820,11 +820,16 @@ async function getOrder(req, res) {
   const rider = order.rider_id ? await db("riders").where({ id: order.rider_id }).select("name", "phone").first() : null;
   const restaurant = await db("restaurants").where({ id: order.restaurant_id }).select("name", "address", "lat", "lng").first();
   const customer = type === "rider" || type === "admin" ? await db("users").where({ id: order.customer_id }).select("phone").first() : null;
+  // What the rider would earn for a delivery still to be done (live config; the payout itself is frozen at delivery).
+  const estimatedRiderPayout = type === "rider" || type === "admin"
+    ? riderPay.estimatePayout({ order, restaurant, config: await riderPay.getCurrentConfig() })
+    : undefined;
 
   res.json({
     order: scrubRiderPay(scrubDeliveryOtp(
       {
         ...withCancelInfo(order),
+        ...(estimatedRiderPayout !== undefined ? { estimated_rider_payout: estimatedRiderPayout } : {}),
         categories,
         category_name: categories.map((c) => c.name).join(" + "),
         cancelled: order.status === "cancelled",
@@ -1087,6 +1092,7 @@ async function listMyOrders(req, res) {
         (await db("users").whereIn("id", customerIds).select("id", "phone")).map((c) => [c.id, c])
       );
 
+  const liveRiderPay = type === "rider" || type === "admin" ? await riderPay.getCurrentConfig() : null;
   res.json({
     orders: orders.map((o) => {
       const items = itemsByOrderId[o.id] || [];
@@ -1094,6 +1100,7 @@ async function listMyOrders(req, res) {
       return scrubRiderPay(scrubDeliveryOtp(
         {
           ...withCancelInfo(o), items, categories, category_name: categories.map((c) => c.name).join(" + "),
+          ...(liveRiderPay ? { estimated_rider_payout: riderPay.estimatePayout({ order: o, restaurant: restaurantById[o.restaurant_id], config: liveRiderPay }) } : {}),
           ...restaurantContactFields(type, restaurantById[o.restaurant_id]),
           ...customerContactFields(type, customerById[o.customer_id]),
         },

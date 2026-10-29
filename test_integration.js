@@ -2792,6 +2792,113 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 44: Rider pay distance tier + estimated_rider_payout on orders ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const riderPaySvc = require("./src/services/riderPay.service");
+    const devtools = require("./src/services/devtools.service");
+    const { haversineDistanceKm } = require("./src/utils/geo");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const mkAdmin = async (name, role) => {
+      const [id] = await db("admins").insert({ name, email: `${name}@tier.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role });
+      return { id, token: signToken({ id, type: "admin" }) };
+    };
+    const superA = await mkAdmin("tier-super", "super_admin");
+    const opsA = await mkAdmin("tier-ops", "ops");
+    const call = async (who, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { Authorization: `Bearer ${who.token}`, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      let json = null; try { json = await r.json(); } catch { /* none */ }
+      return { status: r.status, body: json };
+    };
+    const put = (body) => call(superA, "PUT", "/admin/settings/rider-pay", body);
+    const otherRiders = await db("riders").select("id", "status");
+    try {
+      // ---- the formula
+      const tiered = { base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, tier_km: 5, per_km_rate_after_tier: 7 };
+      const at = (km, cfg = tiered) => riderPaySvc.computePayout({ distanceKm: km, config: cfg });
+      check("within the tier it is the single rate: 3 km -> 30, exactly 5 km -> 50, nothing extra", at(3).payout === 30 && at(5).payout === 50 && at(5).breakdown.extra_distance_km === 0 && at(5).breakdown.extra_distance_pay === 0);
+      const eight = at(8);
+      check("beyond the tier the after-rate applies to the extra km only: 8 km -> 10x5 + 7x3 = 71, extra 3 km / 21", eight.payout === 71 && eight.breakdown.extra_distance_km === 3 && eight.breakdown.extra_distance_pay === 21 && eight.breakdown.distance_pay === 71);
+      check("the minimum still applies: 0.5 km -> 5 -> min 15, min_applied true", at(0.5).payout === 15 && at(0.5).breakdown.min_applied === true);
+      const full = at(6, { base_payout: 10, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 5, tier_km: 5, per_km_rate_after_tier: 7 });
+      check("base + incentive compose with the tier: 6 km -> max(15, 10 + 50 + 7) + 5 = 72", full.payout === 72 && full.breakdown.subtotal === 67);
+      check("every existing breakdown key is still there, plus tier_km / per_km_rate_after_tier / extra_distance_km / extra_distance_pay",
+        ["formula", "distance_km", "base_payout", "per_km_rate", "distance_pay", "subtotal", "min_payout", "min_applied", "incentive_per_delivery", "payout", "tier_km", "per_km_rate_after_tier", "extra_distance_km", "extra_distance_pay"].every((k) => k in eight.breakdown));
+      const single = at(8, { base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0 });
+      check("a config with no tier fields (every row before this change) behaves exactly as before: 8 km -> 80, tier keys null/0", single.payout === 80 && single.breakdown.tier_km === null && single.breakdown.extra_distance_km === 0);
+      check("a tier with no after-rate is ignored (single rate)", at(8, { ...tiered, per_km_rate_after_tier: null }).payout === 80 && at(8, { ...tiered, tier_km: 0 }).payout === 80);
+      check("FORMULA describes the tier", /tier_km/.test(riderPaySvc.FORMULA) && /per_km_rate_after_tier/.test(riderPaySvc.FORMULA));
+
+      // ---- settings
+      check("PUT with tier_km but no after-rate -> 400; after-rate but no tier -> 400",
+        (await put({ base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, tier_km: 5 })).status === 400 && (await put({ base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, per_km_rate_after_tier: 7 })).status === 400);
+      check("PUT with tier_km 0 / negative / text / absurd, or a negative after-rate -> 400",
+        (await Promise.all([{ tier_km: 0, per_km_rate_after_tier: 7 }, { tier_km: -1, per_km_rate_after_tier: 7 }, { tier_km: "abc", per_km_rate_after_tier: 7 }, { tier_km: 5000, per_km_rate_after_tier: 7 }, { tier_km: 5, per_km_rate_after_tier: -2 }]
+          .map((t) => put({ base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, ...t })))).every((r) => r.status === 400));
+      check("PUT by ops is still 403 forbidden_role", (await call(opsA, "PUT", "/admin/settings/rider-pay", { ...tiered })).body.code === "forbidden_role");
+      const ok = await put({ ...tiered });
+      check("PUT with both tier fields -> 200; settings carry tier_km 5 and per_km_rate_after_tier 7", ok.status === 200 && ok.body.settings.tier_km === 5 && ok.body.settings.per_km_rate_after_tier === 7 && ok.body.settings.per_km_rate === 10);
+      const hist = await call(opsA, "GET", "/admin/settings/rider-pay");
+      check("GET settings + history show the tier, and the earlier rows show null (a single rate)", hist.body.settings.tier_km === 5 && hist.body.history[0].per_km_rate_after_tier === 7 && hist.body.history[hist.body.history.length - 1].tier_km === null);
+      const rateRes = fakeRes();
+      await riderCtl.getMyRate(fakeReq({}, {}, { id: riderId, type: "rider" }), rateRes);
+      check("GET /riders/me/rate returns the tier alongside the existing keys", rateRes.body.tier_km === 5 && rateRes.body.per_km_rate_after_tier === 7 && rateRes.body.rate_per_km === 10 && rateRes.body.min_earning_per_delivery === 15 && rateRes.body.base_payout === 0);
+      check("a tier alone is a valid config even when every other value is 0 (riders still earn beyond the tier)", (await put({ base_payout: 0, per_km_rate: 0, min_payout: 0, incentive_per_delivery: 0, tier_km: 5, per_km_rate_after_tier: 10 })).status === 200);
+      const cleared = await put({ base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0 });
+      check("a PUT that leaves the tier out saves a single-rate config (tier_km null)", cleared.status === 200 && cleared.body.settings.tier_km === null && cleared.body.settings.per_km_rate_after_tier === null);
+      check("both null / empty also means no tier", (await put({ base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, tier_km: null, per_km_rate_after_tier: "" })).body.settings.tier_km === null);
+
+      // ---- estimate on orders: a tier of 1 km after-rate 7, so the order below is on the second rate
+      const live = (await put({ base_payout: 0, per_km_rate: 10, min_payout: 15, incentive_per_delivery: 0, tier_km: 1, per_km_rate_after_tier: 7 })).body.settings;
+      await db("riders").update({ status: "inactive" });
+      const [estRider] = await db("riders").insert({ name: "Estimate Rider", phone: "8500000044", status: "active", last_known_lat: 22.5810, last_known_lng: 88.4610, wallet_balance: 0 });
+      const place = async (phone) => {
+        const [custId] = await db("users").insert({ name: "Est Customer", phone, wallet_balance: 0 });
+        const r = fakeRes();
+        await orderController.placeOrder(fakeReq({ items: [{ item_id: fishCurryId, quantity: 1 }], delivery_lat: 22.6050, delivery_lng: 88.4850, delivery_address: "Est St", payment_method: "cod" }, {}, { id: custId, type: "customer" }), r);
+        return { id: r.body.order.id, custId };
+      };
+      const o1 = await place("8000004401");
+      const kmOf = async (id) => { const o = await db("orders").where({ id }).first(); const k = await db("restaurants").where({ id: o.restaurant_id }).first(); return { km: haversineDistanceKm(Number(k.lat), Number(k.lng), Number(o.delivery_lat), Number(o.delivery_lng)), restaurantId: o.restaurant_id }; };
+      const getAs = async (id, auth) => { const r = fakeRes(); await orderController.getOrder(fakeReq({}, { id: String(id) }, auth), r); return r.body.order; };
+      const listAs = async (auth, id) => { const r = fakeRes(); await orderController.listMyOrders(fakeReq({}, {}, auth, {}), r); return r.body.orders.find((o) => o.id === id); };
+      check("a placed (not yet accepted) order has no estimate (null): there is nothing to deliver yet", (await getAs(o1.id, { id: 1, type: "admin" })).estimated_rider_payout === null);
+      await devtools.advanceOrder(o1.id, { to: "accepted" });
+      const { km: km1, restaurantId } = await kmOf(o1.id);
+      const expected1 = riderPaySvc.computePayout({ distanceKm: km1, config: live }).payout;
+      const riderAuth = { id: estRider, type: "rider" };
+      const asRider = await getAs(o1.id, riderAuth);
+      check("GET /orders/:id for the assigned rider: estimated_rider_payout = the LIVE config applied to kitchen->drop-off distance (tier included)", asRider.rider_id === estRider && asRider.estimated_rider_payout === expected1 && expected1 > 0);
+      check("the order is far enough to use the second rate (more than 1 km, so cheaper than 10/km all the way)", km1 > 1 && expected1 < Number((km1 * 10).toFixed(2)));
+      check("GET /orders list (rider): the same estimate on the active order", (await listAs(riderAuth, o1.id)).estimated_rider_payout === expected1);
+      check("admin sees it too", (await getAs(o1.id, { id: 1, type: "admin" })).estimated_rider_payout === expected1);
+      const asCustomer = await getAs(o1.id, { id: o1.custId, type: "customer" });
+      const asKitchen = await getAs(o1.id, { id: restaurantId, type: "restaurant" });
+      check("customers and kitchens never get the key (GET /orders/:id)", !("estimated_rider_payout" in asCustomer) && !("estimated_rider_payout" in asKitchen));
+      check("...nor in their GET /orders lists", !("estimated_rider_payout" in (await listAs({ id: o1.custId, type: "customer" }, o1.id))) && !("estimated_rider_payout" in (await listAs({ id: restaurantId, type: "restaurant" }, o1.id))));
+
+      // the estimate follows the live config; the payout freezes whatever is live at delivery
+      const newer = (await put({ base_payout: 0, per_km_rate: 20, min_payout: 15, incentive_per_delivery: 0, tier_km: 1, per_km_rate_after_tier: 12 })).body.settings;
+      const expected2 = riderPaySvc.computePayout({ distanceKm: km1, config: newer }).payout;
+      check("change the config while the order is active: the estimate changes with it", expected2 !== expected1 && (await getAs(o1.id, riderAuth)).estimated_rider_payout === expected2);
+      await devtools.advanceOrder(o1.id, { to: "delivered" });
+      const delivered = await getAs(o1.id, riderAuth);
+      check("once delivered: no estimate (null), and the frozen rider_payout equals the estimate under the config live at delivery", delivered.estimated_rider_payout === null && delivered.rider_payout === expected2);
+      check("the frozen breakdown explains the tier: tier_km 1, extra km beyond it, extra pay at the after-rate",
+        delivered.rider_payout_breakdown.tier_km === 1 && delivered.rider_payout_breakdown.per_km_rate_after_tier === 12 && Math.abs(delivered.rider_payout_breakdown.extra_distance_km - (km1 - 1)) < 0.011 && Math.abs(delivered.rider_payout_breakdown.extra_distance_pay - 12 * delivered.rider_payout_breakdown.extra_distance_km) < 0.02);
+      check("estimatePayout is null when there is no kitchen to measure from, or the order isn't active",
+        riderPaySvc.estimatePayout({ order: { status: "accepted", delivery_lat: 1, delivery_lng: 1 }, restaurant: null, config: live }) === null && riderPaySvc.estimatePayout({ order: { status: "delivered", delivery_lat: 1, delivery_lng: 1 }, restaurant: { lat: 1, lng: 1 }, config: live }) === null);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      for (const r of otherRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      await db("admins").where("email", "like", "%@tier.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

@@ -147,7 +147,9 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   collected vs handed over per rider and per order (cancelled/refunded COD
   orders included) and flags mismatches. Report dates are IST days.
 - **Rider pay is admin-configurable** (2026-10-28): `payout = max(min_payout,
-  base_payout + per_km_rate × distance_km) + incentive_per_delivery`, set by a
+  base_payout + per_km_rate × min(d, tier_km) + per_km_rate_after_tier ×
+  max(0, d − tier_km)) + incentive_per_delivery` (two-rate distance, added
+  2026-10-29; no tier = one rate), set by a
   super_admin (`PUT /admin/settings/rider-pay`, append-only history) and
   **frozen on the order at delivery** (`orders.rider_payout` + breakdown), so a
   later rate change never rewrites earnings; settlement pays the frozen figure

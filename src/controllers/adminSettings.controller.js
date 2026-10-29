@@ -2,6 +2,7 @@ const db = require("../config/db");
 const riderPay = require("../services/riderPay.service");
 
 const MAX_AMOUNT = 100000;
+const MAX_TIER_KM = 1000;
 const FIELDS = ["base_payout", "per_km_rate", "min_payout", "incentive_per_delivery"];
 
 async function history(limit = 100) {
@@ -23,7 +24,7 @@ async function getRiderPay(req, res) {
 }
 
 /**
- * PUT /admin/settings/rider-pay { base_payout, per_km_rate, min_payout, incentive_per_delivery }
+ * PUT /admin/settings/rider-pay { base_payout, per_km_rate, min_payout, incentive_per_delivery, tier_km?, per_km_rate_after_tier? }
  * super_admin only. Appends a history row and makes it the live config. Applies to orders
  * delivered from now on — payouts already frozen on delivered orders never change.
  */
@@ -38,7 +39,24 @@ async function updateRiderPay(req, res) {
     }
     values[key] = Number(n.toFixed(2));
   }
-  if (FIELDS.every((key) => values[key] === 0)) {
+  // Optional two-rate distance pay: BOTH tier_km and per_km_rate_after_tier, or neither (omitted / null = a single rate).
+  const num = (v) => (typeof v === "string" && v.trim() !== "" ? Number(v) : v);
+  const blank = (v) => v === undefined || v === null || v === "";
+  if (blank(body.tier_km) !== blank(body.per_km_rate_after_tier)) {
+    return res.status(400).json({ error: "tier_km and per_km_rate_after_tier must be set together (or both left out for a single rate)" });
+  }
+  if (blank(body.tier_km)) {
+    values.tier_km = null;
+    values.per_km_rate_after_tier = null;
+  } else {
+    const tier = num(body.tier_km);
+    const after = num(body.per_km_rate_after_tier);
+    if (typeof tier !== "number" || !Number.isFinite(tier) || tier <= 0 || tier > MAX_TIER_KM) return res.status(400).json({ error: `tier_km must be a number above 0 (up to ${MAX_TIER_KM})` });
+    if (typeof after !== "number" || !Number.isFinite(after) || after < 0 || after > MAX_AMOUNT) return res.status(400).json({ error: `per_km_rate_after_tier must be a number from 0 to ${MAX_AMOUNT}` });
+    values.tier_km = Number(tier.toFixed(2));
+    values.per_km_rate_after_tier = Number(after.toFixed(2));
+  }
+  if (FIELDS.every((key) => values[key] === 0) && values.tier_km === null) {
     return res.status(400).json({ error: "At least one of the pay values must be above 0 — riders would earn nothing" });
   }
 

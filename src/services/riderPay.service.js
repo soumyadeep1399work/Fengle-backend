@@ -2,7 +2,12 @@ const db = require("../config/db");
 const { haversineDistanceKm } = require("../utils/geo");
 
 // The formula, in one line, as shown to admins and stored with every payout:
-const FORMULA = "max(min_payout, base_payout + per_km_rate x distance_km) + incentive_per_delivery";
+const FORMULA =
+  "max(min_payout, base_payout + per_km_rate x min(distance_km, tier_km) + per_km_rate_after_tier x max(0, distance_km - tier_km)) + incentive_per_delivery" +
+  " (with no tier set: per_km_rate x distance_km)";
+
+// Statuses in which a delivery is still to be done: the rider sees an estimated payout for these.
+const ACTIVE_STATUSES = ["accepted", "picked_up", "on_the_way"];
 
 const money = (n) => Number(Number(n).toFixed(2));
 
@@ -26,6 +31,9 @@ function normalizeConfig(row) {
     per_km_rate: Number(row.per_km_rate),
     min_payout: Number(row.min_payout),
     incentive_per_delivery: Number(row.incentive_per_delivery),
+    // Two-rate distance pay: per_km_rate up to tier_km, per_km_rate_after_tier beyond it. Both null = a single rate.
+    tier_km: row.tier_km == null ? null : Number(row.tier_km),
+    per_km_rate_after_tier: row.per_km_rate_after_tier == null ? null : Number(row.per_km_rate_after_tier),
     created_by_admin_id: row.created_by_admin_id ?? null,
     created_at: row.created_at ?? null,
   };
@@ -38,7 +46,13 @@ function normalizeConfig(row) {
  */
 function computePayout({ distanceKm, config }) {
   const distance = money(distanceKm);
-  const distancePay = money(config.per_km_rate * distance);
+  // A tier only applies when it has both a length and an after-rate; otherwise it is the old single rate.
+  const tierKm = config.tier_km != null && Number(config.tier_km) > 0 && config.per_km_rate_after_tier != null ? Number(config.tier_km) : null;
+  const afterRate = tierKm != null ? Number(config.per_km_rate_after_tier) : null;
+  const extraKm = tierKm != null ? money(Math.max(0, distance - tierKm)) : 0;
+  const extraPay = tierKm != null ? money(afterRate * extraKm) : 0;
+  const firstKm = tierKm != null ? Math.min(distance, tierKm) : distance;
+  const distancePay = money(config.per_km_rate * firstKm + extraPay); // total distance pay: the first tier plus anything beyond it
   const subtotal = money(config.base_payout + distancePay);
   const minApplied = subtotal < config.min_payout;
   const core = minApplied ? config.min_payout : subtotal;
@@ -51,6 +65,10 @@ function computePayout({ distanceKm, config }) {
       base_payout: config.base_payout,
       per_km_rate: config.per_km_rate,
       distance_pay: distancePay,
+      tier_km: tierKm,
+      per_km_rate_after_tier: afterRate,
+      extra_distance_km: extraKm,
+      extra_distance_pay: extraPay,
       subtotal,
       min_payout: config.min_payout,
       min_applied: minApplied,
@@ -90,10 +108,22 @@ function payoutForSettlement({ order, restaurant, config }) {
   return { payout: computePayout({ distanceKm: orderDistanceKm(order, restaurant), config }).payout, stored: false };
 }
 
+/**
+ * What a rider would earn for an order still to be delivered, under the LIVE config and the same distance measure
+ * the frozen payout uses. null when the order isn't active or the distance can't be computed. The final payout is
+ * frozen at delivery from whatever config is live then, so this is only an estimate.
+ */
+function estimatePayout({ order, restaurant, config }) {
+  if (!ACTIVE_STATUSES.includes(order.status) || !restaurant) return null;
+  const km = orderDistanceKm(order, restaurant);
+  if (!Number.isFinite(km)) return null;
+  return computePayout({ distanceKm: km, config }).payout;
+}
+
 function parseBreakdown(value) {
   if (value == null) return null;
   if (typeof value === "object") return value; // MySQL JSON columns arrive parsed
   try { return JSON.parse(value); } catch { return null; }
 }
 
-module.exports = { FORMULA, getCurrentConfig, normalizeConfig, computePayout, orderDistanceKm, recordPayoutOnDelivery, payoutForSettlement, parseBreakdown };
+module.exports = { FORMULA, getCurrentConfig, normalizeConfig, computePayout, estimatePayout, ACTIVE_STATUSES, orderDistanceKm, recordPayoutOnDelivery, payoutForSettlement, parseBreakdown };
