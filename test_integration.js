@@ -2349,6 +2349,165 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 41: Notification centre — audiences, promotion vs service, send now / scheduled / cancel, delivery counts ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const { promoOptIn } = require("./src/services/push.service");
+    const campaignSvc = require("./src/services/campaign.service");
+    const app = require("./src/app");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const mkAdmin = async (name, role) => {
+      const [id] = await db("admins").insert({ name, email: `${name}@notif.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role });
+      return { id, token: signToken({ id, type: "admin" }) };
+    };
+    const superA = await mkAdmin("notif-super", "super_admin");
+    const opsA = await mkAdmin("notif-ops", "ops");
+    const supA = await mkAdmin("notif-support", "support");
+
+    // Never touch the real Expo / Google endpoints: answer them locally and remember what was "sent".
+    const realFetch = global.fetch;
+    const expoSent = [];
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("exp.host")) {
+        const messages = JSON.parse(opts.body);
+        expoSent.push(...messages);
+        const data = messages.map((m) => (m.to.includes("BAD") ? { status: "error", message: "gone", details: { error: "DeviceNotRegistered" } } : { status: "ok", id: "t" }));
+        return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("googleapis.com")) return new Response(JSON.stringify({ error: "invalid_grant", error_description: "stubbed" }), { status: 400 });
+      return realFetch(url, opts);
+    };
+    const call = async (who, method, p, body) => {
+      const r = await realFetch(base + p, { method, headers: { Authorization: `Bearer ${who.token}`, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      let json = null; try { json = await r.json(); } catch { /* none */ }
+      return { status: r.status, body: json };
+    };
+    const waitFor = async (id, wanted) => {
+      for (let i = 0; i < 80; i++) {
+        const c = (await call(superA, "GET", `/admin/notifications/${id}`)).body.campaign;
+        if (wanted.includes(c.status)) return c;
+        await sleep(100);
+      }
+      return (await call(superA, "GET", `/admin/notifications/${id}`)).body.campaign;
+    };
+    const created = [];
+    try {
+      // ---- roles
+      const probes = [["POST", "/admin/notifications/preview", {}], ["POST", "/admin/notifications", {}], ["GET", "/admin/notifications"], ["GET", "/admin/notifications/1"], ["POST", "/admin/notifications/1/cancel", {}]];
+      const leaked = [];
+      for (const [m, p, b] of probes) for (const [name, who] of [["ops", opsA], ["support", supA]]) {
+        const r = await call(who, m, p, b);
+        if (!(r.status === 403 && r.body.code === "forbidden_role")) leaked.push(`${name} ${m} ${p} -> ${r.status}`);
+      }
+      check(`ops and support get 403 forbidden_role on every notification route (leaks: ${leaked.join("; ") || "none"})`, leaked.length === 0);
+
+      // ---- customers: c1 opted in (2 devices: one live, one dead), c2 opted OUT of promotions (1 device), c3 blocked (1 device), c4 opted in (no device)
+      const mkCustomer = async (phone, extra = {}) => (await db("users").insert({ name: `N ${phone}`, phone, wallet_balance: 0, ...extra }))[0];
+      const c1 = await mkCustomer("8000004101");
+      const c2 = await mkCustomer("8000004102", { notification_prefs: JSON.stringify({ promotions: false }) });
+      const c3 = await mkCustomer("8000004103", { status: "blocked" });
+      const c4 = await mkCustomer("8000004104");
+      const tok = (owner, token) => db("device_tokens").insert({ owner_type: "customer", owner_id: owner, token, platform: "android" });
+      await tok(c1, "ExponentPushToken[OK-c1]"); await tok(c1, "ExponentPushToken[BAD-c1]");
+      await tok(c2, "ExponentPushToken[OK-c2]"); await tok(c3, "ExponentPushToken[OK-c3]");
+      const phones = ["8000004101", "8000004102", "8000004103", "8000004104"];
+
+      // ---- preview (nothing is sent)
+      const pvPromo = await call(superA, "POST", "/admin/notifications/preview", { kind: "promotion", audience: { type: "phones", phones } });
+      check("preview promotion: blocked c3 and opted-out c2 are left out -> 2 customers (c1, c4), 2 devices (c1's), matched 3, 1 opted out", pvPromo.status === 200 && pvPromo.body.customers === 2 && pvPromo.body.devices === 2 && pvPromo.body.matched === 3 && pvPromo.body.opted_out_excluded === 1);
+      const pvService = await call(superA, "POST", "/admin/notifications/preview", { kind: "service", audience: { type: "phones", phones } });
+      check("preview service: the opted-out customer IS included (c1, c2, c4), blocked still not -> 3 customers, 3 devices", pvService.body.customers === 3 && pvService.body.devices === 3 && pvService.body.opted_out_excluded === 0);
+      check("preview sent nothing", expoSent.length === 0);
+
+      // ---- validation
+      const okBody = { title: "Hello", body: "World", kind: "promotion", audience: { type: "phones", phones } };
+      const invalid = [
+        { ...okBody, title: "" }, { ...okBody, title: "x".repeat(101) }, { ...okBody, body: " " }, { ...okBody, body: "x".repeat(501) },
+        { ...okBody, kind: "spam" }, { ...okBody, audience: undefined }, { ...okBody, audience: { type: "everyone" } },
+        { ...okBody, audience: { type: "phones", phones: [] } }, { ...okBody, audience: { type: "phones", phones: ["12345"] } },
+        { ...okBody, audience: { type: "filtered", filters: { min_orders: -1 } } }, { ...okBody, audience: { type: "filtered", filters: { min_orders: 5, max_orders: 2 } } },
+        { ...okBody, scheduled_at: "not-a-date" }, { ...okBody, scheduled_at: new Date(Date.now() - 3600e3).toISOString() },
+        { ...okBody, scheduled_at: new Date(Date.now() + 400 * 86400e3).toISOString() },
+      ];
+      check("create validation: empty/long title or body, bad kind, missing/odd audience, bad phones, bad filters, past/invalid/too-far schedule -> all 400", (await Promise.all(invalid.map((b) => call(superA, "POST", "/admin/notifications", b)))).every((r) => r.status === 400));
+
+      // ---- send now: promotion
+      const promo = await call(superA, "POST", "/admin/notifications", { title: "Weekend offer", body: "20% off Bengali", kind: "promotion", audience: { type: "phones", phones } });
+      created.push(promo.body.campaign.id);
+      check("POST /admin/notifications (no scheduled_at) -> 201, status sending, who created it", promo.status === 201 && promo.body.campaign.status === "sending" && promo.body.campaign.created_by_admin_id === superA.id && promo.body.campaign.audience.type === "phones");
+      const promoDone = await waitFor(promo.body.campaign.id, ["sent", "failed"]);
+      check("promotion result: status sent, 2 customers targeted, 2 devices, 1 sent + 1 failed (the dead token), sent_at set", promoDone.status === "sent" && promoDone.targeted_customers === 2 && promoDone.targeted_devices === 2 && promoDone.sent_count === 1 && promoDone.failed_count === 1 && !!promoDone.sent_at);
+      check("the push went to c1's two devices only (not the opted-out, blocked or token-less customers) with the title/body", expoSent.length === 2 && expoSent.every((m) => m.to.includes("c1") && m.title === "Weekend offer" && m.body === "20% off Bengali"));
+      check("the dead device token was removed", (await db("device_tokens").where({ token: "ExponentPushToken[BAD-c1]" })).length === 0);
+
+      // ---- send now: service reaches the opted-out customer
+      expoSent.length = 0;
+      const service = await call(superA, "POST", "/admin/notifications", { title: "Service notice", body: "Short maintenance tonight", kind: "service", audience: { type: "phones", phones } });
+      created.push(service.body.campaign.id);
+      const serviceDone = await waitFor(service.body.campaign.id, ["sent", "failed"]);
+      check("service notice: reaches the promotions-opted-out customer too (c1's live device + c2's) -> 3 customers, 2 devices, 2 sent, 0 failed", serviceDone.status === "sent" && serviceDone.targeted_customers === 3 && serviceDone.targeted_devices === 2 && serviceDone.sent_count === 2 && serviceDone.failed_count === 0 && expoSent.some((m) => m.to.includes("c2")));
+      check("...and a blocked customer never gets anything", !expoSent.some((m) => m.to.includes("c3")));
+
+      // ---- filtered audience uses the same filters as GET /admin/customers
+      const noOrders = await db("users as u").leftJoin("orders as o", "o.customer_id", "u.id").where("u.status", "active").groupBy("u.id").havingRaw("COUNT(o.id) = 0").select("u.id", "u.notification_prefs");
+      const expectedNoOrders = noOrders.filter((r) => promoOptIn(r.notification_prefs)).length;
+      const pvFiltered = await call(superA, "POST", "/admin/notifications/preview", { kind: "promotion", audience: { type: "filtered", filters: { max_orders: 0 } } });
+      check("filtered audience {max_orders: 0} = active, opted-in customers who never ordered (same count as the customers list logic)", pvFiltered.body.customers === expectedNoOrders && expectedNoOrders >= 1);
+      check("filtered audience {min_orders: 99999} matches nobody; an all-audience service notice matches every active customer",
+        (await call(superA, "POST", "/admin/notifications/preview", { kind: "promotion", audience: { type: "filtered", filters: { min_orders: 99999 } } })).body.customers === 0 &&
+        (await call(superA, "POST", "/admin/notifications/preview", { kind: "service", audience: { type: "all" } })).body.customers === Number((await db("users").where({ status: "active" }).count({ n: "*" }).first()).n));
+
+      // ---- scheduling + cancel
+      const later = new Date(Date.now() + 2 * 3600e3).toISOString();
+      const sched = await call(superA, "POST", "/admin/notifications", { title: "Later", body: "Scheduled", kind: "promotion", audience: { type: "phones", phones: ["8000004101"] }, scheduled_at: later });
+      created.push(sched.body.campaign.id);
+      check("a campaign with scheduled_at stays 'scheduled' and sends nothing yet", sched.status === 201 && sched.body.campaign.status === "scheduled" && sched.body.campaign.targeted_customers === null);
+      check("processDue() ignores a campaign whose time hasn't come", (await campaignSvc.processDue()) === 0 && (await call(superA, "GET", `/admin/notifications/${sched.body.campaign.id}`)).body.campaign.status === "scheduled");
+      const cancelled = await call(superA, "POST", `/admin/notifications/${sched.body.campaign.id}/cancel`, {});
+      check("cancel a scheduled campaign -> cancelled with cancelled_at", cancelled.status === 200 && cancelled.body.campaign.status === "cancelled" && !!cancelled.body.campaign.cancelled_at);
+      check("cancelling again, or a sent one -> 409; unknown id -> 404", (await call(superA, "POST", `/admin/notifications/${sched.body.campaign.id}/cancel`, {})).status === 409 && (await call(superA, "POST", `/admin/notifications/${promo.body.campaign.id}/cancel`, {})).status === 409 && (await call(superA, "POST", "/admin/notifications/999999/cancel", {})).status === 404);
+      check("a cancelled campaign is never sent by the scheduler", (await db("notification_campaigns").where({ id: sched.body.campaign.id }).update({ scheduled_at: new Date(Date.now() - 60e3) }), (await campaignSvc.processDue()) === 0));
+
+      expoSent.length = 0;
+      const due = await call(superA, "POST", "/admin/notifications", { title: "Due soon", body: "Scheduled for later", kind: "promotion", audience: { type: "phones", phones: ["8000004101"] }, scheduled_at: later });
+      created.push(due.body.campaign.id);
+      await db("notification_campaigns").where({ id: due.body.campaign.id }).update({ scheduled_at: new Date(Date.now() - 1000) }); // its time comes
+      check("claim() is atomic: a second claim of the same campaign loses", (await campaignSvc.claim(due.body.campaign.id)) === true && (await campaignSvc.claim(due.body.campaign.id)) === false);
+      await db("notification_campaigns").where({ id: due.body.campaign.id }).update({ status: "scheduled" }); // put it back for the scheduler tick
+      check("the scheduler tick sends a due campaign", (await campaignSvc.processDue()) === 1);
+      const dueDone = await waitFor(due.body.campaign.id, ["sent", "failed"]);
+      check("...which ends 'sent' with its counts (c1 now has 1 live device)", dueDone.status === "sent" && dueDone.targeted_customers === 1 && dueDone.sent_count === 1 && expoSent.length === 1 && expoSent[0].title === "Due soon");
+
+      // ---- failure + recovery
+      const [c6] = await db("users").insert({ name: "N fcm", phone: "8000004106", wallet_balance: 0 });
+      await tok(c6, "fcm-native-token-1");
+      const fcmCampaign = await call(superA, "POST", "/admin/notifications", { title: "FCM", body: "no FCM here", kind: "service", audience: { type: "phones", phones: ["8000004106"] } });
+      created.push(fcmCampaign.body.campaign.id);
+      const fcmDone = await waitFor(fcmCampaign.body.campaign.id, ["sent", "failed"]);
+      check("when no device accepts the push (FCM unavailable) the campaign ends 'failed' with a reason, not a silent 'sent to 0'", fcmDone.status === "failed" && typeof fcmDone.error === "string" && fcmDone.error.length > 0);
+      const [stuck] = await db("notification_campaigns").insert({ title: "Stuck", body: "x", kind: "service", audience_type: "all", status: "sending", scheduled_at: new Date(), created_by_admin_id: superA.id });
+      await db("notification_campaigns").where({ id: stuck }).update({ updated_at: new Date(Date.now() - 3600e3) });
+      created.push(stuck);
+      check("a campaign left 'sending' by a restart is marked failed, not re-sent", (await campaignSvc.failStuckCampaigns()) >= 1 && (await call(superA, "GET", `/admin/notifications/${stuck}`)).body.campaign.status === "failed");
+
+      // ---- history
+      const history = await call(superA, "GET", "/admin/notifications?limit=100");
+      check("GET /admin/notifications lists the history newest first with who created each", history.status === 200 && history.body.total >= created.length && history.body.campaigns[0].id > history.body.campaigns[1].id && history.body.campaigns[0].created_by_admin_name === "notif-super");
+      check("history filters by status and kind; bad filter -> 400", (await call(superA, "GET", "/admin/notifications?status=cancelled")).body.campaigns.every((c) => c.status === "cancelled") && (await call(superA, "GET", "/admin/notifications?kind=service")).body.campaigns.every((c) => c.kind === "service") && (await call(superA, "GET", "/admin/notifications?status=bogus")).status === 400);
+      check("GET /admin/notifications/:id -> 404 for an unknown id", (await call(superA, "GET", "/admin/notifications/999999")).status === 404);
+    } finally {
+      global.fetch = realFetch;
+      await new Promise((resolve) => server.close(resolve));
+      await db("notification_campaigns").delete();
+      await db("device_tokens").where("token", "like", "ExponentPushToken[%-c%").orWhere("token", "fcm-native-token-1").delete();
+      await db("admins").where("email", "like", "%@notif.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

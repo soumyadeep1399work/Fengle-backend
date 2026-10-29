@@ -103,6 +103,12 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   rider must explicitly confirm the exact amount collected at the
   "Mark Delivered" step for a COD order — this is the trigger that creates
   the ledger entry. Do not skip this confirmation step in the UI.
+- **Notification centre is super_admin only** (2026-10-29): campaigns to
+  customers, sent now or scheduled (`services/campaign.service.js`, a
+  once-a-minute in-process timer started from `server.js` — single PM2
+  instance). `promotion` respects the "Offers & news" opt-out, `service` goes to
+  everyone targeted; blocked customers never get either. The campaign row is
+  the audit trail (who, what, targeted/sent/failed counts).
 - **Profit & loss is super_admin only** (2026-10-29): `GET /admin/finance/pnl`
   and the expenses CRUD. Every order figure is keyed to the order's **placement
   date in IST** so the P&L and `orders.csv` tie out. Fengle revenue is

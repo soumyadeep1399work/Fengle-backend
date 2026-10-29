@@ -509,6 +509,20 @@ Why `net_profit` leaves out restaurant payables and GST: the customer's money in
 
 **orders.csv columns**: `order_id, placed_at, delivered_at, cancelled_at, status, payment_method, payment_status, item_total, delivery_fee, gst, coupon_discount, grand_total, commission, fengle_revenue, restaurant_payable, rider_payout, rider_payout_source (stored|estimated|empty), gateway_charge, offer_discount, refunded, net_contribution` — `net_contribution = fengle_revenue − rider_payout − coupon_discount − gateway_charge` for a delivered order, `0` otherwise; summed over the rows and minus expenses it equals `net_profit`.
 
+## Notification centre (added 2026-10-29) — super_admin only
+
+Compose a push notification to customers, send it now or schedule it, cancel it while it is still scheduled, and read the delivery report. All routes are **super_admin only** (ops/support → 403 `forbidden_role`).
+
+- **Kinds**: `promotion` respects each customer's "Offers & news" switch (`notification_prefs.promotions === false` = opted out, skipped); `service` (outage, policy or safety notices) goes to **every targeted customer regardless**. Blocked customers never receive either.
+- **Audience** `{ type, ... }`: `all` (every active customer) · `filtered` with `filters` using the same names as `GET /admin/customers` — `min_orders`, `max_orders` (`0` = never ordered), `inactive_days` (no order in N days, or never), `ordered_category_id` — all whole numbers ≥ 0 · `phones` with a `phones` list (≤ 5000 numbers; 10 digits or `91`-prefixed, de-duplicated).
+- `POST /admin/notifications/preview { kind, audience }` → `{ customers, devices, matched, opted_out_excluded }` — how many customers/devices it would reach right now (`matched` = audience size before promotion opt-outs). Sends nothing.
+- `POST /admin/notifications { title (≤100), body (≤500), kind, audience, scheduled_at? }` → **201** `{ campaign }`. Leave `scheduled_at` out to **send now** (status starts at `sending`); otherwise it must be at least a minute ahead and at most a year ahead (ISO date-time) and the campaign starts as `scheduled`.
+- `GET /admin/notifications?status=&kind=&page=&limit=` → `{ campaigns, page, limit, total }`, newest first (the history). `GET /admin/notifications/:id` → `{ campaign }`.
+- `POST /admin/notifications/:id/cancel` — only while `scheduled`; otherwise **409** (`sending`/`sent`/`cancelled`/`failed`), 404 unknown. The cancel is atomic with the scheduler's pick-up, so a campaign can never both send and be cancelled.
+- **campaign** = `{ id, title, body, kind, audience: { type, filters, phones }, scheduled_at, status: scheduled|sending|sent|cancelled|failed, targeted_customers, targeted_devices, sent_count, failed_count, error, created_by_admin_id, created_by_admin_name, sent_at, cancelled_at, created_at }`. `targeted_customers`/`targeted_devices` are filled in when the send starts; `sent_count` = device pushes accepted by FCM/Expo, `failed_count` = pushes rejected (including dead tokens, which are also deleted). A send where devices existed but **none** accepted ends `failed` with an `error` (e.g. FCM not configured) rather than a silent "sent to 0".
+- **Scheduler**: an in-process timer (`services/campaign.service.js`, started from `server.js`) runs every minute and sends due campaigns, oldest first. The API runs as a single PM2 instance; a second instance would need a different claim (the claim is an atomic `UPDATE … WHERE status='scheduled'`, so even two instances would not double-send). A campaign found still `sending` after 30 minutes on boot (the server was cut off mid-send) is marked `failed` and is **not** re-sent.
+- The push carries `data: { type: "campaign", campaign_id, kind }`; the customer app may ignore it.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**

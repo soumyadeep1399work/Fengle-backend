@@ -192,4 +192,4 @@ async function exportCustomersCsv(req, res) {
   res.send(csv);
 }
 
-module.exports = { listCustomers, getCustomer, updateCustomerStatus, creditCustomerWallet, exportCustomersCsv };
+module.exports = { listCustomers, getCustomer, updateCustomerStatus, creditCustomerWallet, exportCustomersCsv, customersWithOrderStats, applyCampaignFilters };

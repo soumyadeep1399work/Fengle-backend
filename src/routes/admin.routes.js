@@ -9,6 +9,7 @@ const adminAdmins = require("../controllers/adminAdmins.controller");
 const adminSettings = require("../controllers/adminSettings.controller");
 const adminCod = require("../controllers/adminCod.controller");
 const adminFinance = require("../controllers/adminFinance.controller");
+const adminNotifications = require("../controllers/adminNotifications.controller");
 const partnerDocuments = require("../controllers/partnerDocuments.controller");
 
 const router = express.Router();
@@ -76,6 +77,13 @@ router.get("/documents/:ownerType/:ownerId", partnerDocuments.getOwnerDocuments)
 // Rider pay: every role can read it; only a super_admin can change it.
 router.get("/settings/rider-pay", adminSettings.getRiderPay);
 router.put("/settings/rider-pay", superOnly, adminSettings.updateRiderPay);
+
+// Notification centre (super_admin only): compose, schedule, cancel and review push campaigns to customers.
+router.post("/notifications/preview", superOnly, adminNotifications.preview);
+router.post("/notifications", superOnly, adminNotifications.createCampaign);
+router.get("/notifications", superOnly, adminNotifications.listCampaigns);
+router.get("/notifications/:id", superOnly, adminNotifications.getCampaign);
+router.post("/notifications/:id/cancel", superOnly, adminNotifications.cancelCampaign);
 
 // Finance (super_admin only): expenses CRUD, profit & loss, and its CSVs.
 router.post("/expenses", superOnly, adminFinance.createExpense);

@@ -71,7 +71,9 @@ function isDeadTokenError(status, error) {
 
 async function sendFcm(tokens, { title, body, data }) {
   const sa = getServiceAccount();
-  if (!sa || !tokens.length) return;
+  if (!tokens.length) return { sent: 0, failed: 0 };
+  if (!sa) return { sent: 0, failed: tokens.length }; // FCM isn't configured on this server
+  let sent = 0;
   const accessToken = await getAccessToken(sa);
   const url = `https://fcm.googleapis.com/v1/projects/${sa.project_id}/messages:send`;
   // FCM data values must be strings.
@@ -92,13 +94,14 @@ async function sendFcm(tokens, { title, body, data }) {
           },
         }),
       });
-      if (res.ok) return;
+      if (res.ok) { sent += 1; return; }
       const { error } = await res.json().catch(() => ({}));
       if (isDeadTokenError(res.status, error)) dead.push(token);
       else console.error("[push] FCM send failed", res.status, error && error.message);
     })
   );
   await deleteTokens(dead);
+  return { sent, failed: tokens.length - sent };
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +109,7 @@ async function sendFcm(tokens, { title, body, data }) {
 // ---------------------------------------------------------------------------
 
 async function sendExpo(tokens, { title, body, data }) {
+  let sent = 0;
   const messages = tokens.map((to) => ({ to, title, body, data, channelId: CHANNEL_ID, sound: "default", priority: "high" }));
   for (let i = 0; i < messages.length; i += EXPO_MAX_BATCH) {
     const batch = messages.slice(i, i + EXPO_MAX_BATCH);
@@ -116,18 +120,19 @@ async function sendExpo(tokens, { title, body, data }) {
     const payload = await res.json().catch(() => null);
     if (!res.ok || !payload || !Array.isArray(payload.data)) {
       console.error("[push] Expo push request failed", res.status, payload && payload.errors);
-      continue;
+      continue; // this whole batch counts as failed (sent is only incremented for accepted tickets)
     }
 
     // Tickets come back in message order.
     const dead = [];
     payload.data.forEach((ticket, idx) => {
-      if (ticket.status !== "error") return;
+      if (ticket.status !== "error") { sent += 1; return; }
       if (ticket.details && ticket.details.error === "DeviceNotRegistered") dead.push(batch[idx].to);
       else console.error("[push] Expo ticket error", ticket.message);
     });
     await deleteTokens(dead);
   }
+  return { sent, failed: tokens.length - sent };
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +181,28 @@ async function sendPromoBroadcast(customerIds, { title, body, data = {} }) {
 }
 
 /**
+ * Pushes one notification to every device of the given customers and reports how it went.
+ * No opt-out filtering here — the caller decides who is targeted (see campaign.service.js).
+ * Returns { devices, sent, failed } where sent/failed count device pushes accepted / rejected.
+ * Throws if FCM authentication itself fails, so a campaign can be marked failed instead of "sent to 0".
+ */
+async function sendToCustomerDevices(customerIds, { title, body, data = {} }) {
+  if (!customerIds.length) return { devices: 0, sent: 0, failed: 0 };
+  const tokens = [];
+  for (let i = 0; i < customerIds.length; i += 1000) {
+    const rows = await db("device_tokens").where({ owner_type: "customer" }).whereIn("owner_id", customerIds.slice(i, i + 1000)).select("token");
+    for (const r of rows) tokens.push(r.token);
+  }
+  const unique = [...new Set(tokens)];
+  const notification = { title, body, data };
+  const [fcm, expo] = await Promise.all([
+    sendFcm(unique.filter((t) => !isExpoToken(t)), notification),
+    sendExpo(unique.filter(isExpoToken), notification),
+  ]);
+  return { devices: unique.length, sent: fcm.sent + expo.sent, failed: fcm.failed + expo.failed };
+}
+
+/**
  * Send one notification to every device registered to an account.
  * @param {'customer'|'restaurant'|'rider'} ownerType
  * @param {number} ownerId
@@ -205,4 +232,4 @@ function notifyLater(job) {
   });
 }
 
-module.exports = { sendToOwner, notifyLater, CHANNEL_ID, promoOptIn, sendPromoBroadcast };
+module.exports = { sendToOwner, notifyLater, CHANNEL_ID, promoOptIn, sendPromoBroadcast, sendToCustomerDevices };
