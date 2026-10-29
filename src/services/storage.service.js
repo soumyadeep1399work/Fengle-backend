@@ -121,6 +121,15 @@ async function saveAgreementSelfie(buffer, ext) {
  * from a request path param at read time), so there's no path-traversal
  * surface here despite the plain path.join.
  */
+/**
+ * True when an S3 error just means "that key isn't there". Without s3:ListBucket a missing key is a 403, and a HeadObject has no
+ * response body, so the SDK can't name the error ("Unknown"/"Forbidden"): the HTTP status is the only reliable signal.
+ */
+function isMissingKeyError(err) {
+  const status = err && err.$metadata && err.$metadata.httpStatusCode;
+  return ["NoSuchKey", "NotFound", "AccessDenied", "Forbidden"].includes(err && err.name) || status === 403 || status === 404;
+}
+
 async function readAgreementSelfie(storedPath) {
   const ext = path.extname(storedPath).slice(1);
   const contentType = CONTENT_TYPE[ext] || "application/octet-stream";
@@ -135,8 +144,8 @@ async function readAgreementSelfie(storedPath) {
         const buffer = await getS3Object(bucket, storedPath);
         return { buffer, contentType };
       } catch (err) {
-        // Without s3:ListBucket a missing key answers AccessDenied rather than NoSuchKey.
-        if (!["NoSuchKey", "AccessDenied", "NotFound"].includes(err.name)) throw err;
+        // Without s3:ListBucket a missing key answers AccessDenied (or a bare 403) rather than NoSuchKey.
+        if (!isMissingKeyError(err)) throw err;
         lastErr = err;
       }
     }
@@ -208,6 +217,6 @@ async function getS3Object(bucket, key) {
 }
 
 module.exports = {
-  UPLOAD_DIR, detectImageType, saveImage, saveAgreementSelfie, readAgreementSelfie, getS3Client, getS3Object,
+  UPLOAD_DIR, detectImageType, saveImage, saveAgreementSelfie, readAgreementSelfie, getS3Client, getS3Object, isMissingKeyError,
   detectDocumentType, savePartnerDocument, readPartnerDocument,
 };

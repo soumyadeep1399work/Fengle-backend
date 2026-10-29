@@ -3225,6 +3225,14 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 47: S3 'missing key' detection (bare 403/404 from a HEAD without s3:ListBucket) ---");
+  {
+    const { isMissingKeyError } = require("./src/services/storage.service");
+    check("a named NoSuchKey / NotFound / AccessDenied / Forbidden counts as missing", ["NoSuchKey", "NotFound", "AccessDenied", "Forbidden"].every((name) => isMissingKeyError({ name })));
+    check("a HEAD on a missing key without s3:ListBucket (name 'Unknown', bare 403 or 404) counts as missing", isMissingKeyError({ name: "Unknown", $metadata: { httpStatusCode: 403 } }) && isMissingKeyError({ name: "Unknown", $metadata: { httpStatusCode: 404 } }));
+    check("real failures are NOT swallowed: a 500, a throttle, a network error, undefined", !isMissingKeyError({ name: "InternalError", $metadata: { httpStatusCode: 500 } }) && !isMissingKeyError({ name: "SlowDown", $metadata: { httpStatusCode: 503 } }) && !isMissingKeyError(new Error("socket hang up")) && !isMissingKeyError(undefined));
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

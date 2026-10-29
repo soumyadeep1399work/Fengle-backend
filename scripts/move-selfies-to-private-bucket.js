@@ -10,7 +10,7 @@
 // Run with NODE_ENV=production on the server (it uses the EC2 role, no keys).
 require("dotenv").config();
 const db = require("../src/config/db");
-const { getS3Client, getS3Object } = require("../src/services/storage.service");
+const { getS3Client, getS3Object, isMissingKeyError } = require("../src/services/storage.service");
 
 async function main() {
   const publicBucket = process.env.AWS_S3_BUCKET;
@@ -37,14 +37,15 @@ async function main() {
       try {
         privateSize = (await s3.send(new HeadObjectCommand({ Bucket: privateBucket, Key: row.key }))).ContentLength;
       } catch (err) {
-        if (!["NotFound", "NoSuchKey", "AccessDenied", "Forbidden"].includes(err.name)) throw err;
+        // Without s3:ListBucket a HEAD on a missing key is a bare 403 with no body (err.name "Unknown"), so go by the HTTP status too.
+        if (!isMissingKeyError(err)) throw err;
       }
 
       let publicBody = null;
       try {
         publicBody = await getS3Object(publicBucket, row.key);
       } catch (err) {
-        if (!["NoSuchKey", "AccessDenied", "NotFound"].includes(err.name)) throw err;
+        if (!isMissingKeyError(err)) throw err;
       }
 
       if (privateSize == null) {
