@@ -577,6 +577,14 @@ Riders add their bank account (and optionally a UPI id) in the Rider app so admi
 - **Admin**: `GET /admin/riders/:id` gains `bank_account` — for **super_admin and ops** (who pay riders) `{ account_holder_name, account_number (FULL), account_number_last4, ifsc, bank_name, upi_id, updated_at }`; for **support** the masked form (no `account_number` key). If a stored number can't be decrypted (lost/rotated key) it reads `account_number: null` with `account_number_unavailable: true` and the masked fields still work. `bank_account_history: [{ id, action: create|update, changed_by: "rider", before: {account_holder_name, account_number_last4, ifsc, upi_id} | null, after: {...}, created_at }]` (newest first; every admin role, no full numbers). `GET /admin/riders` rows gain `has_bank_account`. Admin reads of the full number are **not** audited in v1.
 - **Ops note**: set `BANK_DATA_KEY` in the server `.env` before use (`openssl rand -hex 32`) and **back it up** — without it saved account numbers can't be read back.
 
+### Kitchen payout account (added 2026-10-30)
+
+The kitchen equivalent, so admins can pay the vendor-cost settlement. Same secret handling, validation and messages as the rider account above (shared code: `services/restaurantBank.service.js` reuses `riderBank.service.js`'s crypto/validation).
+
+- **Store**: `restaurant_bank_accounts` (one current account per kitchen) + `restaurant_bank_account_history` (append-only, last-4s only). Same `BANK_DATA_KEY`, no plaintext fallback (503 `bank_details_unavailable`).
+- **Kitchen** (restaurant token, **behind the verification gate** — unlike `GET /restaurants/me`, this route is not `allowUnverified`): `PUT /restaurants/me/bank-account { account_holder_name, account_number, ifsc, bank_name?, upi_id? }` → **200 `{ restaurant }`** (exactly the `GET /restaurants/me` shape). `GET /restaurants/me` carries `bank_account: null | { account_holder_name, account_number_last4, ifsc, bank_name, upi_id, updated_at }` — masked, never the full number. Identical resubmit = 200, no history row. **Changing an existing account** writes a history row and pushes the kitchen ("Payout account updated", `data.type: "bank_account_updated"`).
+- **Admin**: `GET /admin/restaurants/:id` gains `bank_account` (full `account_number` for **super_admin and ops**, masked for **support**; `account_number_unavailable: true` when it can't be decrypted) and `bank_account_history[]` (newest first: `{ id, action, changed_by, before, after, created_at }`, last-4s only). `GET /admin/restaurants` rows gain `has_bank_account`. Admin reads are not audited.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**

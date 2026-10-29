@@ -172,6 +172,9 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   the masked form; every change lands in `rider_bank_account_history` (last-4s,
   never the full number) and pushes the rider. Never log or return the full number
   elsewhere (`services/riderBank.service.js` is the only place that decrypts).
+  Kitchens have the same thing (2026-10-30): `PUT /restaurants/me/bank-account`,
+  `restaurant_bank_accounts` + history, `GET /admin/restaurants/:id` — all via
+  `services/restaurantBank.service.js`, which reuses the rider module's crypto.
 - **Rider online state is the server's** (2026-10-30): `riders.status` is what
   auto-assignment uses, so it must match what the rider sees. A new rider starts
   `inactive` (offline); `POST /auth/logout` sets an `active` rider `inactive`;

@@ -8,6 +8,7 @@ const { portionLabel } = require("../utils/portion");
 const { presentPricing } = require("../utils/pricing");
 const { reviewPartner } = require("../services/partnerVerification.service");
 const partnerDocuments = require("../services/partnerDocuments.service");
+const restaurantBank = require("../services/restaurantBank.service");
 
 // Never password_hash — every admin-facing restaurant read goes through this
 // column list rather than select("*")/first() on the raw table.
@@ -68,6 +69,7 @@ async function listRestaurants(req, res) {
     .select(
       ...RESTAURANT_PUBLIC_COLUMNS, "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion",
       db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie"),
+      db.raw("EXISTS (SELECT 1 FROM restaurant_bank_accounts b WHERE b.restaurant_id = restaurants.id) as has_bank_account"),
       "verification_status as verificationStatus", "verification_denied_reason as verificationDeniedReason", "verification_reviewed_at as verificationReviewedAt"
     )
     .orderBy("name")
@@ -81,7 +83,7 @@ async function listRestaurants(req, res) {
 
   res.json({
     restaurants: restaurants.map((r) => ({
-      ...r, hasAgreementSelfie: !!r.hasAgreementSelfie, order_count: orderCountById[r.id] || 0, documents: docSummaries.get(Number(r.id)),
+      ...r, hasAgreementSelfie: !!r.hasAgreementSelfie, has_bank_account: !!r.has_bank_account, order_count: orderCountById[r.id] || 0, documents: docSummaries.get(Number(r.id)),
     })),
     page, limit, total: Number(total),
   });
@@ -180,12 +182,19 @@ async function getRestaurantDetail(req, res) {
 
   const commissionHistory = await db("commission_config_history").where({ restaurant_id: id }).orderBy("created_at", "desc");
 
+  // Payout account: super_admin / ops (who pay the settlement) get the full number, support only the masked form.
+  const bankRow = await restaurantBank.getRow(db, id);
+  const bank_account = req.auth && req.auth.role === "support" ? restaurantBank.presentMasked(bankRow) : restaurantBank.presentFull(bankRow);
+  const bank_account_history = await restaurantBank.historyFor(db, id);
+
   res.json({
     restaurant,
     categories,
     order_count: Number(orderCount),
     rating: { avg: ratingRow.avg != null ? Number(Number(ratingRow.avg).toFixed(1)) : null, count: Number(ratingRow.n) },
     commission_config_history: commissionHistory,
+    bank_account,
+    bank_account_history,
   });
 }
 
@@ -220,8 +229,26 @@ async function getMyRestaurant(req, res) {
       verificationDeniedReason: restaurant.verification_denied_reason,
       documents: (await partnerDocuments.summariesFor("restaurant", [restaurant.id])).get(restaurant.id),
       documentsPortalUrl: partnerDocuments.PORTAL_URL,
+      bank_account: restaurantBank.presentMasked(await restaurantBank.getRow(db, restaurant.id)),
     },
   });
+}
+
+/**
+ * PUT /restaurants/me/bank-account — the kitchen's payout account (the whole form each time). Responds with the GET /restaurants/me
+ * shape, whose bank_account carries only the last 4 digits. 503 bank_details_unavailable if the server has no encryption key
+ * (nothing is stored in plaintext). Behind the verification gate.
+ */
+async function putMyBankAccount(req, res) {
+  const v = restaurantBank.validateInput(req.body);
+  if (v.error) return res.status(400).json({ error: v.error });
+  try {
+    await restaurantBank.saveForRestaurant(req.auth.id, v.value);
+  } catch (err) {
+    if (err instanceof restaurantBank.BankError) return res.status(err.status).json({ error: err.message, code: err.code });
+    throw err;
+  }
+  return getMyRestaurant(req, res);
 }
 
 /**
@@ -489,6 +516,6 @@ async function addMyCategory(req, res) {
 
 module.exports = {
   onboardRestaurant, listRestaurants, updateRestaurant, addRestaurantCategory, removeRestaurantCategory, getRestaurantDetail,
-  getMyRestaurant, getMyMenu, getCategoryOptions, addMyCategory,
+  getMyRestaurant, putMyBankAccount, getMyMenu, getCategoryOptions, addMyCategory,
   acceptRestaurantAgreement, getRestaurantAgreementSelfie, reviewRestaurantVerification,
 };

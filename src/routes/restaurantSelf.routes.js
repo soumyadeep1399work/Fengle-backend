@@ -10,6 +10,7 @@ const router = express.Router();
 // PATCH /restaurants/:restaurantId/items/:itemId/availability, lives in
 // catalog.routes.js and is a different method/depth, so there's no clash.)
 router.get("/me", requireAuth(["restaurant"], { allowUnverified: true }), restaurantController.getMyRestaurant);
+router.put("/me/bank-account", requireAuth(["restaurant"]), restaurantController.putMyBankAccount);
 router.get("/me/menu", requireAuth(["restaurant"]), restaurantController.getMyMenu);
 router.get("/me/category-options", requireAuth(["restaurant"]), restaurantController.getCategoryOptions);
 router.post("/me/categories", requireAuth(["restaurant"]), restaurantController.addMyCategory);
