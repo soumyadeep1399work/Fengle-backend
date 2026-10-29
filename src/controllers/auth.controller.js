@@ -12,18 +12,38 @@ const PURPOSE_TABLE = {
   rider_login: "riders",
 };
 
+const RESTAURANT_NOT_REGISTERED = "This number is not registered as a partner restaurant. Please contact admin for onboarding.";
+const NO_PARTNER_ACCOUNT = "No partner account uses this number. Sign up in the Fengle Rider app first, or contact Fengle.";
+const ACCOUNT_SUSPENDED = "Your account has been suspended. Contact support.";
+
 /**
  * POST /auth/otp/request
- * body: { phone, purpose }
+ * body: { phone, purpose, existing_only? }
+ *
+ * A number that can't log in gets no SMS (saves the cost and the confusing wait for a code that never works):
+ *  - restaurant_login: no restaurants row -> 404, a suspended kitchen -> 403.
+ *  - rider_login: riders are self-serve (the first OTP creates the account), so an unknown number is still sent a
+ *    code UNLESS the caller sends existing_only: true (the partner portal does), then 404. A suspended rider -> 403.
+ *  - customer login/signup: unchanged.
+ * Same wording as verify. Rejected requests insert no otp_verifications row. This does reveal whether a number is a
+ * registered kitchen (accepted trade-off). Demo phones follow the same rules: a demo number that isn't a restaurant can't
+ * request restaurant_login.
  */
 async function requestOtp(req, res) {
-  const { phone, purpose = "login" } = req.body;
+  const { phone, purpose = "login", existing_only: existingOnly } = req.body;
 
   if (!phone || !/^\d{10}$/.test(phone)) {
     return res.status(400).json({ error: "A valid 10-digit phone number is required" });
   }
   if (!PURPOSE_TABLE[purpose]) {
     return res.status(400).json({ error: "Invalid purpose" });
+  }
+
+  if (purpose === "restaurant_login" || purpose === "rider_login") {
+    const partner = await db(PURPOSE_TABLE[purpose]).where({ phone }).select("status").first();
+    if (!partner && purpose === "restaurant_login") return res.status(404).json({ error: RESTAURANT_NOT_REGISTERED });
+    if (!partner && existingOnly === true) return res.status(404).json({ error: NO_PARTNER_ACCOUNT });
+    if (partner && partner.status === "suspended") return res.status(403).json({ error: ACCOUNT_SUSPENDED });
   }
 
   const demoOtp = demoOtpFor(phone);
@@ -98,13 +118,13 @@ async function verifyOtp(req, res) {
     // Restaurants are manually onboarded via Admin Panel only (confirmed business rule) —
     // an OTP verifying successfully for an unknown restaurant phone means it hasn't been
     // onboarded yet, not that we should create one on the fly.
-    return res.status(404).json({ error: "This number is not registered as a partner restaurant. Please contact admin for onboarding." });
+    return res.status(404).json({ error: RESTAURANT_NOT_REGISTERED });
   }
 
   if (!userRow && existingOnly === true) {
     // The partner document portal (partner.fengle.in) logs in existing partners only —
     // rider self-signup stays in the Rider app, where the profile + selfie steps are.
-    return res.status(404).json({ error: "No partner account uses this number. Sign up in the Fengle Rider app first, or contact Fengle." });
+    return res.status(404).json({ error: NO_PARTNER_ACCOUNT });
   }
 
   if (!userRow) {
@@ -120,7 +140,7 @@ async function verifyOtp(req, res) {
   // OTP itself is still consumed above — it just doesn't buy a session.
   const isBlocked = userType === "customer" ? userRow.status === "blocked" : userRow.status === "suspended";
   if (isBlocked) {
-    return res.status(403).json({ error: "Your account has been suspended. Contact support." });
+    return res.status(403).json({ error: ACCOUNT_SUSPENDED });
   }
 
   const token = signToken({ id: userRow.id, type: userType });

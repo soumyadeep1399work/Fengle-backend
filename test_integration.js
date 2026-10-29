@@ -2728,6 +2728,70 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 43: POST /auth/otp/request refuses numbers that can't log in (no SMS, no OTP row) ---");
+  {
+    const authCtl = require("./src/controllers/auth.controller");
+    const savedDemo = { otp: process.env.DEMO_LOGIN_OTP, phones: process.env.DEMO_LOGIN_PHONES };
+    const request = async (body) => { const r = fakeRes(); await authCtl.requestOtp(fakeReq(body, {}, null), r); return r; };
+    const otpRows = async (phone, purpose) => (await db("otp_verifications").where({ phone, purpose })).length;
+    const RESTAURANT_MSG = "This number is not registered as a partner restaurant. Please contact admin for onboarding.";
+    const RIDER_MSG = "No partner account uses this number. Sign up in the Fengle Rider app first, or contact Fengle.";
+    try {
+      // ---- kitchens
+      const unknownK = await request({ phone: "7000004301", purpose: "restaurant_login" });
+      check("restaurant_login for an unknown number -> 404 with verify's wording", unknownK.statusCode === 404 && unknownK.body.error === RESTAURANT_MSG);
+      check("...and no OTP row was created (so no SMS was sent)", (await otpRows("7000004301", "restaurant_login")) === 0);
+      await db("restaurants").insert({ name: "OTP Kitchen", phone: "7000004302", address: "x", lat: 22.58, lng: 88.46, status: "active" });
+      const knownK = await request({ phone: "7000004302", purpose: "restaurant_login" });
+      check("restaurant_login for a registered kitchen -> OTP sent as before (200 + a row)", knownK.statusCode === undefined && knownK.body.message === "OTP sent" && (await otpRows("7000004302", "restaurant_login")) === 1);
+      await db("restaurants").insert({ name: "OTP Suspended Kitchen", phone: "7000004303", address: "x", lat: 22.58, lng: 88.46, status: "suspended" });
+      const suspendedK = await request({ phone: "7000004303", purpose: "restaurant_login" });
+      check("a suspended kitchen -> 403 with verify's wording, no row", suspendedK.statusCode === 403 && suspendedK.body.error === "Your account has been suspended. Contact support." && (await otpRows("7000004303", "restaurant_login")) === 0);
+      check("an inactive (paused) kitchen can still log in (only suspension blocks)", (await (async () => { await db("restaurants").insert({ name: "OTP Paused Kitchen", phone: "7000004304", address: "x", lat: 22.58, lng: 88.46, status: "inactive" }); return (await request({ phone: "7000004304", purpose: "restaurant_login" })).statusCode === undefined; })()));
+
+      // ---- riders: self-serve by default, existing-only on request
+      const newRider = await request({ phone: "7000004311", purpose: "rider_login" });
+      check("rider_login for an unknown number WITHOUT the flag is unchanged: code sent (signup stays possible)", newRider.statusCode === undefined && (await otpRows("7000004311", "rider_login")) === 1);
+      const unknownR = await request({ phone: "7000004312", purpose: "rider_login", existing_only: true });
+      check("rider_login + existing_only for an unknown number -> 404 with verify's wording, no row", unknownR.statusCode === 404 && unknownR.body.error === RIDER_MSG && (await otpRows("7000004312", "rider_login")) === 0);
+      await db("riders").insert({ name: "OTP Rider", phone: "7000004313", status: "active", wallet_balance: 0 });
+      check("rider_login + existing_only for a known rider -> sent", (await request({ phone: "7000004313", purpose: "rider_login", existing_only: true })).body.message === "OTP sent");
+      await db("riders").insert({ name: "OTP Suspended Rider", phone: "7000004314", status: "suspended", wallet_balance: 0 });
+      check("a suspended rider -> 403, no row (with or without the flag)",
+        (await request({ phone: "7000004314", purpose: "rider_login" })).statusCode === 403 && (await request({ phone: "7000004314", purpose: "rider_login", existing_only: true })).statusCode === 403 && (await otpRows("7000004314", "rider_login")) === 0);
+      check("existing_only only counts when it is the boolean true (a string 'true' behaves like the default)", (await request({ phone: "7000004315", purpose: "rider_login", existing_only: "true" })).statusCode === undefined);
+
+      // ---- customers unchanged
+      check("customer login for a brand-new number is unchanged: code sent", (await request({ phone: "7000004321", purpose: "login" })).body.message === "OTP sent" && (await otpRows("7000004321", "login")) === 1);
+
+      // ---- demo numbers follow the same rules (the Play-review demo logins must keep working)
+      process.env.DEMO_LOGIN_OTP = "123456";
+      process.env.DEMO_LOGIN_PHONES = "7000004331,7000004332,7000004333";
+      const demoNotKitchen = await request({ phone: "7000004331", purpose: "restaurant_login" });
+      check("a demo number that is NOT a registered kitchen can't request restaurant_login (404, no row)", demoNotKitchen.statusCode === 404 && (await otpRows("7000004331", "restaurant_login")) === 0);
+      await db("restaurants").insert({ name: "Demo Kitchen", phone: "7000004332", address: "x", lat: 22.58, lng: 88.46, status: "active" });
+      const demoKitchen = await request({ phone: "7000004332", purpose: "restaurant_login" });
+      check("a demo number that IS a registered kitchen still works", demoKitchen.statusCode === undefined && demoKitchen.body.message === "OTP sent");
+      const row = await db("otp_verifications").where({ phone: "7000004332", purpose: "restaurant_login" }).first();
+      check("...and its code is the fixed demo code (verifies with 123456)", await require("./src/utils/otp").verifyOtpHash("123456", row.otp_hash));
+      const verifyRes = fakeRes();
+      await authCtl.verifyOtp(fakeReq({ phone: "7000004332", otp: "123456", purpose: "restaurant_login" }, {}, null), verifyRes);
+      check("the demo kitchen logs in end to end (verify returns a token)", typeof verifyRes.body.token === "string" && verifyRes.body.user.type === "restaurant");
+      await db("riders").insert({ name: "Demo Rider", phone: "7000004333", status: "active", wallet_balance: 0 });
+      const demoRider = await request({ phone: "7000004333", purpose: "rider_login", existing_only: true });
+      check("a demo rider works with and without existing_only", demoRider.body.message === "OTP sent" && (await request({ phone: "7000004333", purpose: "rider_login" })).body.message === "OTP sent");
+      check("a demo number can still be a customer (login purpose)", (await request({ phone: "7000004331", purpose: "login" })).body.message === "OTP sent");
+
+      // ---- verify keeps its own guards (unchanged)
+      const verifyUnknown = fakeRes();
+      await authCtl.verifyOtp(fakeReq({ phone: "7000004340", otp: "000000", purpose: "restaurant_login" }, {}, null), verifyUnknown);
+      check("verify still answers 400 (no pending OTP) for a number that never requested one", verifyUnknown.statusCode === 400);
+    } finally {
+      if (savedDemo.otp === undefined) delete process.env.DEMO_LOGIN_OTP; else process.env.DEMO_LOGIN_OTP = savedDemo.otp;
+      if (savedDemo.phones === undefined) delete process.env.DEMO_LOGIN_PHONES; else process.env.DEMO_LOGIN_PHONES = savedDemo.phones;
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }
