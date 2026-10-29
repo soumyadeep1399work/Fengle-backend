@@ -131,7 +131,7 @@ async function verifyOtp(req, res) {
     // Self-serve signup: first successful OTP verification creates the account.
     // Applies to customers and riders (confirmed: rider onboarding is self-serve).
     // A rider starts unverified: nothing but onboarding works until an admin approves the selfie.
-    const [id] = await db(table).insert({ phone, name: name || null, ...(table === "riders" ? { verification_status: "pending" } : {}) });
+    const [id] = await db(table).insert({ phone, name: name || null, ...(table === "riders" ? { verification_status: "pending", status: "inactive" } : {}) }); // a new rider starts OFFLINE: they go online themselves
     userRow = await db(table).where({ id }).first();
   }
 
@@ -221,6 +221,11 @@ async function getSession(req, res) {
  */
 async function logout(req, res) {
   const { device_token } = req.body;
+  // A rider who logs out is no longer reachable, so they go offline on the server too (otherwise they stay "active" and keep being
+  // picked for deliveries). Only an active rider is touched: a suspended one stays suspended. Orders already assigned are unaffected.
+  if (req.auth.type === "rider") {
+    await db("riders").where({ id: req.auth.id, status: "active" }).update({ status: "inactive" });
+  }
   if (device_token) {
     await db("device_tokens").where({ owner_type: req.auth.type, owner_id: req.auth.id, token: device_token }).delete();
   }

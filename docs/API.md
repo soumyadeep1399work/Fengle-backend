@@ -19,7 +19,7 @@ Companion Postman collection: `postman/Fengle-Backend.postman_collection.json` (
 | POST | `/auth/otp/verify` | — | `{ phone, otp, purpose, name? }` | → `{ token, user: { id, phone, name, type } }`. First verify auto-creates customer/rider accounts. `restaurant_login` for an un-onboarded phone → **404** (restaurants are admin-onboarded only). 5 attempts max (429), 5-min expiry. |
 | POST | `/auth/admin/login` | — | `{ email, password }` | → `{ token, user: { id, name, email, role, type } }`. 401 on bad credentials. |
 | GET | `/auth/session` | any | — | Validates a persisted token on app boot → `{ user }`. 401 if the token is missing/expired or the account no longer exists. |
-| POST | `/auth/logout` | any | `{ device_token? }` | JWTs are stateless — logout is the client discarding its token. This only deregisters the push `device_token` if one is sent. |
+| POST | `/auth/logout` | any | `{ device_token? }` | JWTs are stateless — logout is the client discarding its token. It deregisters the push `device_token` if one is sent, and **a rider who logs out is set `inactive` (offline) on the server** (only an `active` rider is touched; a suspended one stays suspended, and orders already assigned to them are unaffected). A **new rider** (self-signup) is created `inactive` — riders go online themselves via `PATCH /riders/me/availability`. |
 
 ### Dev-only: read the last OTP
 

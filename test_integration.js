@@ -3233,6 +3233,57 @@ async function main() {
     check("real failures are NOT swallowed: a 500, a throttle, a network error, undefined", !isMissingKeyError({ name: "InternalError", $metadata: { httpStatusCode: 500 } }) && !isMissingKeyError({ name: "SlowDown", $metadata: { httpStatusCode: 503 } }) && !isMissingKeyError(new Error("socket hang up")) && !isMissingKeyError(undefined));
   }
 
+  console.log("\n--- Test 48: a new rider starts offline; logging out takes a rider offline ---");
+  {
+    const authCtl48 = require("./src/controllers/auth.controller");
+    const saved = { otp: process.env.DEMO_LOGIN_OTP, phones: process.env.DEMO_LOGIN_PHONES };
+    try {
+      process.env.DEMO_LOGIN_OTP = "123456";
+      process.env.DEMO_LOGIN_PHONES = "7000004801";
+      const req48 = fakeRes();
+      await authCtl48.requestOtp(fakeReq({ phone: "7000004801", purpose: "rider_login" }, {}, null), req48);
+      const ver48 = fakeRes();
+      await authCtl48.verifyOtp(fakeReq({ phone: "7000004801", otp: "123456", purpose: "rider_login" }, {}, null), ver48);
+      const fresh = await db("riders").where({ phone: "7000004801" }).first();
+      check("a brand-new rider (self-signup) is created OFFLINE (status inactive), awaiting approval — they go online themselves", !!ver48.body.token && fresh.status === "inactive" && fresh.verification_status === "pending");
+      
+      const logoutAs = async (auth) => { const r = fakeRes(); await authCtl48.logout(fakeReq({}, {}, auth), r); return r; };
+      const [online] = await db("riders").insert({ name: "Online Rider", phone: "8500004801", status: "active", wallet_balance: 0 });
+      const out = await logoutAs({ id: online, type: "rider" });
+      check("logout of an ONLINE rider sets them inactive on the server", out.body.message === "Logged out" && (await db("riders").where({ id: online }).first()).status === "inactive");
+      const [suspended] = await db("riders").insert({ name: "Suspended Rider", phone: "8500004802", status: "suspended", wallet_balance: 0 });
+      await logoutAs({ id: suspended, type: "rider" });
+      check("a suspended rider stays suspended after logging out (only 'active' is touched)", (await db("riders").where({ id: suspended }).first()).status === "suspended");
+      const [alreadyOff] = await db("riders").insert({ name: "Offline Rider", phone: "8500004803", status: "inactive", wallet_balance: 0 });
+      await logoutAs({ id: alreadyOff, type: "rider" });
+      check("an already-offline rider stays offline", (await db("riders").where({ id: alreadyOff }).first()).status === "inactive");
+
+      // a customer/kitchen logout must never touch a rider row that happens to share the same numeric id
+      const [other] = await db("riders").insert({ name: "Other Rider", phone: "8500004804", status: "active", wallet_balance: 0 });
+      await logoutAs({ id: other, type: "customer" });
+      await logoutAs({ id: other, type: "restaurant" });
+      check("a customer or kitchen logout never changes a rider with the same id", (await db("riders").where({ id: other }).first()).status === "active");
+
+      // an order already assigned to the rider is untouched by their logout
+      const [custId] = await db("users").insert({ name: "Logout Customer", phone: "8000004801", wallet_balance: 0 });
+      const [oid] = await db("orders").insert({ customer_id: custId, restaurant_id: restA, rider_id: other, status: "picked_up", delivery_lat: 22.58, delivery_lng: 88.46, delivery_address: "x", item_total: 100, delivery_fee: 0, grand_total: 100, payment_method: "cod", payment_status: "pending" });
+      await logoutAs({ id: other, type: "rider" });
+      const orderAfter = await db("orders").where({ id: oid }).first();
+      check("a rider logging out mid-delivery goes offline but keeps the order assigned to them", (await db("riders").where({ id: other }).first()).status === "inactive" && orderAfter.rider_id === other && orderAfter.status === "picked_up");
+      // and an offline rider is never auto-assigned (the existing filter) — so the logout really stops new work
+      await db("riders").where({ id: online }).update({ last_known_lat: 22.5801, last_known_lng: 88.4601 });
+      const [assignOrder] = await db("orders").insert({ customer_id: custId, restaurant_id: restA, status: "accepted", delivery_lat: 22.58, delivery_lng: 88.46, delivery_address: "x", item_total: 100, delivery_fee: 0, grand_total: 100, payment_method: "cod", payment_status: "pending" });
+      const prevActive = await db("riders").where({ status: "active" }).select("id");
+      await db("riders").update({ status: "inactive" });
+      await db("riders").where({ id: online }).update({ status: "inactive" });
+      check("an offline rider is not picked by auto-assignment", (await orderController.autoAssignRider(assignOrder)) === null);
+      for (const r of prevActive) await db("riders").where({ id: r.id }).update({ status: "active" });
+    } finally {
+      if (saved.otp === undefined) delete process.env.DEMO_LOGIN_OTP; else process.env.DEMO_LOGIN_OTP = saved.otp;
+      if (saved.phones === undefined) delete process.env.DEMO_LOGIN_PHONES; else process.env.DEMO_LOGIN_PHONES = saved.phones;
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

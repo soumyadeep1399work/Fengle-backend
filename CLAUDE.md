@@ -172,6 +172,13 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   the masked form; every change lands in `rider_bank_account_history` (last-4s,
   never the full number) and pushes the rider. Never log or return the full number
   elsewhere (`services/riderBank.service.js` is the only place that decrypts).
+- **Rider online state is the server's** (2026-10-30): `riders.status` is what
+  auto-assignment uses, so it must match what the rider sees. A new rider starts
+  `inactive` (offline); `POST /auth/logout` sets an `active` rider `inactive`;
+  the only other thing that changes it is the in-app toggle
+  (`PATCH /riders/me/availability`) and admin suspension. There is deliberately
+  no location-staleness filter in auto-assignment (pings are foreground-only, so
+  a rider with a locked phone would silently stop getting orders).
 - **Wallet** is shared infrastructure for both customer refunds/credits and
   rider COD reconciliation — see `wallet_ledger` table (owner_type/owner_id
   polymorphic pattern).
