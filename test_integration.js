@@ -3118,6 +3118,113 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 46: Rider bank account — masked for the rider, encrypted at rest, history, role-based admin view ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const riderBankSvc = require("./src/services/riderBank.service");
+    const savedKey = process.env.BANK_DATA_KEY;
+    const KEY = "a1".repeat(32); // 64 hex chars = 32 bytes
+    process.env.BANK_DATA_KEY = KEY;
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const mkAdmin = async (name, role) => {
+      const [id] = await db("admins").insert({ name, email: `${name}@bank.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role });
+      return { id, token: signToken({ id, type: "admin" }) };
+    };
+    const superA = await mkAdmin("bank-super", "super_admin");
+    const opsA = await mkAdmin("bank-ops", "ops");
+    const supA = await mkAdmin("bank-support", "support");
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { Authorization: `Bearer ${token}`, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    try {
+      const [bankRider] = await db("riders").insert({ name: "Bank Rider", phone: "8500004601", status: "active", wallet_balance: 0 });
+      const [pendingRider] = await db("riders").insert({ name: "Pending Bank Rider", phone: "8500004602", status: "active", wallet_balance: 0, verification_status: "pending" });
+      const [noBankRider] = await db("riders").insert({ name: "No Bank Rider", phone: "8500004603", status: "active", wallet_balance: 0 });
+      const riderTok = signToken({ id: bankRider, type: "rider" });
+      const pendingTok = signToken({ id: pendingRider, type: "rider" });
+      const put = (body, tok = riderTok) => call(tok, "PUT", "/riders/me/bank-account", body);
+      const good = { account_holder_name: "Asha Rider", account_number: "123456789012", ifsc: "HDFC0001234", bank_name: "HDFC Bank", upi_id: "asha@okhdfc" };
+
+      // ---- who may call it
+      check("an unapproved (pending) rider is behind the verification gate: 403 verification_required", (await put(good, pendingTok)).body.code === "verification_required");
+      check("a customer or kitchen token can't use it (403)", (await put(good, signToken({ id: 1, type: "customer" }))).status === 403 && (await put(good, signToken({ id: restA, type: "restaurant" }))).status === 403);
+      check("no token -> 401", (await fetch(base + "/riders/me/bank-account", { method: "PUT" })).status === 401);
+
+      // ---- before anything is saved
+      const before = await call(riderTok, "GET", "/riders/me");
+      check("GET /riders/me has bank_account: null until a rider saves one", before.status === 200 && before.body.rider.bank_account === null);
+
+      // ---- validation
+      const invalid = [
+        { ...good, account_holder_name: "A" }, { ...good, account_holder_name: "x".repeat(101) }, { ...good, account_holder_name: undefined },
+        { ...good, account_number: "12345678" }, { ...good, account_number: "1234567890123456789" }, { ...good, account_number: "12345abc9012" }, { ...good, account_number: undefined },
+        { ...good, ifsc: "HDFC1001234" }, { ...good, ifsc: "HDF0001234" }, { ...good, ifsc: "" },
+        { ...good, bank_name: "b".repeat(101) }, { ...good, upi_id: "asha" }, { ...good, upi_id: "a@b" }, { ...good, upi_id: "@okhdfc" },
+      ];
+      const results = await Promise.all(invalid.map((b) => put(b)));
+      check("validation: short/long holder or missing, account number of 8 / 19 digits / with letters / missing, bad IFSC, long bank name, bad UPI -> all 400 with a readable error",
+        results.every((r) => r.status === 400 && typeof r.body.error === "string" && r.body.error.length > 5));
+      check("nothing was stored by the refused attempts", (await db("rider_bank_accounts").where({ rider_id: bankRider }).count({ n: "*" }).first()).n === 0);
+
+      // ---- saving
+      const saved = await put({ ...good, account_number: "1234 5678-9012", ifsc: " hdfc0001234 " });
+      check("PUT -> 200 { rider } with the masked account (last 4, IFSC uppercased, spaces/hyphens in the number stripped)",
+        saved.status === 200 && saved.body.rider.id === bankRider && saved.body.rider.bank_account.account_number_last4 === "9012" && saved.body.rider.bank_account.ifsc === "HDFC0001234" && saved.body.rider.bank_account.account_holder_name === "Asha Rider" && saved.body.rider.bank_account.upi_id === "asha@okhdfc" && !!saved.body.rider.bank_account.updated_at);
+      check("the rider's responses NEVER contain the full account number (PUT, GET /riders/me, PATCH /riders/me)",
+        !saved.text.includes("123456789012") && !(await call(riderTok, "GET", "/riders/me")).text.includes("123456789012") && !(await call(riderTok, "PATCH", "/riders/me", { name: "Bank Rider" })).text.includes("123456789012") && !("account_number" in saved.body.rider.bank_account));
+      check("GET /riders/me returns the same masked bank_account", JSON.stringify((await call(riderTok, "GET", "/riders/me")).body.rider.bank_account) === JSON.stringify(saved.body.rider.bank_account));
+      const row = await db("rider_bank_accounts").where({ rider_id: bankRider }).first();
+      check("at rest: the number is encrypted (not the digits, not containing them), only the last 4 are in the clear, and it decrypts back", row.account_number_enc !== "123456789012" && !row.account_number_enc.includes("123456789012") && row.account_number_last4 === "9012" && riderBankSvc.decrypt(row.account_number_enc) === "123456789012" && row.account_number_enc.split(".").length === 3);
+      check("encrypting the same number twice gives different ciphertext (random IV)", riderBankSvc.encrypt("123456789012") !== riderBankSvc.encrypt("123456789012"));
+
+      // ---- idempotent resubmit, changes, optional fields
+      const historyCount = async () => (await db("rider_bank_account_history").where({ rider_id: bankRider })).length;
+      check("the first save wrote one history row (create)", (await historyCount()) === 1);
+      const same = await put(good);
+      check("an identical resubmit is 200 and writes no history", same.status === 200 && (await historyCount()) === 1);
+      const changed = await put({ ...good, account_number: "999988887777", ifsc: "SBIN0000456", bank_name: null, upi_id: null });
+      check("a changed account is saved (new last4 / IFSC), optional fields cleared by null, and an 'update' history row is written",
+        changed.body.rider.bank_account.account_number_last4 === "7777" && changed.body.rider.bank_account.ifsc === "SBIN0000456" && changed.body.rider.bank_account.bank_name === null && changed.body.rider.bank_account.upi_id === null && (await historyCount()) === 2);
+      const emptyStr = await put({ ...good, account_number: "999988887777", ifsc: "SBIN0000456", bank_name: "", upi_id: "" });
+      check("empty strings for the optional fields mean null too (and that is an identical account: no new history)", emptyStr.status === 200 && emptyStr.body.rider.bank_account.bank_name === null && (await historyCount()) === 2);
+
+      // ---- a missing/lost key refuses to store plaintext
+      delete process.env.BANK_DATA_KEY;
+      const noKey = await put({ ...good, account_number: "555566667777" });
+      check("without BANK_DATA_KEY a save is refused: 503 bank_details_unavailable, nothing stored in plaintext, the previous account intact", noKey.status === 503 && noKey.body.code === "bank_details_unavailable" && (await db("rider_bank_accounts").where({ rider_id: bankRider }).first()).account_number_last4 === "7777");
+      process.env.BANK_DATA_KEY = KEY;
+
+      // ---- admin view
+      const adminOf = (who) => call(who.token, "GET", `/admin/riders/${bankRider}`);
+      const asSuper = await adminOf(superA), asOps = await adminOf(opsA), asSupport = await adminOf(supA);
+      check("super_admin and ops see the FULL account number, IFSC, holder and updated_at", [asSuper, asOps].every((r) => r.status === 200 && r.body.bank_account.account_number === "999988887777" && r.body.bank_account.ifsc === "SBIN0000456" && r.body.bank_account.account_number_last4 === "7777" && !!r.body.bank_account.updated_at));
+      check("support gets the masked form only (no account_number key, and the full number appears nowhere in the response)", asSupport.status === 200 && asSupport.body.bank_account.account_number_last4 === "7777" && !("account_number" in asSupport.body.bank_account) && !asSupport.text.includes("999988887777"));
+      const hist = asSuper.body.bank_account_history;
+      check("bank_account_history: newest first, a create then an update, with before/after last-4s, IFSC and who changed it", hist.length === 2 && hist[0].action === "update" && hist[0].before.account_number_last4 === "9012" && hist[0].after.account_number_last4 === "7777" && hist[0].after.ifsc === "SBIN0000456" && hist[0].changed_by === "rider" && hist[1].action === "create" && hist[1].before === null && hist[1].after.account_number_last4 === "9012");
+      check("the history (visible to every admin role, support included) holds no full account number", !JSON.stringify(hist).includes("123456789012") && !JSON.stringify(hist).includes("999988887777") && JSON.stringify(asSupport.body.bank_account_history) === JSON.stringify(hist));
+      check("a rider with no account reads bank_account null and an empty history", (await call(superA.token, "GET", `/admin/riders/${noBankRider}`)).body.bank_account === null && (await call(superA.token, "GET", `/admin/riders/${noBankRider}`)).body.bank_account_history.length === 0);
+      const list = await call(opsA.token, "GET", "/admin/riders?limit=200");
+      check("GET /admin/riders rows carry has_bank_account (true for this rider, false for the others) and never the account", list.body.riders.find((r) => r.id === bankRider).has_bank_account === true && list.body.riders.find((r) => r.id === noBankRider).has_bank_account === false && !list.text.includes("999988887777") && !list.text.includes("account_number"));
+
+      // ---- a lost/rotated key must not crash a read
+      process.env.BANK_DATA_KEY = "b2".repeat(32);
+      const wrongKey = await adminOf(superA);
+      check("with the wrong key the admin read still works: account_number null + account_number_unavailable, masked fields intact", wrongKey.status === 200 && wrongKey.body.bank_account.account_number === null && wrongKey.body.bank_account.account_number_unavailable === true && wrongKey.body.bank_account.account_number_last4 === "7777");
+      process.env.BANK_DATA_KEY = KEY;
+    } finally {
+      if (savedKey === undefined) delete process.env.BANK_DATA_KEY; else process.env.BANK_DATA_KEY = savedKey;
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@bank.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

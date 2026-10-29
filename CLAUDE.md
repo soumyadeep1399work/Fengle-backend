@@ -164,6 +164,14 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   `shipping_history`. `PUT /admin/settings/rider-pay` is retired (410). Customers,
   kitchens and riders never see `delivery_fee_breakdown`. Any new place that
   prices a delivery must call the engine, not recompute.
+- **Rider payout accounts are secrets** (2026-10-29): a rider saves bank
+  account + IFSC (+ optional UPI) via `PUT /riders/me/bank-account`; the number is
+  AES-256-GCM encrypted at rest (`BANK_DATA_KEY`, no plaintext fallback — 503
+  without it) and the rider's own responses only ever carry the **last 4 digits**.
+  super_admin and ops see the full number on `GET /admin/riders/:id`, support only
+  the masked form; every change lands in `rider_bank_account_history` (last-4s,
+  never the full number) and pushes the rider. Never log or return the full number
+  elsewhere (`services/riderBank.service.js` is the only place that decrypts).
 - **Wallet** is shared infrastructure for both customer refunds/credits and
   rider COD reconciliation — see `wallet_ledger` table (owner_type/owner_id
   polymorphic pattern).

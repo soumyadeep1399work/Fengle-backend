@@ -1,5 +1,6 @@
 const db = require("../config/db");
 const riderPay = require("../services/riderPay.service");
+const riderBank = require("../services/riderBank.service");
 const { CURRENT_AGREEMENT_VERSION, agreementRequired } = require("../utils/agreement");
 const storage = require("../services/storage.service");
 const partnerDocuments = require("../services/partnerDocuments.service");
@@ -51,8 +52,27 @@ async function getMyProfile(req, res) {
       verificationDeniedReason: rider.verification_denied_reason,
       documents: (await partnerDocuments.summariesFor("rider", [rider.id])).get(rider.id),
       documentsPortalUrl: partnerDocuments.PORTAL_URL,
+      // The payout account, masked: the app only ever gets the last 4 digits back.
+      bank_account: riderBank.presentMasked(await riderBank.getRow(db, rider.id)),
     },
   });
+}
+
+/**
+ * PUT /riders/me/bank-account { account_holder_name, account_number, ifsc, bank_name?, upi_id? } -> 200 { rider } (the GET /riders/me
+ * shape, with the masked bank_account). The whole form is sent each time. 400 { error } with a readable message on bad input; 503
+ * bank_details_unavailable if the server has no encryption key (nothing is stored in plaintext). Behind the verification gate.
+ */
+async function putBankAccount(req, res) {
+  const v = riderBank.validateInput(req.body);
+  if (v.error) return res.status(400).json({ error: v.error });
+  try {
+    await riderBank.saveForRider(req.auth.id, v.value);
+  } catch (err) {
+    if (err instanceof riderBank.BankError) return res.status(err.status).json({ error: err.message, code: err.code });
+    throw err;
+  }
+  return getMyProfile(req, res);
 }
 
 /**
@@ -180,4 +200,4 @@ async function getMyAssignedOrders(req, res) {
   res.json({ orders });
 }
 
-module.exports = { getMyProfile, updateMyProfile, getMyRate, setAvailability, updateLocation, getMyAssignedOrders, acceptRiderAgreement };
+module.exports = { getMyProfile, putBankAccount, updateMyProfile, getMyRate, setAvailability, updateLocation, getMyAssignedOrders, acceptRiderAgreement };

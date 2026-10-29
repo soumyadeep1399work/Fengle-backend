@@ -3,6 +3,7 @@ const settlement = require("../services/settlement.service");
 const { paginationParams } = require("../utils/pagination");
 const { listOrdersForOwner } = require("./adminOrders.controller");
 const storage = require("../services/storage.service");
+const riderBank = require("../services/riderBank.service");
 const { reviewPartner } = require("../services/partnerVerification.service");
 const partnerDocuments = require("../services/partnerDocuments.service");
 
@@ -56,6 +57,7 @@ async function listRiders(req, res) {
       "id", "name", "phone", "status", "wallet_balance", "vehicle_type", "vehicle_number", "updated_at", "created_at",
       "agreement_accepted_at as agreementAcceptedAt", "agreement_version as agreementVersion",
       db.raw("(agreement_selfie_path is not null) as hasAgreementSelfie"),
+      db.raw("EXISTS (SELECT 1 FROM rider_bank_accounts b WHERE b.rider_id = riders.id) as has_bank_account"),
       "verification_status as verificationStatus", "verification_denied_reason as verificationDeniedReason", "verification_reviewed_at as verificationReviewedAt"
     );
 
@@ -76,6 +78,7 @@ async function listRiders(req, res) {
       last_active_at: r.updated_at, created_at: r.created_at,
       agreementAcceptedAt: r.agreementAcceptedAt, agreementVersion: r.agreementVersion,
       hasAgreementSelfie: !!r.hasAgreementSelfie,
+      has_bank_account: !!r.has_bank_account,
       verificationStatus: r.verificationStatus, verificationDeniedReason: r.verificationDeniedReason,
       documents: docSummaries.get(Number(r.id)),
     })),
@@ -119,8 +122,15 @@ async function getRider(req, res) {
     );
   const payouts = { deliveries: Number(payoutRow.n), total_earned: Number(Number(payoutRow.total).toFixed(2)), unsettled: Number(Number(payoutRow.unsettled).toFixed(2)) };
 
+  // The payout account: the FULL number only for the roles that pay riders (super_admin, ops); support sees the masked form.
+  const bankRow = await riderBank.getRow(db, id);
+  const bank_account = req.auth && req.auth.role === "support" ? riderBank.presentMasked(bankRow) : riderBank.presentFull(bankRow);
+  const bank_account_history = await riderBank.historyFor(db, id);
+
   res.json({
     payouts,
+    bank_account,
+    bank_account_history,
     rider: {
       ...rider,
       wallet_balance: Number(rider.wallet_balance),
