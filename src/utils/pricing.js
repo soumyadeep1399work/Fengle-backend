@@ -27,8 +27,9 @@ function toIso(value) {
  */
 function presentPricing(row, now = new Date()) {
   const active = offerIsActive(row, now);
+  const { vendor_cost, ...visible } = row; // what Fengle pays a kitchen for the dish is never shown to customers or kitchens
   return {
-    ...row,
+    ...visible,
     price: row.awaiting_price ? null : Number(row.price),
     offer_price: active ? Number(row.offer_price) : null,
     offer_ends_at: active ? toIso(row.offer_ends_at) : null,
@@ -38,9 +39,18 @@ function presentPricing(row, now = new Date()) {
 }
 
 /** Admin-facing: the raw offer as stored, plus whether it is currently in force. */
+function marginOf(effectivePrice, vendorCost) {
+  if (vendorCost == null || effectivePrice == null) return { margin: null, margin_percent: null };
+  const margin = Number((Number(effectivePrice) - Number(vendorCost)).toFixed(2));
+  return { margin, margin_percent: Number(effectivePrice) > 0 ? Number(((margin / Number(effectivePrice)) * 100).toFixed(2)) : null };
+}
+
 function presentAdminPricing(row, now = new Date()) {
+  const effective = row.awaiting_price ? null : effectivePrice(row, now);
   return {
     ...row,
+    vendor_cost: row.vendor_cost == null ? null : Number(row.vendor_cost),
+    ...marginOf(effective, row.vendor_cost),
     price: row.awaiting_price ? null : Number(row.price),
     offer_price: row.offer_price == null ? null : Number(row.offer_price),
     offer_ends_at: toIso(row.offer_ends_at),
@@ -50,4 +60,4 @@ function presentAdminPricing(row, now = new Date()) {
   };
 }
 
-module.exports = { offerIsActive, effectivePrice, presentPricing, presentAdminPricing };
+module.exports = { offerIsActive, effectivePrice, presentPricing, presentAdminPricing, marginOf };

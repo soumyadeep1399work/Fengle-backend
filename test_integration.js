@@ -2322,7 +2322,7 @@ async function main() {
       check("cancelled: 1 order worth 300; in progress: 1 order worth 100", t.cancelled_orders === 1 && t.cancelled_value === 300 && t.in_progress_orders === 1 && t.in_progress_value === 100);
       check("expenses by category (marketing 500, salaries 1000) total 1500", t.expenses.marketing === 500 && t.expenses.salaries === 1000 && t.expenses.operating === 0 && t.expenses_total === 1500);
       check(`net profit = 140 - ${riderTotal} - 20 - ${gateway} - 1500 = ${expectedNet}`, t.net_profit === expectedNet);
-      check("the response documents every formula", month.body.formulas && ["fengle_revenue", "restaurant_payables_interim", "net_profit", "gateway_charges"].every((k) => typeof month.body.formulas[k] === "string") && month.body.gateway_fee_percent === feePct);
+      check("the response documents every formula", month.body.formulas && ["fengle_revenue", "restaurant_payables", "net_profit", "gateway_charges"].every((k) => typeof month.body.formulas[k] === "string") && month.body.gateway_fee_percent === feePct);
 
       const day = await call(superA, "GET", "/admin/finance/pnl?from=2026-03-01&to=2026-03-31&group=day");
       check("P&L by day: periods 03-10, 03-11, 03-12, 03-15 (expenses only), 03-31 (the 23:30 IST order), sorted", day.body.periods.map((p) => p.period).join() === "2026-03-10,2026-03-11,2026-03-12,2026-03-15,2026-03-31");
@@ -2505,6 +2505,226 @@ async function main() {
       await db("notification_campaigns").delete();
       await db("device_tokens").where("token", "like", "ExponentPushToken[%-c%").orWhere("token", "fcm-native-token-1").delete();
       await db("admins").where("email", "like", "%@notif.test").delete();
+    }
+  }
+
+  console.log("\n--- Test 42: Vendor cost per dish, payable snapshot on orders, restaurant settlement, profit per product ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const devtools = require("./src/services/devtools.service");
+    const financeSvc42 = require("./src/services/finance.service");
+    const catalogCtl42 = require("./src/controllers/catalog.controller");
+    const favoriteCtl42 = require("./src/controllers/favorite.controller");
+    const restCtl42 = require("./src/controllers/restaurant.controller");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const mkAdmin = async (name, role) => {
+      const [id] = await db("admins").insert({ name, email: `${name}@vend.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role });
+      return { id, token: signToken({ id, type: "admin" }) };
+    };
+    const superA = await mkAdmin("vend-super", "super_admin");
+    const opsA = await mkAdmin("vend-ops", "ops");
+    const supA = await mkAdmin("vend-support", "support");
+    const call = async (who, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { Authorization: `Bearer ${who.token}`, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* csv */ }
+      return { status: r.status, body: json, text };
+    };
+    const adminAuth = { id: 1, type: "admin" };
+    const otherRiders = await db("riders").select("id", "status");
+    try {
+      // ---- a dedicated kitchen + category, so every figure below is exact
+      const [catK] = await db("categories").insert({ name: "Settlement Cat" });
+      const [K] = await db("restaurants").insert({ name: "Settlement Kitchen", phone: "9000004201", address: "Newtown K", lat: 22.5900, lng: 88.4700, radius_km: 5, commission_rate_percent: 20, status: "active" });
+      await db("restaurant_categories").insert({ restaurant_id: K, category_id: catK });
+      const kitchen = { id: K, type: "restaurant" };
+      const create = async (body, auth = adminAuth) => { const r = fakeRes(); await catalogCtl42.createItem(fakeReq({ category_id: catK, ...body }, {}, auth), r); return r; };
+      const patch = async (id, body, auth = adminAuth) => { const r = fakeRes(); await catalogCtl42.updateItem(fakeReq(body, { id }, auth), r); return r; };
+      const stock = (itemId) => db("restaurant_items").insert({ restaurant_id: K, item_id: itemId, is_available: true }).onConflict(["restaurant_id", "item_id"]).ignore();
+
+      // ---- vendor cost on dishes: admin-only, validated, margin, loss-leader warning
+      const X = await create({ name: "Vendor X", price: 200, vendor_cost: "120" });
+      check("admin creates a dish with a vendor cost: 201, vendor_cost 120, margin 80, margin_percent 40, no warning", X.statusCode === 201 && X.body.item.vendor_cost === 120 && X.body.item.margin === 80 && X.body.item.margin_percent === 40 && X.body.warning === undefined);
+      const Y = await create({ name: "Vendor Y", price: 100 });
+      check("a dish with no vendor cost reads vendor_cost null and no margin", Y.body.item.vendor_cost === null && Y.body.item.margin === null);
+      const Z = await create({ name: "Vendor Z loss-leader", price: 50, vendor_cost: 70 });
+      check("a vendor cost ABOVE the price is allowed but returns a warning (and a negative margin)", Z.statusCode === 201 && typeof Z.body.warning === "string" && Z.body.item.margin === -20);
+      check("vendor_cost 0 is allowed; negative / text / absurd -> 400", (await create({ name: "Vendor free", price: 10, vendor_cost: 0 })).statusCode === 201 && (await create({ name: "V1", price: 10, vendor_cost: -1 })).statusCode === 400 && (await create({ name: "V2", price: 10, vendor_cost: "abc" })).statusCode === 400 && (await create({ name: "V3", price: 10, vendor_cost: 1e9 })).statusCode === 400);
+      check("a restaurant can't send vendor_cost on create or edit (403 price_admin_only)", (await create({ name: "KV", vendor_cost: 5 }, kitchen)).statusCode === 403 && (await patch(X.body.item.id, { vendor_cost: 5 }, kitchen)).statusCode === 403);
+      const cleared = await patch(Z.body.item.id, { vendor_cost: null });
+      check("vendor_cost: null clears it; the warning goes away", cleared.body.item.vendor_cost === null && cleared.body.warning === undefined);
+      await patch(Z.body.item.id, { vendor_cost: 20 });
+
+      // a kitchen proposes a dish; the admin prices it and sets its cost in ONE patch
+      const proposed = await create({ name: "Kitchen idea" }, kitchen);
+      check("a kitchen's own response never carries vendor_cost", proposed.statusCode === 201 && !("vendor_cost" in proposed.body.item) && !("margin" in proposed.body.item));
+      const live = await patch(proposed.body.item.id, { price: 90, vendor_cost: 50 });
+      check("admin prices an awaiting dish and sets its vendor cost in the same PATCH -> live with cost 50", live.body.item.price === 90 && live.body.item.vendor_cost === 50 && live.body.item.awaiting_price === false && Boolean(live.body.item.is_active));
+
+      await stock(X.body.item.id); await stock(Y.body.item.id); await stock(Z.body.item.id);
+      await patch(X.body.item.id, { offer_price: 150 }); // a dish offer: Fengle bears it, the kitchen's payable must not drop
+
+      // ---- nothing leaks to customers or kitchens
+      const near = { lat: "22.5900", lng: "88.4700" };
+      const listRes = fakeRes();
+      await catalogCtl42.listItemsForCategory(fakeReq({}, { categoryId: String(catK) }, null, near), listRes);
+      check("customer catalog never carries vendor_cost / margin", listRes.body.items.length >= 2 && listRes.body.items.every((i) => !("vendor_cost" in i) && !("margin" in i)));
+      const [leakCust] = await db("users").insert({ name: "Leak Customer", phone: "8000004200", wallet_balance: 0 });
+      await db("favorites").insert({ customer_id: leakCust, item_id: X.body.item.id });
+      const favRes = fakeRes();
+      await favoriteCtl42.listFavorites(fakeReq({}, {}, { id: leakCust, type: "customer" }), favRes);
+      const menuRes = fakeRes();
+      await restCtl42.getMyMenu(fakeReq({}, {}, kitchen), menuRes);
+      check("favorites and the kitchen's own menu never carry vendor_cost", favRes.body.favorites.every((i) => !("vendor_cost" in i)) && menuRes.body.items.length >= 2 && menuRes.body.items.every((i) => !("vendor_cost" in i)));
+      const adminItems = await call(opsA, "GET", "/admin/items?q=Vendor");
+      const adminX = adminItems.body.items.find((i) => i.id === X.body.item.id);
+      check("GET /admin/items (ops) shows vendor_cost + margin at today's charged price (offer 150 -> margin 30, 20%)", adminX.vendor_cost === 120 && adminX.effective_price === 150 && adminX.margin === 30 && adminX.margin_percent === 20);
+      const supItems = await call(supA, "GET", "/admin/items?q=Vendor");
+      check("...but support never sees vendor cost or margin", supItems.status === 200 && supItems.body.items.length > 0 && supItems.body.items.every((i) => !("vendor_cost" in i) && !("margin" in i)));
+      check("GET /admin/items?missing_vendor_cost=1 lists the dishes still missing a cost", (await call(opsA, "GET", "/admin/items?missing_vendor_cost=1&q=Vendor")).body.items.some((i) => i.id === Y.body.item.id) && !(await call(opsA, "GET", "/admin/items?missing_vendor_cost=1&q=Vendor")).body.items.some((i) => i.id === X.body.item.id));
+
+      // ---- orders snapshot the cost and compute the payable
+      await db("riders").update({ status: "inactive" });
+      const [vRider] = await db("riders").insert({ name: "Vendor Rider", phone: "8500000042", status: "active", last_known_lat: 22.5905, last_known_lng: 88.4705, wallet_balance: 0 });
+      const place = async (phone, items) => {
+        const [custId] = await db("users").insert({ name: "V Customer", phone, wallet_balance: 0 });
+        const r = fakeRes();
+        await orderController.placeOrder(fakeReq({ items, delivery_lat: 22.5905, delivery_lng: 88.4705, delivery_address: "V St", payment_method: "cod" }, {}, { id: custId, type: "customer" }), r);
+        return { res: r, custId, id: r.body.order && r.body.order.id };
+      };
+      const o1 = await place("8000004211", [{ item_id: X.body.item.id, quantity: 2 }, { item_id: Y.body.item.id, quantity: 1 }]);
+      const row1 = await db("orders").where({ id: o1.id }).first();
+      check("order placed: restaurant_payable = X 120 x 2 + Y (no cost) estimated 100 - 20% = 80 -> 320; flagged estimated (the offer on X does not lower it)", o1.res.statusCode === 201 && o1.res.body.order.restaurant_id === K && Number(row1.restaurant_payable) === 320 && Number(row1.payable_estimated) === 1);
+      check("...customers were charged the offer price (item_total 2 x 150 + 100 = 400) yet the payable stayed on vendor cost", Number(row1.item_total) === 400);
+      const lines1 = await db("order_items").where({ order_id: o1.id }).orderBy("id");
+      check("order_items snapshot vendor_cost (120 for X, null for Y)", Number(lines1[0].vendor_cost) === 120 && lines1[1].vendor_cost === null);
+      check("the placeOrder response to the customer has no restaurant_payable / payable_estimated", !("restaurant_payable" in o1.res.body.order) && !("payable_estimated" in o1.res.body.order));
+      const getAs = async (orderId, auth) => { const r = fakeRes(); await orderController.getOrder(fakeReq({}, { id: String(orderId) }, auth), r); return r.body; };
+      const asCust = await getAs(o1.id, { id: o1.custId, type: "customer" });
+      const asKitchen = await getAs(o1.id, kitchen);
+      check("GET /orders/:id: customer and kitchen see neither the payable nor any line's vendor_cost", [asCust, asKitchen].every((b) => !("restaurant_payable" in b.order) && !("payable_estimated" in b.order) && b.items.every((l) => !("vendor_cost" in l))));
+      const listAsKitchen = fakeRes();
+      await orderController.listMyOrders(fakeReq({}, {}, kitchen, {}), listAsKitchen);
+      check("GET /orders list rows for the kitchen carry no payable either", listAsKitchen.body.orders.every((o) => !("restaurant_payable" in o)));
+      const adminView = await call(opsA, "GET", `/admin/orders/${o1.id}`);
+      check("GET /admin/orders/:id (ops): restaurant_payable 320, payable_estimated, and the lines' vendor_cost", adminView.body.order.restaurant_payable === 320 && Number(adminView.body.order.payable_estimated) === 1 && adminView.body.items[0].vendor_cost === 120);
+      const supView = await call(supA, "GET", `/admin/orders/${o1.id}`);
+      check("...support gets neither the payable nor vendor costs", supView.status === 200 && !("restaurant_payable" in supView.body.order) && supView.body.items.every((l) => !("vendor_cost" in l)));
+
+      // a later cost change never rewrites the old order
+      await patch(X.body.item.id, { vendor_cost: 130 });
+      check("changing the dish's vendor cost later leaves the old order's snapshot and payable alone", Number((await db("order_items").where({ id: lines1[0].id }).first()).vendor_cost) === 120 && Number((await db("orders").where({ id: o1.id }).first()).restaurant_payable) === 320);
+      await patch(X.body.item.id, { vendor_cost: 120 });
+
+      // accept with a dropped line: recomputed on the confirmed lines only (and no longer estimated once Y is gone)
+      const dropRes = fakeRes();
+      await orderController.acceptOrder(fakeReq({ unavailable_item_ids: [Y.body.item.id] }, { id: String(o1.id) }, kitchen), dropRes);
+      const afterDrop = await db("orders").where({ id: o1.id }).first();
+      check("accepting with Y unavailable: payable recomputed to X only = 240, no longer estimated", dropRes.statusCode === undefined && Number(afterDrop.restaurant_payable) === 240 && Number(afterDrop.payable_estimated) === 0);
+      check("...and the accept response to the kitchen hides the payable", !("restaurant_payable" in dropRes.body.order));
+
+      // cancelled orders owe the kitchen nothing
+      const oc = await place("8000004212", [{ item_id: X.body.item.id, quantity: 1 }]);
+      await require("./src/controllers/adminOrders.controller").cancelOrder(fakeReq({ reason: "t" }, { id: String(oc.id) }, adminAuth), fakeRes());
+      check("a cancelled order shows restaurant_payable 0 to admins and never counts in settlement", (await call(opsA, "GET", `/admin/orders/${oc.id}`)).body.order.restaurant_payable === 0);
+      await db("orders").where({ id: o1.id }).update({ status: "cancelled", cancelled_at: new Date() }); // retire the accepted order from section above
+
+      // ---- two delivered orders for the settlement figures
+      const d1 = await place("8000004213", [{ item_id: X.body.item.id, quantity: 2 }, { item_id: Y.body.item.id, quantity: 1 }]);
+      await devtools.advanceOrder(d1.id, { to: "delivered" });
+      await patch(Y.body.item.id, { vendor_cost: 60 }); // now every dish has a cost
+      const d2 = await place("8000004214", [{ item_id: X.body.item.id, quantity: 1 }, { item_id: Y.body.item.id, quantity: 1 }]);
+      await devtools.advanceOrder(d2.id, { to: "delivered" });
+      const dRow1 = await db("orders").where({ id: d1.id }).first();
+      const dRow2 = await db("orders").where({ id: d2.id }).first();
+      check("D1 payable 320 (estimated), D2 payable 180 = 120 + 60 (exact)", Number(dRow1.restaurant_payable) === 320 && Number(dRow1.payable_estimated) === 1 && Number(dRow2.restaurant_payable) === 180 && Number(dRow2.payable_estimated) === 0 && dRow1.status === "delivered" && dRow2.status === "delivered");
+
+      // ---- settlement overview
+      const probes = [["GET", "/admin/restaurant-settlements"], ["GET", "/admin/restaurant-settlements.csv"], ["GET", `/admin/restaurants/${K}/settlement`], ["GET", `/admin/restaurants/${K}/settlement.csv`], ["POST", `/admin/restaurants/${K}/payments`, {}], ["GET", "/admin/restaurant-payments"], ["POST", `/admin/restaurants/${K}/adjustments`, {}], ["GET", "/admin/restaurant-adjustments"]];
+      const leaked = [];
+      for (const [m, p, b] of probes) { const r = await call(supA, m, p, b); if (!(r.status === 403 && r.body && r.body.code === "forbidden_role")) leaked.push(`${m} ${p} -> ${r.status}`); }
+      check(`support gets 403 forbidden_role on every settlement route (leaks: ${leaked.join("; ") || "none"})`, leaked.length === 0);
+
+      const ov = await call(opsA, "GET", "/admin/restaurant-settlements");
+      const kRow = ov.body.restaurants.find((r) => r.restaurant_id === K);
+      check("overview: kitchen K delivered 2, total_payable 500, outstanding 500, status due, 1 estimated order flagged", ov.status === 200 && kRow.delivered_orders === 2 && kRow.payable_earned === 500 && kRow.total_payable === 500 && kRow.outstanding === 500 && kRow.status === "due" && kRow.estimated_orders_total === 1 && kRow.has_estimated_payables === true);
+      check("a kitchen with nothing owed reads settled", ov.body.restaurants.filter((r) => r.outstanding === 0).every((r) => r.status === "settled") && ov.body.restaurants.some((r) => r.outstanding === 0));
+      const ovFuture = await call(opsA, "GET", "/admin/restaurant-settlements?from=2099-01-01");
+      check("a range with no deliveries shows payable_earned 0 for the range but keeps the all-time total (500) and outstanding", ovFuture.body.restaurants.find((r) => r.restaurant_id === K).payable_earned === 0 && ovFuture.body.restaurants.find((r) => r.restaurant_id === K).total_payable === 500);
+
+      // ---- payments
+      const pay = (body) => call(opsA, "POST", `/admin/restaurants/${K}/payments`, body);
+      check("payment: amount 0 / text -> 400; bad method -> 400; bank transfer without a reference -> 400; future paid_at -> 400",
+        (await pay({ amount: 0, reference: "R" })).status === 400 && (await pay({ amount: "abc", reference: "R" })).status === 400 && (await pay({ amount: 5, reference: "R", method: "cheque" })).status === 400 && (await pay({ amount: 5 })).status === 400 && (await pay({ amount: 5, reference: "R", paid_at: new Date(Date.now() + 86400e3).toISOString() })).status === 400);
+      check("unknown kitchen -> 404", (await call(opsA, "POST", "/admin/restaurants/999999/payments", { amount: 5, reference: "R" })).status === 404);
+      const tooMuch = await pay({ amount: 600, reference: "UTR-TOO-MUCH" });
+      check("a payment above what is owed -> 409 with the outstanding (500), unless allow_advance", tooMuch.status === 409 && tooMuch.body.outstanding === 500);
+      const p1 = await pay({ amount: 200, reference: "UTR-1", method: "bank_transfer", notes: "First part", paid_at: new Date(Date.now() - 3600e3).toISOString() });
+      check("payment 200 recorded -> 201, outstanding_after 300, who recorded it", p1.status === 201 && p1.body.payment.amount === 200 && p1.body.outstanding_after === 300 && p1.body.payment.recorded_by_admin_id === opsA.id);
+      check("the same reference again -> 409 and nothing extra recorded", (await pay({ amount: 10, reference: "UTR-1" })).status === 409 && (await call(opsA, "GET", `/admin/restaurant-payments?restaurant_id=${K}`)).body.total === 1);
+      check("a cash payment needs no reference", (await pay({ amount: 50, method: "cash" })).body.outstanding_after === 250);
+
+      // ---- adjustments
+      const adj = (body) => call(opsA, "POST", `/admin/restaurants/${K}/adjustments`, body);
+      check("adjustment: amount 0 / text / missing reason -> 400; an order of another kitchen -> 400",
+        (await adj({ amount: 0, reason: "x" })).status === 400 && (await adj({ amount: "abc", reason: "x" })).status === 400 && (await adj({ amount: -10 })).status === 400 && (await adj({ amount: -10, reason: "x", related_order_id: orderId })).status === 400);
+      const penalty = await adj({ amount: -30, reason: "Cancelled after accepting", related_order_id: d1.id });
+      check("a -30 deduction tied to an order -> 201, outstanding_after 220", penalty.status === 201 && penalty.body.adjustment.amount === -30 && penalty.body.outstanding_after === 220);
+      check("a + adjustment (owed to the kitchen) raises it: +5 -> 225, then -5 -> 220", (await adj({ amount: 5, reason: "Packaging" })).body.outstanding_after === 225 && (await adj({ amount: -5, reason: "Packaging reversed" })).body.outstanding_after === 220);
+
+      // ---- statement
+      const st = await call(opsA, "GET", `/admin/restaurants/${K}/settlement`);
+      check("statement: opening 0, earned 500, adjustments -30, paid 250, closing = outstanding_now = 220, status due",
+        st.status === 200 && st.body.opening_balance === 0 && st.body.payable_earned === 500 && st.body.adjustments_total === -30 && st.body.paid_total === 250 && st.body.closing_balance === 220 && st.body.outstanding_now === 220 && st.body.status === "due");
+      const sOrder = st.body.orders.find((o) => o.order_id === d1.id);
+      check("statement order lines show items with vendor cost x quantity and the estimated flag (D1: X 2 x 120, Y estimated 80)", sOrder.payable === 320 && sOrder.estimated === true && sOrder.items.find((i) => i.name === "Vendor X").line_cost === 240 && sOrder.items.find((i) => i.name === "Vendor Y").estimated === true && sOrder.items.find((i) => i.name === "Vendor Y").line_cost === 80);
+      check("statement has date-wise subtotals, the payments and the adjustments", st.body.days.reduce((s, d) => s + d.payable, 0) === 500 && st.body.payments.length === 2 && st.body.adjustments.length === 3);
+      const stLater = await call(opsA, "GET", `/admin/restaurants/${K}/settlement?from=2099-01-01`);
+      check("a statement starting after everything: opening = what was owed before (220), nothing in range, closing 220", stLater.body.opening_balance === 220 && stLater.body.payable_earned === 0 && stLater.body.closing_balance === 220 && stLater.body.orders.length === 0);
+      check("statement for an unknown kitchen -> 404", (await call(opsA, "GET", "/admin/restaurants/999999/settlement")).status === 404);
+      const stCsv = await call(opsA, "GET", `/admin/restaurants/${K}/settlement.csv`);
+      const lines = stCsv.text.trim().split("\r\n");
+      check("statement CSV: header, opening_balance row, one row per order/payment/adjustment, last running balance = 220", lines[0] === "date,type,reference,detail,amount,estimated,balance" && lines[1].includes("opening_balance") && lines.length === 2 + 2 + 3 + 2 && lines[lines.length - 1].endsWith(",220"));
+      const ovCsv = await call(opsA, "GET", "/admin/restaurant-settlements.csv");
+      check("overview CSV has a row for the kitchen with outstanding 220", ovCsv.text.startsWith("restaurant_id,restaurant_name,status") && ovCsv.text.split("\r\n").some((l) => l.startsWith(`${K},Settlement Kitchen,due`) && l.includes(",220,")));
+
+      // ---- settle fully, then an advance needs the flag
+      check("paying the remaining 220 -> settled", (await pay({ amount: 220, reference: "UTR-2" })).body.outstanding_after === 0 && (await call(opsA, "GET", "/admin/restaurant-settlements")).body.restaurants.find((r) => r.restaurant_id === K).status === "settled");
+      check("one more rupee is refused without allow_advance (409) and recorded with it (outstanding -1, status advance)",
+        (await pay({ amount: 1, reference: "UTR-3" })).status === 409 && (await pay({ amount: 1, reference: "UTR-3", allow_advance: true })).body.outstanding_after === -1 && (await call(opsA, "GET", "/admin/restaurant-settlements")).body.restaurants.find((r) => r.restaurant_id === K).status === "advance");
+      const hist = await call(opsA, "GET", `/admin/restaurant-payments?restaurant_id=${K}`);
+      check("GET /admin/restaurant-payments: newest first with the kitchen name and total_amount", hist.body.payments.length === 4 && hist.body.total_amount === 471 && hist.body.payments[0].restaurant_name === "Settlement Kitchen");
+      check("GET /admin/restaurant-adjustments lists the 3 adjustments (total -30)", (await call(opsA, "GET", `/admin/restaurant-adjustments?restaurant_id=${K}`)).body.total_amount === -30);
+
+      // ---- the P&L uses the real payable
+      const econ = (await financeSvc42.buildOrderEconomics({ from: null, to: null })).filter((r) => r.order_id === d1.id || r.order_id === d2.id);
+      const e1 = econ.find((r) => r.order_id === d1.id);
+      const e2 = econ.find((r) => r.order_id === d2.id);
+      check("P&L order rows: payable = the stored payable; fengle_revenue = item_total - payable + delivery_fee; estimated flag carried", e1.restaurant_payable === 320 && e1.payable_estimated === true && e1.fengle_revenue === Number((400 - 320 + Number(dRow1.delivery_fee)).toFixed(2)) && e2.restaurant_payable === 180 && e2.payable_estimated === false && e2.fengle_revenue === Number((Number(dRow2.item_total) - 180 + Number(dRow2.delivery_fee)).toFixed(2)));
+      const sum42 = financeSvc42.summarize(econ, []);
+      check("P&L summary: restaurant_payables 500 (the 'interim' alias matches), 1 order with an estimated payable", sum42.restaurant_payables === 500 && sum42.restaurant_payables_interim === 500 && sum42.payable_estimated_orders === 1);
+      const pnl = await call(superA, "GET", "/admin/finance/pnl?group=month");
+      check("GET /admin/finance/pnl: the formulas describe restaurant_payables and no longer call them interim", pnl.status === 200 && typeof pnl.body.formulas.restaurant_payables === "string" && !/INTERIM/.test(pnl.body.formulas.restaurant_payables) && !("restaurant_payables_interim" in pnl.body.formulas));
+
+      // ---- profit per product
+      check("profit per product is super_admin only (ops 403)", (await call(opsA, "GET", "/admin/finance/products")).body.code === "forbidden_role" && (await call(opsA, "GET", "/admin/finance/products.csv")).body.code === "forbidden_role");
+      const prod = await call(superA, "GET", `/admin/finance/products?category_id=${catK}`);
+      const pX = prod.body.products.find((p) => p.item_id === X.body.item.id);
+      const pY = prod.body.products.find((p) => p.item_id === Y.body.item.id);
+      check("product X: 3 units, revenue 3 x 150 = 450 (after the offer), vendor cost 360, profit 90, margin 20%", pX.units_sold === 3 && pX.customer_revenue === 450 && pX.vendor_cost_total === 360 && pX.gross_profit === 90 && pX.margin_percent === 20 && pX.has_estimated_cost === false);
+      check("product Y: 2 units, revenue 200, cost 80 (estimated) + 60 = 140, profit 60, flagged estimated (1 unit)", pY.units_sold === 2 && pY.customer_revenue === 200 && pY.vendor_cost_total === 140 && pY.gross_profit === 60 && pY.estimated_units === 1 && pY.has_estimated_cost === true);
+      check("rows carry the dish's CURRENT price, vendor cost and margin; sorted by gross profit; totals add up", pX.current_vendor_cost === 120 && pX.current_effective_price === 150 && pX.current_margin === 30 && prod.body.products[0].gross_profit >= prod.body.products[prod.body.products.length - 1].gross_profit && prod.body.totals.gross_profit === 150 && prod.body.totals.units_sold === 5);
+      check("category filter: another category has none of these dishes", (await call(superA, "GET", `/admin/finance/products?category_id=${bengaliCatId}`)).body.products.every((p) => p.item_id !== X.body.item.id));
+      const prodCsv = await call(superA, "GET", `/admin/finance/products.csv?category_id=${catK}`);
+      check("products.csv: header + a row per dish", prodCsv.text.startsWith("item_id,name,category_name,units_sold") && prodCsv.text.trim().split("\r\n").length === 3);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      for (const r of otherRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      await db("admins").where("email", "like", "%@vend.test").delete();
     }
   }
 

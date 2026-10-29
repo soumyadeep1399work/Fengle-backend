@@ -2,6 +2,13 @@ const db = require("../config/db");
 const { presentAdminPricing } = require("../utils/pricing");
 
 // price (null while awaiting an admin-set price), the stored offer, whether it is in force, and the price charged.
+// vendor_cost, the margin it leaves at today's charged price, and margin_percent (of that price).
+const vendorFields = (r, allowed) => {
+  if (!allowed) return {};
+  const p = presentAdminPricing(r);
+  return { vendor_cost: p.vendor_cost, margin: p.margin, margin_percent: p.margin_percent };
+};
+
 const pricingFields = (r) => {
   const p = presentAdminPricing(r);
   return { price: p.price, awaiting_price: p.awaiting_price, offer_price: p.offer_price, offer_ends_at: p.offer_ends_at, offer_active: p.offer_active, effective_price: p.effective_price };
@@ -166,12 +173,14 @@ async function mergeCategories(req, res) {
 /** GET /admin/items?category_id=&q= — includes inactive items. */
 /** GET /admin/items?category_id=&q=&page=&limit= — includes inactive items. */
 async function listItems(req, res) {
-  const { category_id, q, awaiting_price, is_active } = req.query;
+  const { category_id, q, awaiting_price, is_active, missing_vendor_cost } = req.query;
   const { page, limit, offset } = paginationParams(req);
+  const canSeeVendorCost = !(req.auth && req.auth.role === "support"); // what Fengle pays kitchens is for super_admin and ops only
 
   let base = db("items as i");
   if (category_id) base = base.where("i.category_id", category_id);
   if (awaiting_price === "1" || awaiting_price === "true") base = base.where("i.awaiting_price", true);
+  if (missing_vendor_cost === "1" || missing_vendor_cost === "true") base = base.whereNull("i.vendor_cost");
   if (is_active === "1" || is_active === "true") base = base.where("i.is_active", true);
   if (is_active === "0" || is_active === "false") base = base.where("i.is_active", false);
   if (q && q.trim()) base = base.andWhere((qb) => qb.where("i.name", "like", `%${q.trim()}%`).orWhere("i.description", "like", `%${q.trim()}%`));
@@ -189,7 +198,7 @@ async function listItems(req, res) {
   res.json({
     page, limit, total: Number(total),
     items: rows.map((r) => ({
-      id: r.id, name: r.name, description: r.description, ...pricingFields(r), image_url: r.image_url,
+      id: r.id, name: r.name, description: r.description, ...pricingFields(r), ...vendorFields(r, canSeeVendorCost), image_url: r.image_url,
       is_veg: Boolean(r.is_veg), is_active: Boolean(r.is_active), category_id: r.category_id, category_name: r.category_name,
       quantity_value: r.quantity_value == null ? null : Number(r.quantity_value), quantity_unit: r.quantity_unit || null,
       portion_label: portionLabel(r.quantity_value, r.quantity_unit),

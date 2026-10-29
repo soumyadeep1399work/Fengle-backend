@@ -117,8 +117,10 @@ const FORMULAS = {
   basis: "Every order figure is for orders PLACED in the period (report-timezone day/month); expenses use their own date. Dates are IST days (REPORT_TZ_OFFSET_MINUTES).",
   gross_order_value: "sum of grand_total over all orders placed (any status)",
   delivered_sales: "sum of grand_total over delivered orders (includes GST and delivery fee, after coupons)",
-  fengle_revenue: "sum of (commission_amount + delivery_fee) over delivered orders; GST is a pass-through and is never revenue",
-  restaurant_payables_interim: "INTERIM — sum of (item_total - commission_amount) over delivered orders, until the restaurant settlement model is decided",
+  fengle_revenue: "sum over delivered orders of (item_total - restaurant_payable + delivery_fee); item_total is what customers paid for the food after dish offers; GST is a pass-through and is never revenue",
+  restaurant_payables: "sum of orders.restaurant_payable over delivered orders = what Fengle owes kitchens: vendor cost x quantity per confirmed line, never reduced by coupons or offers (Fengle bears all discounts). A line whose dish had no vendor cost uses the old estimate (line subtotal minus the kitchen's commission %) and its order counts in payable_estimated_orders",
+  payable_estimated_orders: "delivered orders whose payable includes at least one estimated line (a dish still missing its vendor cost) — set the dish costs to make the payables exact",
+  commission: "legacy/informational only: the old commission_amount; it no longer drives revenue or payables",
   rider_payouts: "sum of the rider payout frozen at delivery; delivered orders without one use the current rider-pay formula (rider_payouts_estimated)",
   coupon_discounts: "sum of coupon_discount_amount over delivered orders (platform-funded)",
   gateway_charges: "RAZORPAY_FEE_PERCENT % of grand_total over delivered orders paid by upi/card/netbanking (COD and wallet carry no fee)",
@@ -141,7 +143,7 @@ async function pnl(req, res) {
 
 const PNL_COLUMNS = [
   "period", "orders_placed", "gross_order_value", "delivered_orders", "delivered_sales", "delivered_item_total", "delivered_delivery_fees",
-  "gst_collected", "commission", "fengle_revenue", "restaurant_payables_interim", "rider_payouts", "rider_payouts_estimated",
+  "gst_collected", "fengle_revenue", "restaurant_payables", "payable_estimated_orders", "rider_payouts", "rider_payouts_estimated",
   "coupon_discounts", "gateway_charges", "expenses_marketing", "expenses_operating", "expenses_salaries", "expenses_other", "expenses_total",
   "net_profit", "offer_discounts_info", "refunds_info", "cancelled_orders", "cancelled_value", "in_progress_orders", "in_progress_value",
 ];
@@ -159,7 +161,7 @@ async function pnlCsv(req, res) {
 
 const ORDER_COLUMNS = [
   "order_id", "placed_at", "delivered_at", "cancelled_at", "status", "payment_method", "payment_status",
-  "item_total", "delivery_fee", "gst", "coupon_discount", "grand_total", "commission", "fengle_revenue", "restaurant_payable",
+  "item_total", "delivery_fee", "gst", "coupon_discount", "grand_total", "fengle_revenue", "restaurant_payable", "payable_estimated",
   "rider_payout", "rider_payout_source", "gateway_charge", "offer_discount", "refunded", "net_contribution",
 ];
 
@@ -169,6 +171,7 @@ async function ordersCsv(req, res) {
   if (range.error) return res.status(400).json({ error: range.error });
   const rows = (await finance.buildOrderEconomics({ from: range.from, to: range.to })).map((o) => ({
     ...o,
+    payable_estimated: o.payable_estimated ? "yes" : "",
     placed_at: o.placed_at ? new Date(o.placed_at).toISOString() : "",
     delivered_at: o.delivered_at ? new Date(o.delivered_at).toISOString() : "",
     cancelled_at: o.cancelled_at ? new Date(o.cancelled_at).toISOString() : "",
@@ -176,4 +179,28 @@ async function ordersCsv(req, res) {
   sendCsv(res, `finance-orders-${dayKey(new Date())}.csv`, rows, ORDER_COLUMNS);
 }
 
-module.exports = { createExpense, listExpenses, updateExpense, deleteExpense, pnl, pnlCsv, ordersCsv };
+/**
+ * GET /admin/finance/products?from=&to=&category_id= → { range, products: [...], totals } (super_admin) — profit per dish for delivered
+ * orders placed in the range. See finance.service.buildProductProfit for the definitions.
+ */
+async function products(req, res) {
+  const range = financeRange(req.query);
+  if (range.error) return res.status(400).json({ error: range.error });
+  const result = await finance.buildProductProfit({ from: range.from, to: range.to, categoryId: req.query.category_id ? Number(req.query.category_id) : null });
+  res.json({ range: { from: range.from, to: range.to }, ...result });
+}
+
+const PRODUCT_COLUMNS = [
+  "item_id", "name", "category_name", "units_sold", "customer_revenue", "vendor_cost_total", "gross_profit", "margin_percent", "estimated_units",
+  "current_price", "current_effective_price", "current_vendor_cost", "current_margin", "current_margin_percent",
+];
+
+/** GET /admin/finance/products.csv — the same rows as /admin/finance/products. */
+async function productsCsv(req, res) {
+  const range = financeRange(req.query);
+  if (range.error) return res.status(400).json({ error: range.error });
+  const { products: rows } = await finance.buildProductProfit({ from: range.from, to: range.to, categoryId: req.query.category_id ? Number(req.query.category_id) : null });
+  sendCsv(res, `product-profit-${dayKey(new Date())}.csv`, rows, PRODUCT_COLUMNS);
+}
+
+module.exports = { createExpense, listExpenses, updateExpense, deleteExpense, pnl, pnlCsv, ordersCsv, products, productsCsv };

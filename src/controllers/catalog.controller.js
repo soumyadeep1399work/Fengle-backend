@@ -384,6 +384,13 @@ function parseOfferInput(body, { finalPrice, item }) {
   return { fields: { offer_price: offerPrice, offer_ends_at: endsAt } };
 }
 
+/** A vendor cost above what the customer pays loses money on every sale: allowed (a deliberate loss-leader), but flagged. */
+function vendorCostWarning(row) {
+  if (row.vendor_cost == null || row.awaiting_price) return null;
+  const charged = require("../utils/pricing").effectivePrice(row);
+  return Number(row.vendor_cost) > charged ? `vendor_cost (${Number(row.vendor_cost)}) is above the price customers pay (${charged}) — every sale loses money` : null;
+}
+
 /** An item as the caller should see it: admins get the raw offer, everyone else the customer-style view. */
 function presentItemFor(type, row) {
   const withPortion = presentPortion(row);
@@ -441,6 +448,17 @@ function validateItemFields(body, { partial, skipPrice = false }) {
   const portion = parsePortionInput(body);
   if (portion.error) return { error: portion.error };
   if (portion.fields) Object.assign(fields, portion.fields);
+  if (has("vendor_cost")) {
+    // What Fengle pays the kitchen per unit. Admin-only (the callers block everyone else before this runs).
+    // Zero is allowed, and so is a cost above the price (a deliberate loss-leader; the response warns).
+    const raw = body.vendor_cost;
+    if (raw === null || raw === "") fields.vendor_cost = null;
+    else {
+      const n = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : raw;
+      if (typeof n !== "number" || !Number.isFinite(n) || n < 0 || n > 100000) return { error: "vendor_cost must be a number from 0 to 100000 (or null to clear it)" };
+      fields.vendor_cost = Number(n.toFixed(2));
+    }
+  }
   return { fields };
 }
 
@@ -481,9 +499,9 @@ async function updateItem(req, res) {
 
   // Prices and offers belong to Fengle admins alone (client decision 2026-10-28): a kitchen can
   // edit everything else on a dish, but never what it costs.
-  const ADMIN_ONLY_KEYS = ["price", "offer_price", "offer_ends_at"];
+  const ADMIN_ONLY_KEYS = ["price", "offer_price", "offer_ends_at", "vendor_cost"];
   if (type !== "admin" && ADMIN_ONLY_KEYS.some((key) => body[key] !== undefined)) {
-    return res.status(403).json({ error: "Only Fengle admins can set prices or offers", code: "price_admin_only" });
+    return res.status(403).json({ error: "Only Fengle admins can set prices, offers or vendor costs", code: "price_admin_only" });
   }
 
   const EDITABLE = ["name", "is_veg", "image_url", "description", "quantity_value", "quantity_unit"];
@@ -524,7 +542,8 @@ async function updateItem(req, res) {
   }
 
   await db("items").where({ id }).update({ ...fields, updated_at: db.fn.now() });
-  res.json({ item: presentItemFor(type, await db("items").where({ id }).first()) });
+  const updatedRow = await db("items").where({ id }).first();
+  res.json({ item: presentItemFor(type, updatedRow), ...(type === "admin" && vendorCostWarning(updatedRow) ? { warning: vendorCostWarning(updatedRow) } : {}) });
 }
 
 /**
@@ -540,8 +559,8 @@ async function createItem(req, res) {
   }
   // Prices belong to Fengle admins alone (client decision 2026-10-28). A kitchen proposes a dish
   // without a price; it stays hidden (awaiting_price) until an admin sets one.
-  if (type === "restaurant" && ["price", "offer_price", "offer_ends_at"].some((key) => req.body[key] !== undefined)) {
-    return res.status(403).json({ error: "Only Fengle admins can set prices or offers — leave the price out; it is added when your dish is approved", code: "price_admin_only" });
+  if (type === "restaurant" && ["price", "offer_price", "offer_ends_at", "vendor_cost"].some((key) => req.body[key] !== undefined)) {
+    return res.status(403).json({ error: "Only Fengle admins can set prices, offers or vendor costs — leave the price out; it is added when your dish is approved", code: "price_admin_only" });
   }
   if (!category_id || !name || (type === "admin" && price == null)) {
     return res.status(400).json({ error: type === "admin" ? "category_id, name and price are required" : "category_id and name are required" });
@@ -576,6 +595,7 @@ async function createItem(req, res) {
     category_id,
     name: fields.name,
     description: fields.description || null,
+    vendor_cost: type === "admin" ? (fields.vendor_cost ?? null) : null,
     price: type === "restaurant" ? 0 : fields.price, // a kitchen's dish has no price until an admin sets one
     awaiting_price: type === "restaurant",
     is_active: type !== "restaurant",
@@ -594,8 +614,8 @@ async function createItem(req, res) {
     await db("restaurant_items").insert({ restaurant_id: actorId, item_id: id, is_available: true });
   }
 
-  const item = presentItemFor(type, await db("items").where({ id }).first());
-  res.status(201).json({ item });
+  const createdRow = await db("items").where({ id }).first();
+  res.status(201).json({ item: presentItemFor(type, createdRow), ...(type === "admin" && vendorCostWarning(createdRow) ? { warning: vendorCostWarning(createdRow) } : {}) });
 }
 
 /**

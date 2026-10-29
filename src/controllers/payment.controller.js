@@ -1,4 +1,5 @@
 const db = require("../config/db");
+const { stripInternalOrderFields } = require("../utils/orderPrivacy");
 const payment = require("../services/payment.service");
 const wallet = require("../services/wallet.service");
 const { notifyLater } = require("../services/push.service");
@@ -96,7 +97,7 @@ async function chargeCard(req, res) {
   await db("orders").where({ id: order.id }).update({ payment_status: "paid" });
   const updated = await db("orders").where({ id: order.id }).first();
   if (updated.status === "placed") notifyLater(() => orderPush.newOrderForRestaurant(order.id)); // now visible to the kitchen
-  res.json({ order: updated, payment: { status: "captured", dev_stub: true } });
+  res.json({ order: stripInternalOrderFields(updated), payment: { status: "captured", dev_stub: true } });
 }
 
 module.exports = { getPaymentMethods, initiateUpi, chargeCard };

@@ -2,6 +2,8 @@ const crypto = require("crypto");
 const { portionLabel, presentLinePortion } = require("../utils/portion");
 const { effectivePrice } = require("../utils/pricing");
 const riderPay = require("../services/riderPay.service");
+const restaurantPayable = require("../services/restaurantPayable.service");
+const { stripInternalOrderFields, stripInternalLineFields } = require("../utils/orderPrivacy");
 const db = require("../config/db");
 const routing = require("../services/routing.service");
 const commission = require("../services/commission.service");
@@ -34,7 +36,7 @@ function cancellableUntil(order) {
   return new Date(new Date(order.created_at).getTime() + CANCEL_BUFFER_SECONDS * 1000).toISOString();
 }
 
-const withCancelInfo = (order) => ({ ...order, cancellable_until: cancellableUntil(order) });
+const withCancelInfo = (order) => stripInternalOrderFields({ ...order, cancellable_until: cancellableUntil(order) });
 
 // 4-digit code shown to the customer and read aloud to the rider at drop-off —
 // see the "delivery_otp" column/migration and markDelivered below.
@@ -270,6 +272,14 @@ async function createOrderForRestaurant({ customerId, restaurant, distanceKm, ca
 
     const grandTotal = Number((itemTotal + deliveryFee + cgstAmount + sgstAmount - couponDiscount).toFixed(2));
 
+    // What Fengle owes this kitchen: vendor cost x quantity per line, snapshotted now so a later cost
+    // change never rewrites the order. Fengle bears coupons and dish offers, so neither reduces it.
+    const vendorCosts = await restaurantPayable.getVendorCosts(trx, cartItems.map((i) => i.itemId), restaurant.id);
+    const costedItems = cartItems.map((i) => ({ ...i, vendorCost: vendorCosts.get(i.itemId) ?? null, subtotal: Number((i.unitPrice * i.quantity).toFixed(2)) }));
+    const { payable, estimated } = restaurantPayable.computePayable(
+      costedItems.map((i) => ({ quantity: i.quantity, subtotal: i.subtotal, vendor_cost: i.vendorCost })), restaurant
+    );
+
     const [orderId] = await trx("orders").insert({
       customer_id: customerId,
       restaurant_id: restaurant.id,
@@ -281,7 +291,9 @@ async function createOrderForRestaurant({ customerId, restaurant, distanceKm, ca
       delivery_address: deliveryAddress,
       item_total: itemTotal,
       delivery_fee: deliveryFee,
-      commission_amount: commissionAmount,
+      commission_amount: commissionAmount, // legacy: no longer drives anything, kept so older reports still read
+      restaurant_payable: payable,
+      payable_estimated: estimated,
       cgst_amount: cgstAmount,
       sgst_amount: sgstAmount,
       coupon_id: appliedCoupon ? appliedCoupon.id : null,
@@ -304,7 +316,7 @@ async function createOrderForRestaurant({ customerId, restaurant, distanceKm, ca
     }
 
     await trx("order_items").insert(
-      cartItems.map((i) => ({
+      costedItems.map((i) => ({
         order_id: orderId,
         item_id: i.itemId,
         item_name: i.name,
@@ -314,7 +326,8 @@ async function createOrderForRestaurant({ customerId, restaurant, distanceKm, ca
         quantity: i.quantity,
         unit_price: i.unitPrice,
         list_price: i.listPrice ?? null,
-        subtotal: Number((i.unitPrice * i.quantity).toFixed(2)),
+        vendor_cost: i.vendorCost,
+        subtotal: i.subtotal,
       }))
     );
 
@@ -480,6 +493,7 @@ async function acceptOrder(req, res) {
         grand_total: newGrandTotal,
         status: "accepted",
       });
+      await restaurantPayable.recomputeForOrder(trx, id); // dropped lines no longer count toward what the kitchen is owed
     } else {
       await trx("orders").where({ id }).update({ status: "accepted" });
     }
@@ -493,7 +507,7 @@ async function acceptOrder(req, res) {
   notifyLater(() => orderPush.orderAccepted(id, order.payment_status === "paid" ? refundAmount : 0));
 
   const updated = await db("orders").where({ id }).first();
-  res.json({ order: updated });
+  res.json({ order: stripInternalOrderFields(updated) });
 }
 
 /**
@@ -565,6 +579,9 @@ async function rejectOrder(req, res) {
       cascade_attempts: (order.cascade_attempts || 1) + 1,
       status: "placed", // re-enters the queue for the new restaurant
     });
+    // Another kitchen now: the payable is recomputed for it (matters for any line still on the commission fallback).
+    // The vendor-cost snapshot on the lines stays: today there is one cost per dish for every kitchen.
+    await restaurantPayable.recomputeForOrder(db, id);
     notifyRestaurantIfVisible(order);
     return res.json({ message: "Order reassigned to next available restaurant", reassigned: true });
   }
@@ -798,7 +815,7 @@ async function getOrder(req, res) {
     .where("order_items.order_id", id)
     .orderBy("order_items.id")
     .select("order_items.*", db.raw("COALESCE(order_items.item_name, items.name) as name"), "categories.name as category_name")
-    .then((rows) => rows.map(presentLinePortion));
+    .then((rows) => rows.map((r) => (type === "admin" ? presentLinePortion(r) : stripInternalLineFields(presentLinePortion(r)))));
   const categories = distinctCategories(items);
   const rider = order.rider_id ? await db("riders").where({ id: order.rider_id }).select("name", "phone").first() : null;
   const restaurant = await db("restaurants").where({ id: order.restaurant_id }).select("name", "address", "lat", "lng").first();

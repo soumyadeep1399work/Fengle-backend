@@ -1,6 +1,7 @@
 const db = require("../config/db");
 const { presentLinePortion } = require("../utils/portion");
 const riderPay = require("../services/riderPay.service");
+const { stripInternalLineFields } = require("../utils/orderPrivacy");
 const wallet = require("../services/wallet.service");
 const { paginationParams } = require("../utils/pagination");
 const { scrubDeliveryOtp } = require("./order.controller");
@@ -124,8 +125,13 @@ async function getOrder(req, res) {
   const { delivery_otp, rider_payout_breakdown, ...safeOrder } = order;
   safeOrder.rider_payout = safeOrder.rider_payout == null ? null : Number(safeOrder.rider_payout);
   safeOrder.rider_payout_breakdown = riderPay.parseBreakdown(rider_payout_breakdown);
+  // What Fengle owes the kitchen: nothing for a cancelled order; hidden from support (vendor costs are for super_admin + ops).
+  if (safeOrder.restaurant_payable != null) safeOrder.restaurant_payable = safeOrder.status === "cancelled" ? 0 : Number(safeOrder.restaurant_payable);
+  const isSupport = Boolean(req.auth && req.auth.role === "support");
+  const visibleItems = isSupport ? items.map(stripInternalLineFields) : items.map((l) => ({ ...l, vendor_cost: l.vendor_cost == null ? null : Number(l.vendor_cost) }));
+  if (isSupport) { delete safeOrder.restaurant_payable; delete safeOrder.payable_estimated; }
 
-  res.json({ order: safeOrder, customer, restaurant, rider, items, wallet_ledger: walletLedger });
+  res.json({ order: safeOrder, customer, restaurant, rider, items: visibleItems, wallet_ledger: walletLedger });
 }
 
 /**

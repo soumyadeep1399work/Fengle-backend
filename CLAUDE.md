@@ -109,13 +109,34 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   instance). `promotion` respects the "Offers & news" opt-out, `service` goes to
   everyone targeted; blocked customers never get either. The campaign row is
   the audit trail (who, what, targeted/sent/failed counts).
+- **Kitchens are paid by VENDOR COST, not commission** (client decision
+  2026-10-29, replaces the commission model): every dish has a customer price
+  (`items.price`, plus any offer) and an internal `items.vendor_cost` — what
+  Fengle pays the kitchen per unit, one cost per dish for every kitchen (the
+  seam for a per-kitchen override is `services/restaurantPayable.service.js`).
+  It is **admin-only** (`price_admin_only` 403 for a kitchen) and **never in any
+  customer, kitchen or rider response** — order rows/lines go through
+  `utils/orderPrivacy.js`; `support` admins don't see it either. The cost is
+  snapshotted on `order_items.vendor_cost` at placement and
+  `orders.restaurant_payable` = Σ vendor_cost × quantity over the confirmed
+  lines (recomputed when lines are dropped at accept and on a reject-cascade).
+  A line with no vendor cost falls back to the OLD formula (subtotal minus the
+  kitchen's commission %) and marks the order `payable_estimated`.
+  **Fengle bears ALL discounts** — coupons and dish offers never reduce a
+  kitchen's payable. `commission_amount` is still computed but drives nothing.
+  Kitchens are paid **whenever an admin pays**: no cycle; an admin (`ops`/
+  `super_admin`) records payments (`reference` unique per kitchen, no more than
+  outstanding without `allow_advance`) and signed adjustments; outstanding =
+  Σ payables + adjustments − payments (`settled`/`due`/`advance`). Settlement
+  reads are super_admin + ops only. Profit per dish is super_admin only
+  (`/admin/finance/products`). Any new code that edits an order's confirmed
+  lines or kitchen must call `restaurantPayable.recomputeForOrder`.
 - **Profit & loss is super_admin only** (2026-10-29): `GET /admin/finance/pnl`
   and the expenses CRUD. Every order figure is keyed to the order's **placement
   date in IST** so the P&L and `orders.csv` tie out. Fengle revenue is
-  `commission + delivery fees` (GST is a pass-through, never revenue);
-  restaurant payables are an INTERIM `item_total − commission` until the
-  settlement model is decided; net profit is revenue − rider payouts − coupon
-  discounts − gateway fees (`RAZORPAY_FEE_PERCENT`, default 2%) − expenses.
+  `item_total − restaurant payable + delivery fees` (GST is a pass-through,
+  never revenue); net profit is revenue − rider payouts − coupon discounts −
+  gateway fees (`RAZORPAY_FEE_PERCENT`, default 2%) − expenses.
   Every formula is written out in `docs/API.md` — keep them in sync with
   `services/finance.service.js`.
 - **COD cash handovers** (2026-10-28): outstanding COD is the rider's negative

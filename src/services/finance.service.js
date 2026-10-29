@@ -20,8 +20,9 @@ function gatewayFeePercent() {
  * Every figure in the P&L is a sum over these rows, so the P&L and orders.csv always tie out.
  *
  *   delivered orders only carry revenue/cost:
- *     fengle_revenue   = commission_amount + delivery_fee            (GST is a pass-through, never revenue)
- *     restaurant_payable (INTERIM) = item_total - commission_amount  (until the settlement model is decided)
+ *     fengle_revenue   = item_total - restaurant_payable + delivery_fee   (GST is a pass-through, never revenue)
+ *     restaurant_payable = what Fengle owes the kitchen: sum(vendor_cost x quantity) over confirmed lines, as stored on the order
+ *                          (a line with no vendor cost used the old commission formula, and the order is flagged estimated)
  *     rider_payout     = the payout frozen at delivery; orders delivered before that existed use the current formula (source "estimated")
  *     coupon_discount  = coupon_discount_amount                      (platform-funded)
  *     gateway_charge   = RAZORPAY_FEE_PERCENT % of grand_total, only for upi/card/netbanking
@@ -36,7 +37,7 @@ async function buildOrderEconomics({ from, to }) {
     .select(
       "o.id", "o.created_at", "o.delivered_at", "o.cancelled_at", "o.status", "o.payment_method", "o.payment_status",
       "o.item_total", "o.delivery_fee", "o.cgst_amount", "o.sgst_amount", "o.coupon_discount_amount", "o.grand_total",
-      "o.commission_amount", "o.rider_payout", "o.delivery_lat", "o.delivery_lng", "r.lat as r_lat", "r.lng as r_lng"
+      "o.commission_amount", "o.restaurant_payable", "o.payable_estimated", "o.rider_payout", "o.delivery_lat", "o.delivery_lng", "r.lat as r_lat", "r.lng as r_lng"
     )
     .orderBy("o.created_at", "asc").orderBy("o.id", "asc");
   if (from) q = q.where("o.created_at", ">=", from);
@@ -77,7 +78,10 @@ async function buildOrderEconomics({ from, to }) {
         riderSource = "estimated";
       }
     }
-    const revenue = delivered ? money(commission + deliveryFee) : 0;
+    // The stored payable; an order that somehow has none falls back to the old formula and counts as estimated.
+    const payableStored = o.restaurant_payable != null ? Number(o.restaurant_payable) : money(itemTotal - commission);
+    const payableEstimated = o.restaurant_payable == null || Number(o.payable_estimated) === 1;
+    const revenue = delivered ? money(itemTotal - payableStored + deliveryFee) : 0;
     const gateway = delivered && ONLINE_METHODS.includes(o.payment_method) ? money((grand * feePct) / 100) : 0;
     const couponCost = delivered ? coupon : 0;
     return {
@@ -85,9 +89,10 @@ async function buildOrderEconomics({ from, to }) {
       placed_at: o.created_at, delivered_at: o.delivered_at, cancelled_at: o.cancelled_at,
       status: o.status, payment_method: o.payment_method, payment_status: o.payment_status,
       item_total: itemTotal, delivery_fee: deliveryFee, gst, coupon_discount: coupon, grand_total: grand,
-      commission: delivered ? commission : 0,
+      commission: delivered ? commission : 0, // legacy: no longer drives anything
       fengle_revenue: revenue,
-      restaurant_payable: delivered ? money(itemTotal - commission) : 0,
+      restaurant_payable: delivered ? payableStored : 0,
+      payable_estimated: delivered && payableEstimated,
       rider_payout: money(riderPayout), rider_payout_source: riderSource,
       gateway_charge: gateway,
       offer_discount: money(offers[o.id] || 0), refunded: money(refunded[o.id] || 0),
@@ -119,9 +124,11 @@ function summarize(orderRows, expenseRows) {
     delivered_item_total: sum(delivered, "item_total"),
     delivered_delivery_fees: sum(delivered, "delivery_fee"),
     gst_collected: sum(delivered, "gst"),
-    commission: sum(delivered, "commission"),
+    commission: sum(delivered, "commission"), // legacy / informational
     fengle_revenue: fengleRevenue,
-    restaurant_payables_interim: sum(delivered, "restaurant_payable"),
+    restaurant_payables: sum(delivered, "restaurant_payable"),
+    restaurant_payables_interim: sum(delivered, "restaurant_payable"), // deprecated alias of restaurant_payables, kept so older screens keep working
+    payable_estimated_orders: delivered.filter((o) => o.payable_estimated).length,
     rider_payouts: riderPayouts,
     rider_payouts_stored: money(delivered.filter((o) => o.rider_payout_source === "stored").reduce((s, o) => s + o.rider_payout, 0)),
     rider_payouts_estimated: money(delivered.filter((o) => o.rider_payout_source === "estimated").reduce((s, o) => s + o.rider_payout, 0)),
@@ -160,4 +167,60 @@ async function buildPnl({ from, to, group }) {
   return { periods, totals: summarize(orderRows, expenseRows), orderRows };
 }
 
-module.exports = { buildOrderEconomics, buildPnl, summarize, loadExpenses, gatewayFeePercent, EXPENSE_CATEGORIES, ONLINE_METHODS };
+/**
+ * Profit per dish for delivered orders PLACED in the range (same basis as the P&L), from the lines' own snapshots:
+ *   customer_revenue  = sum(unit_price x quantity)            (what customers paid for the dish, after offers)
+ *   vendor_cost_total = sum(vendor_cost x quantity)           (a line placed with no vendor cost uses the old
+ *                        commission formula and is counted in estimated_units, flagging the row)
+ *   gross_profit      = customer_revenue - vendor_cost_total      margin_percent = gross_profit / customer_revenue
+ * Plus the dish's CURRENT price, vendor cost and margin so a mispriced dish stands out.
+ */
+async function buildProductProfit({ from, to, categoryId }) {
+  let q = db("order_items as oi")
+    .join("orders as o", "o.id", "oi.order_id")
+    .join("items as i", "i.id", "oi.item_id")
+    .join("categories as c", "c.id", "i.category_id")
+    .leftJoin("restaurants as r", "r.id", "o.restaurant_id")
+    .where("o.status", "delivered").andWhere("oi.status", "confirmed")
+    .groupBy("i.id", "i.name", "i.category_id", "c.name", "i.price", "i.offer_price", "i.offer_ends_at", "i.vendor_cost", "i.awaiting_price")
+    .select("i.id as item_id", "i.name", "i.category_id", "c.name as category_name", "i.price", "i.offer_price", "i.offer_ends_at", "i.vendor_cost", "i.awaiting_price")
+    .select(
+      db.raw("SUM(oi.quantity) as units"),
+      db.raw("SUM(oi.subtotal) as revenue"),
+      db.raw("SUM(CASE WHEN oi.vendor_cost IS NOT NULL THEN oi.vendor_cost * oi.quantity ELSE oi.subtotal - oi.subtotal * COALESCE(r.commission_rate_percent, 0) / 100 END) as cost"),
+      db.raw("SUM(CASE WHEN oi.vendor_cost IS NULL THEN oi.quantity ELSE 0 END) as estimated_units")
+    );
+  if (from) q = q.where("o.created_at", ">=", from);
+  if (to) q = q.where("o.created_at", "<=", to);
+  if (categoryId) q = q.where("i.category_id", categoryId);
+  const rows = await q;
+
+  const { presentAdminPricing } = require("../utils/pricing");
+  const products = rows.map((r) => {
+    const revenue = money(r.revenue);
+    const cost = money(r.cost);
+    const profit = money(revenue - cost);
+    const current = presentAdminPricing({ price: r.price, offer_price: r.offer_price, offer_ends_at: r.offer_ends_at, vendor_cost: r.vendor_cost, awaiting_price: r.awaiting_price });
+    return {
+      item_id: r.item_id, name: r.name, category_id: r.category_id, category_name: r.category_name,
+      units_sold: Number(r.units), customer_revenue: revenue, vendor_cost_total: cost, gross_profit: profit,
+      margin_percent: revenue > 0 ? money((profit / revenue) * 100) : null,
+      estimated_units: Number(r.estimated_units), has_estimated_cost: Number(r.estimated_units) > 0,
+      current_price: current.price, current_effective_price: current.effective_price,
+      current_vendor_cost: current.vendor_cost, current_margin: current.margin, current_margin_percent: current.margin_percent,
+    };
+  }).sort((a, b) => b.gross_profit - a.gross_profit || a.item_id - b.item_id);
+
+  const revenue = money(products.reduce((s, p) => s + p.customer_revenue, 0));
+  const cost = money(products.reduce((s, p) => s + p.vendor_cost_total, 0));
+  return {
+    products,
+    totals: {
+      products: products.length, units_sold: products.reduce((s, p) => s + p.units_sold, 0), customer_revenue: revenue,
+      vendor_cost_total: cost, gross_profit: money(revenue - cost), margin_percent: revenue > 0 ? money(((revenue - cost) / revenue) * 100) : null,
+      estimated_units: products.reduce((s, p) => s + p.estimated_units, 0),
+    },
+  };
+}
+
+module.exports = { buildOrderEconomics, buildPnl, buildProductProfit, summarize, loadExpenses, gatewayFeePercent, EXPENSE_CATEGORIES, ONLINE_METHODS };

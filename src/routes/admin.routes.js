@@ -10,6 +10,7 @@ const adminSettings = require("../controllers/adminSettings.controller");
 const adminCod = require("../controllers/adminCod.controller");
 const adminFinance = require("../controllers/adminFinance.controller");
 const adminNotifications = require("../controllers/adminNotifications.controller");
+const adminRestSettlement = require("../controllers/adminRestaurantSettlement.controller");
 const partnerDocuments = require("../controllers/partnerDocuments.controller");
 
 const router = express.Router();
@@ -78,6 +79,17 @@ router.get("/documents/:ownerType/:ownerId", partnerDocuments.getOwnerDocuments)
 router.get("/settings/rider-pay", adminSettings.getRiderPay);
 router.put("/settings/rider-pay", superOnly, adminSettings.updateRiderPay);
 
+// Restaurant settlement (vendor-cost model): what each kitchen is owed, payments and adjustments. super_admin + ops only
+// (statements show what Fengle pays per dish); support never sees it.
+router.get("/restaurant-settlements", staff, adminRestSettlement.overview);
+router.get("/restaurant-settlements.csv", staff, adminRestSettlement.overviewCsv);
+router.get("/restaurants/:id/settlement", staff, adminRestSettlement.statement);
+router.get("/restaurants/:id/settlement.csv", staff, adminRestSettlement.statementCsv);
+router.post("/restaurants/:id/payments", staff, adminRestSettlement.createPayment);
+router.get("/restaurant-payments", staff, adminRestSettlement.listPayments);
+router.post("/restaurants/:id/adjustments", staff, adminRestSettlement.createAdjustment);
+router.get("/restaurant-adjustments", staff, adminRestSettlement.listAdjustments);
+
 // Notification centre (super_admin only): compose, schedule, cancel and review push campaigns to customers.
 router.post("/notifications/preview", superOnly, adminNotifications.preview);
 router.post("/notifications", superOnly, adminNotifications.createCampaign);
@@ -93,6 +105,8 @@ router.delete("/expenses/:id", superOnly, adminFinance.deleteExpense);
 router.get("/finance/pnl", superOnly, adminFinance.pnl);
 router.get("/finance/pnl.csv", superOnly, adminFinance.pnlCsv);
 router.get("/finance/orders.csv", superOnly, adminFinance.ordersCsv);
+router.get("/finance/products", superOnly, adminFinance.products);
+router.get("/finance/products.csv", superOnly, adminFinance.productsCsv);
 
 // Admin accounts (super_admin only) + self-service password change (any admin)
 router.get("/admins", superOnly, adminAdmins.listAdmins);
