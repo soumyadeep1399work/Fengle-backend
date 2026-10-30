@@ -9,6 +9,8 @@ const db = require("../config/db");
 const routing = require("../services/routing.service");
 const commission = require("../services/commission.service");
 const payment = require("../services/payment.service");
+const { isUnpaidOnline, UNPAID_REASON } = require("../services/unpaidOrders.service");
+const { recordCapturedPayment } = require("./razorpayWebhook.controller");
 const wallet = require("../services/wallet.service");
 const { computeTax } = require("../services/tax.service");
 const couponService = require("../services/coupon.service");
@@ -449,6 +451,17 @@ async function confirmPayment(req, res) {
   });
   if (!valid) return res.status(400).json({ error: "Payment verification failed" });
 
+  // The order was cancelled before the money arrived (the unpaid-order timeout, or the customer backing out): the payment can no
+  // longer buy an order, so it goes back as Fengle credits — the same late-capture path the webhook uses.
+  if (order.status === "cancelled") {
+    await recordCapturedPayment(order.razorpay_order_id, razorpay_payment_id);
+    return res.status(409).json({
+      code: "order_expired",
+      payment_status: "refunded",
+      error: `This order had already been cancelled, so your payment of ₹${Number(order.grand_total).toFixed(2)} has been returned to your Fengle credits.`,
+    });
+  }
+
   // Conditional on still being unpaid — guards against racing the Razorpay
   // webhook (POST /payments/razorpay/webhook), which can resolve the same
   // payment from the other side. Without this, an unconditional update could
@@ -651,12 +664,18 @@ async function cancelOrder(req, res) {
   if (order.status !== "placed") {
     return res.status(409).json({ error: "This order can no longer be cancelled — the restaurant has already accepted it" });
   }
-  if (secondsSincePlaced > CANCEL_BUFFER_SECONDS) {
+  // An online-payment order that was never paid (the customer failed or backed out of the payment screen) can always be
+  // cancelled: the 60 s window only protects orders the kitchen could already be looking at.
+  const unpaidOnline = isUnpaidOnline(order);
+  if (!unpaidOnline && secondsSincePlaced > CANCEL_BUFFER_SECONDS) {
     return res.status(409).json({ error: `The ${CANCEL_BUFFER_SECONDS}-second cancellation window has passed` });
   }
 
-  await db.transaction(async (trx) => {
-    await trx("orders").where({ id }).update({ status: "cancelled", cancelled_at: new Date() });
+  const cancelled = await db.transaction(async (trx) => {
+    const fields = { status: "cancelled", cancelled_at: new Date(), ...(unpaidOnline ? { cancelled_by: "customer", cancel_reason: UNPAID_REASON } : {}) };
+    const q = trx("orders").where({ id });
+    if (unpaidOnline) q.where({ status: "placed" }).whereIn("payment_status", ["pending", "failed"]); // a payment landing right now wins
+    if (!(await q.update(fields))) return false;
     if (order.payment_status === "paid") {
       await wallet.recordCustomerRefund(order.customer_id, order.id, Number(order.grand_total), "Customer cancellation", trx);
       await trx("orders").where({ id }).update({ payment_status: "refunded" });
@@ -665,8 +684,10 @@ async function cancelOrder(req, res) {
     // redemption (no-op if none exists) frees the coupon up for reuse rather
     // than silently burning one of the customer's uses on nothing.
     await trx("coupon_redemptions").where({ order_id: id }).delete();
+    return true;
   });
 
+  if (!cancelled) return res.status(409).json({ error: "Your payment was just received, so this order can no longer be cancelled." });
   res.json({ message: "Order cancelled" });
 }
 
@@ -1050,6 +1071,9 @@ async function listMyOrders(req, res) {
   if (!column) return res.status(403).json({ error: "Not applicable for this account type" });
 
   let query = db("orders").where({ [column]: actorId }).orderBy("created_at", "desc");
+
+  // Orders cancelled because the payment was never completed are not real orders: keep them out of a customer's history.
+  if (type === "customer") query = query.andWhere((qb) => qb.whereNull("cancel_reason").orWhere("cancel_reason", "!=", UNPAID_REASON));
 
   // Restaurants should only see paid orders (or COD, which needs no upfront payment).
   if (type === "restaurant") {

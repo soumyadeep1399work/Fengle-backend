@@ -10,4 +10,6 @@ app.listen(PORT, () => {
   require("./services/campaign.service").startScheduler();
   // Safety net for orders waiting on a rider (accepted, no one free yet): the event triggers do the work, this catches misses.
   require("./services/riderDispatch.service").startTick();
+  // Cancels online-payment orders nobody paid for (PAYMENT_EXPIRY_MINUTES, default 5); also clears the backlog once at boot.
+  require("./services/unpaidOrders.service").startTick();
 });

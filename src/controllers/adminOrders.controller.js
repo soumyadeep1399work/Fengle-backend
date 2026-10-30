@@ -16,7 +16,7 @@ const PAYMENT_METHODS = ["upi", "card", "netbanking", "cod", "wallet"];
  * `from`/`to` filter on created_at (inclusive), ISO dates.
  */
 async function listOrders(req, res) {
-  const { status, q, restaurant_id, rider_id, from, to, payment_method } = req.query;
+  const { status, q, restaurant_id, rider_id, from, to, payment_method, include_unpaid } = req.query;
   if (status && !ORDER_STATUSES.includes(status)) {
     return res.status(400).json({ error: `status must be one of: ${ORDER_STATUSES.join(", ")}` });
   }
@@ -32,6 +32,8 @@ async function listOrders(req, res) {
 
   if (status) base = base.where("orders.status", status);
   if (payment_method) base = base.where("orders.payment_method", payment_method);
+  // Orders cancelled because the online payment was never completed are hidden unless asked for (?include_unpaid=1).
+  if (!include_unpaid) base = base.andWhere((qb) => qb.whereNull("orders.cancel_reason").orWhere("orders.cancel_reason", "!=", "payment_not_completed"));
   if (restaurant_id) base = base.where("orders.restaurant_id", restaurant_id);
   if (rider_id) base = base.where("orders.rider_id", rider_id);
   if (from) base = base.where("orders.created_at", ">=", new Date(from));

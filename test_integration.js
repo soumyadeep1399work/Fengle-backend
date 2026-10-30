@@ -3672,6 +3672,79 @@ async function main() {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Test 52: unpaid online orders — immediate cancel, 5-minute expiry, late-payment refund, hidden from lists
+  // ---------------------------------------------------------------------------
+  console.log("\n--- Test 52: unpaid online orders ---");
+  {
+    const unpaid = require("./src/services/unpaidOrders.service");
+    const adminOrdersCtl = require("./src/controllers/adminOrders.controller");
+    const cols = Object.keys(await db("orders").columnInfo());
+    const cust = await db("users").first();
+    const rest = await db("restaurants").first();
+    const mkRes = () => { const r = { code: 200, body: null }; r.status = (c) => { r.code = c; return r; }; r.json = (b) => { r.body = b; return r; }; return r; };
+    const mk = async (over = {}, ageMin = 0) => {
+      const row = { customer_id: cust.id, restaurant_id: rest.id, status: "placed", item_total: 250, grand_total: 250, payment_method: "upi", payment_status: "pending", razorpay_order_id: `dev_order_t52_${Math.random().toString(36).slice(2)}`, delivery_address: "t52", delivery_lat: 22.58, delivery_lng: 88.47, ...over };
+      for (const k of Object.keys(row)) if (!cols.includes(k)) delete row[k];
+      const [id] = await db("orders").insert(row);
+      if (ageMin) await db("orders").where({ id }).update({ created_at: new Date(Date.now() - ageMin * 60000) });
+      return id;
+    };
+    const get = (id) => db("orders").where({ id }).first();
+    const asCust = (extra) => ({ auth: { id: cust.id, type: "customer" }, ...extra });
+
+    const oldUnpaid = await mk({}, 10);
+    const freshUnpaid = await mk({}, 1);
+    const oldCod = await mk({ payment_method: "cod" }, 10);
+    const oldWallet = await mk({ payment_method: "wallet", payment_status: "paid" }, 10);
+    const oldPaid = await mk({ payment_status: "paid" }, 10);
+    const oldAccepted = await mk({ status: "accepted" }, 10);
+    const n = await unpaid.expireUnpaidOrders();
+    const o1 = await get(oldUnpaid);
+    check("the expiry job cancels an unpaid online order older than the expiry (cancelled_by system, reason payment_not_completed)", n >= 1 && o1.status === "cancelled" && o1.cancelled_by === "system" && o1.cancel_reason === "payment_not_completed");
+    check("a fresh unpaid online order is left alone (still inside the expiry window)", (await get(freshUnpaid)).status === "placed");
+    const untouched = [(await get(oldCod)).status, (await get(oldWallet)).status, (await get(oldPaid)).status, (await get(oldAccepted)).status];
+    check("old COD, wallet-paid, paid-online and already-accepted orders are never touched by the job", untouched.join() === "placed,placed,placed,accepted");
+
+    const midUnpaid = await mk({}, 3); // well past the 60 s cancel window
+    let res = mkRes();
+    await orderController.cancelOrder(asCust({ params: { id: midUnpaid } }), res);
+    const cu = await get(midUnpaid);
+    check("a customer can cancel their own UNPAID online order after the 60 s window (a failed payment cancels at once)", res.code === 200 && cu.status === "cancelled" && cu.cancelled_by === "customer" && cu.cancel_reason === "payment_not_completed");
+    const midPaid = await mk({ payment_status: "paid" }, 3);
+    res = mkRes();
+    await orderController.cancelOrder(asCust({ params: { id: midPaid } }), res);
+    check("a PAID order past the 60 s window still cannot be cancelled by the customer", res.code === 409 && (await get(midPaid)).status === "placed");
+    const midCod = await mk({ payment_method: "cod" }, 3);
+    res = mkRes();
+    await orderController.cancelOrder(asCust({ params: { id: midCod } }), res);
+    check("a COD order past the 60 s window still cannot be cancelled either (the unpaid rule is online-only)", res.code === 409 && (await get(midCod)).status === "placed");
+
+    const balBefore = await wallet.getBalance("customer", cust.id);
+    res = mkRes();
+    await orderController.confirmPayment(asCust({ params: { id: oldUnpaid }, body: { razorpay_payment_id: "pay_late_t52", razorpay_signature: "x" } }), res);
+    const afterLate = await get(oldUnpaid);
+    const balAfter = await wallet.getBalance("customer", cust.id);
+    check("a valid payment for an order that already expired -> 409 order_expired, marked refunded, the amount credited to the wallet",
+      res.code === 409 && res.body.code === "order_expired" && afterLate.payment_status === "refunded" && afterLate.status === "cancelled" && Math.abs(balAfter - balBefore - 250) < 0.01);
+    res = mkRes();
+    await orderController.confirmPayment(asCust({ params: { id: oldUnpaid }, body: { razorpay_payment_id: "pay_late_t52", razorpay_signature: "x" } }), res);
+    check("confirming the same late payment again does not refund twice", res.code === 409 && Math.abs((await wallet.getBalance("customer", cust.id)) - balAfter) < 0.01);
+
+    res = mkRes();
+    await orderController.listMyOrders(asCust({ query: {} }), res);
+    const myIds = (res.body.orders || []).map((o) => o.id);
+    check("the customer's order history hides the abandoned unpaid orders but keeps the real ones", !myIds.includes(oldUnpaid) && !myIds.includes(midUnpaid) && myIds.includes(oldPaid) && myIds.includes(oldCod));
+    const adminHas = async (id, query = {}) => {
+      const r = mkRes();
+      await adminOrdersCtl.listOrders({ query: { q: String(id), ...query } }, r); // search by id: the list is newest-first and these test orders are backdated
+      return (r.body.orders || []).some((o) => o.id === id);
+    };
+    check("the admin Orders list hides them by default but still lists real orders",
+      !(await adminHas(oldUnpaid)) && !(await adminHas(midUnpaid)) && (await adminHas(oldPaid)));
+    check("...and ?include_unpaid=1 brings them back", (await adminHas(oldUnpaid, { include_unpaid: "1" })) && (await adminHas(midUnpaid, { include_unpaid: "1" })));
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

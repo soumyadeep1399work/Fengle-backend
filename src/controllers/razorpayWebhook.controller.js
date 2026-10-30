@@ -89,4 +89,4 @@ async function handleWebhook(req, res) {
   }
 }
 
-module.exports = { handleWebhook };
+module.exports = { handleWebhook, recordCapturedPayment };

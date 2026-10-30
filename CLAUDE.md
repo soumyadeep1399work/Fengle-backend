@@ -82,6 +82,7 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   while the order is still `placed` (restaurant hasn't accepted). The
   client-side countdown is UX only; `POST /orders/:id/cancel` enforces both
   conditions server-side and triggers a refund if already paid.
+- **Unpaid online orders** (added 2026-10-30): online-payment orders are created before the payment screen opens, so abandoned ones are cancelled — at once when the customer cancels, else by a job after `PAYMENT_EXPIRY_MINUTES` (default 5) — and hidden from customer history and the default admin list (`cancel_reason = payment_not_completed`). A late payment is refunded to the wallet. Real fix (create the order only after payment) is post-launch.
 - **Rating gate**: a customer with a delivered order that has no
   `restaurant_rating` and `restaurant_rating_skipped = false` is blocked
   from `POST /orders` (and reorder) until they call `rate-restaurant` or
