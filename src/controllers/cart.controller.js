@@ -4,6 +4,8 @@ const { effectivePrice } = require("../utils/pricing");
 const routing = require("../services/routing.service");
 const { computeTax } = require("../services/tax.service");
 const couponService = require("../services/coupon.service");
+const riderDispatch = require("../services/riderDispatch.service");
+const { closedMessage } = require("../utils/serviceHours");
 
 const MIN_ORDER_VALUE = 50; // keep in sync with order.controller.js
 
@@ -50,11 +52,23 @@ async function quoteCart(req, res) {
   const itemTotal = Number(cartItems.reduce((sum, i) => sum + i.unitPrice * i.quantity, 0).toFixed(2));
   const minOrderOk = itemTotal >= MIN_ORDER_VALUE;
 
-  const { match } = await routing.findRestaurantForCart({
+  const routingInput = {
     items: cartItems.map((i) => ({ itemId: i.itemId, categoryId: i.categoryId })),
     customerLat: Number(delivery_lat),
     customerLng: Number(delivery_lng),
-  });
+  };
+  let { match } = await routing.findRestaurantForCart(routingInput);
+
+  // No OPEN kitchen can take it — but a fully-stocked one in range that is only closed right now still lets us price the cart and
+  // explain why it can't be ordered yet ("closed, opens at X") instead of the misleading "nothing nearby".
+  let closedInfo = null;
+  if (!match) {
+    const closed = await routing.findClosedMatch(routingInput);
+    if (closed) {
+      match = closed.match;
+      closedInfo = closed;
+    }
+  }
 
   const clubbable = Boolean(match);
 
@@ -68,6 +82,9 @@ async function quoteCart(req, res) {
       minOrderOk,
       categoryIds,
       clubbable: false,
+      delivery_available: true,
+      unavailable_reason: null,
+      opens_at: null,
       itemTotal,
       reason: categoryIds.length === 2
         ? "No single kitchen nearby can prepare both categories together"
@@ -93,8 +110,20 @@ async function quoteCart(req, res) {
 
   const grandTotal = Number((itemTotal + deliveryFee + cgstAmount + sgstAmount - couponDiscount).toFixed(2));
 
+  // Why the cart can't be ordered right now even though a kitchen can cook it (kitchen closed beats no riders: it's the more useful
+  // thing to tell the customer). `valid` is false and `reason` carries the message, so an app that only reads those still blocks.
+  let unavailableReason = null;
+  let opensAt = null;
+  if (closedInfo) {
+    unavailableReason = "kitchen_closed";
+    opensAt = closedInfo.opens_at;
+  } else if (!(await riderDispatch.hasOnlineRider())) {
+    unavailableReason = "no_riders_online";
+  }
+  const unavailableMessage = unavailableReason === "kitchen_closed" ? closedMessage(opensAt) : unavailableReason === "no_riders_online" ? riderDispatch.NO_RIDERS_MESSAGE : null;
+
   res.json({
-    valid: minOrderOk,
+    valid: minOrderOk && !unavailableReason,
     minOrderOk,
     categoryIds,
     clubbable: true,
@@ -106,7 +135,10 @@ async function quoteCart(req, res) {
     couponDiscount,
     couponError,
     grandTotal,
-    reason: minOrderOk ? null : `Minimum order value is ₹${MIN_ORDER_VALUE}`,
+    delivery_available: !unavailableReason,
+    unavailable_reason: unavailableReason,
+    opens_at: opensAt,
+    reason: unavailableMessage || (minOrderOk ? null : `Minimum order value is ₹${MIN_ORDER_VALUE}`),
   });
 }
 

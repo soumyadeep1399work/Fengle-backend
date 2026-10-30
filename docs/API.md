@@ -585,6 +585,27 @@ The kitchen equivalent, so admins can pay the vendor-cost settlement. Same secre
 - **Kitchen** (restaurant token, **behind the verification gate** — unlike `GET /restaurants/me`, this route is not `allowUnverified`): `PUT /restaurants/me/bank-account { account_holder_name, account_number, ifsc, bank_name?, upi_id? }` → **200 `{ restaurant }`** (exactly the `GET /restaurants/me` shape). `GET /restaurants/me` carries `bank_account: null | { account_holder_name, account_number_last4, ifsc, bank_name, upi_id, updated_at }` — masked, never the full number. Identical resubmit = 200, no history row. **Changing an existing account** writes a history row and pushes the kitchen ("Payout account updated", `data.type: "bank_account_updated"`).
 - **Admin**: `GET /admin/restaurants/:id` gains `bank_account` (full `account_number` for **super_admin and ops**, masked for **support**; `account_number_unavailable: true` when it can't be decrypted) and `bank_account_history[]` (newest first: `{ id, action, changed_by, before, after, created_at }`, last-4s only). `GET /admin/restaurants` rows gain `has_bank_account`. Admin reads are not audited.
 
+## Delivery availability: riders online + waiting orders (added 2026-10-30)
+
+**Online rider** = `riders.status = 'active'` AND approved AND documents in order (when enforced) AND a known location (`last_known_lat/lng`). Suspended, unapproved, offline and "active but never sent a location" riders don't count. There is no staleness filter. **Free** = online and not on an `accepted` / `picked_up` / `on_the_way` order. One module decides both: `services/riderDispatch.service.js`.
+
+**The gate (nobody online at all)**
+- `POST /cart/quote` — when a kitchen can cook the cart but **no rider is online**: `valid: false`, `delivery_available: false`, `unavailable_reason: "no_riders_online"`, `reason: "No delivery partners are online right now. Please try again in a few minutes."`; the bill is still priced and `clubbable` stays true (so no Lock sheet). When deliverable: `delivery_available: true`, `unavailable_reason: null`. (An app that only reads `valid` + `reason` already blocks correctly.)
+- `POST /orders` and `POST /orders/:id/reorder` — **409** `{ code: "no_riders_online", error: "<same message>" }`, checked **before** the order or the Razorpay order is created, so nobody is charged; COD, wallet and online payments alike.
+- If every online rider is merely **busy**, ordering is allowed and the order waits for the first rider to free up.
+
+**Waiting orders** (an `accepted` order with `rider_id` null — nobody was free at accept time). `assignWaitingOrders()` gives them, **oldest first**, each to the **nearest free online rider to its kitchen** (a rider handed one earlier in the same pass counts as busy), writing with a conditional `UPDATE … WHERE rider_id IS NULL`, serialised in-process, so two triggers can never double-assign. Each assignment fires the usual "new delivery" push to the rider. Triggers: (1) `PATCH /riders/me/availability` → `active`; (2) `PATCH /riders/me/location` from an `active` rider; (3) right after `POST /orders/:id/delivered`; (4) a 30-second in-process tick (`riderDispatch.startTick()` from `server.js`, single PM2 instance). The rider's own `GET /orders` / `GET /riders/me/orders` include the order as soon as it is assigned.
+
+## Kitchen service hours (added 2026-10-30)
+
+One **daily window** per kitchen (the same every day), in **IST** (`REPORT_TZ_OFFSET_MINUTES`). `restaurants.opens_at` / `closes_at` (TIME); both null = always open (every existing kitchen); `closes_at` earlier than `opens_at` is an overnight window (`18:00`→`02:00`). Per-weekday schedules are a later step. `utils/serviceHours.js` is the only place the rule lives.
+
+- **Admin** (`ops` / `super_admin`): `PATCH /admin/restaurants/:id { opens_at, closes_at }` — `"HH:MM"` (24 h, two digits) or `null`; both set or both cleared (400 otherwise), not equal. `GET /admin/restaurants/:id`, `GET /admin/restaurants` rows and the PATCH response return `opens_at`, `closes_at` (`"HH:MM"` or null) and `is_open_now` (boolean).
+- **Routing**: a closed kitchen is skipped when matching a cart, so auto-routing and the reject-cascade move on to the next **open** kitchen (`routing.findCandidates` has `includeClosed`, default false). An order already placed before closing can still be accepted and prepared.
+- **Catalog** (customer): a category is **never hidden** for being closed. `GET /categories?lat&lng` entries and `GET /categories/:id` → `category` carry `closed` (true only when it has in-range kitchens and none is open now) and `opens_at` (`"HH:MM"` IST, the earliest next opening among them; null unless closed). `GET /categories/:id/items` returns `{ items, closed, opens_at }` — items are still listed. (Without coordinates: `closed: false`.)
+- **Cart quote**: kitchen closed → `valid: false`, `delivery_available: false`, `unavailable_reason: "kitchen_closed"`, `opens_at`, `reason: "This kitchen is closed right now. It opens at 7:00 PM."`; still priced. Closed wins over `no_riders_online` when both apply.
+- **Orders**: `POST /orders` and reorder → **409** `{ code: "kitchen_closed", opens_at: "HH:MM", error: "This kitchen is closed right now. It opens at 7:00 PM." }`; nothing is created.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**

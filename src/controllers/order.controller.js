@@ -16,7 +16,8 @@ const invoice = require("../services/invoice.service");
 const { haversineDistanceKm } = require("../utils/geo");
 const { notifyLater } = require("../services/push.service");
 const orderPush = require("../services/orderNotifications.service");
-const { applyDocumentsGate } = require("../services/partnerDocuments.service");
+const riderDispatch = require("../services/riderDispatch.service");
+const { closedMessage } = require("../utils/serviceHours");
 
 const MIN_ORDER_VALUE = 50;
 // How long after placing an order a customer can still cancel it for free —
@@ -166,6 +167,15 @@ async function placeOrder(req, res) {
 
   const { match, cascadeAttempts } = await routing.findRestaurantForCart(routingInput);
 
+  // A single-category cart nobody open can take: say "closed, opens at X" if the only reason is service hours.
+  if (!match && categoryIds.length < 2) return respondNoKitchen(res, routingInput);
+
+  // Nobody online to deliver at all: refuse BEFORE anything is created or charged (COD, wallet and online alike). All riders merely
+  // busy is fine — the order waits and goes to the first rider who frees up (riderDispatch.assignWaitingOrders).
+  if (!(await riderDispatch.hasOnlineRider())) {
+    return res.status(409).json({ code: "no_riders_online", error: riderDispatch.NO_RIDERS_MESSAGE });
+  }
+
   if (match) {
     const { order, couponError } = await createOrderForRestaurant({
       customerId, restaurant: match.restaurant, distanceKm: match.distanceKm,
@@ -211,6 +221,16 @@ async function placeOrder(req, res) {
     }
   }
 
+  return respondNoKitchen(res, routingInput);
+}
+
+/**
+ * 409 for a cart no open kitchen can take. If a fully-stocked kitchen is in range but closed, it's `kitchen_closed` with the
+ * earliest `opens_at` ("HH:MM", IST); otherwise the generic "no restaurant" message.
+ */
+async function respondNoKitchen(res, routingInput) {
+  const closed = await routing.findClosedMatch(routingInput);
+  if (closed) return res.status(409).json({ code: "kitchen_closed", opens_at: closed.opens_at, error: closedMessage(closed.opens_at) });
   return res.status(409).json({ error: "No restaurant is currently able to fulfil this order. Please try again shortly." });
 }
 
@@ -657,36 +677,12 @@ async function cancelOrder(req, res) {
 /**
  * Called automatically right after a restaurant accepts (nearest available
  * rider), per the "Rider Auto-Assignment" rule. Exported so it's testable
- * and callable from acceptOrder or an admin override.
+ * and callable from acceptOrder or an admin override. If no rider is free the
+ * order waits (rider_id null) and riderDispatch.assignWaitingOrders() hands it
+ * to the next rider who comes online or frees up.
  */
 async function autoAssignRider(orderId) {
-  const order = await db("orders").where({ id: orderId }).first();
-  if (!order) return null;
-
-  const restaurant = await db("restaurants").where({ id: order.restaurant_id }).first();
-
-  const busyRiderIds = (
-    await db("orders").whereIn("status", ["accepted", "picked_up", "on_the_way"]).whereNotNull("rider_id").select("rider_id")
-  ).map((r) => r.rider_id);
-
-  const candidates = await db("riders")
-    .where({ status: "active", verification_status: "approved" })
-    .modify((qb) => applyDocumentsGate(qb, "documents_valid_until"))
-    .whereNotNull("last_known_lat")
-    .whereNotNull("last_known_lng")
-    .modify((qb) => {
-      if (busyRiderIds.length) qb.whereNotIn("id", busyRiderIds);
-    });
-
-  if (candidates.length === 0) return null;
-
-  const nearest = candidates
-    .map((r) => ({ rider: r, distanceKm: haversineDistanceKm(Number(restaurant.lat), Number(restaurant.lng), Number(r.last_known_lat), Number(r.last_known_lng)) }))
-    .sort((a, b) => a.distanceKm - b.distanceKm)[0];
-
-  await db("orders").where({ id: orderId }).update({ rider_id: nearest.rider.id });
-  notifyLater(() => orderPush.riderAssigned(orderId));
-  return nearest.rider.id;
+  return riderDispatch.assignOne(orderId);
 }
 
 async function markPickedUp(req, res) {
@@ -768,6 +764,7 @@ async function markDelivered(req, res) {
   });
 
   notifyLater(() => orderPush.orderDelivered(id));
+  notifyLater(() => riderDispatch.assignWaitingOrdersSafe()); // this rider is free again: hand them the longest-waiting pickup
   res.json({ message: "Marked delivered" });
 }
 

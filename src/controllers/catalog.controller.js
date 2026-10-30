@@ -4,6 +4,7 @@ const { normalizeCategoryName } = require("../utils/categoryName");
 const categoryService = require("../services/category.service");
 const { parsePortionInput, presentPortion } = require("../utils/portion");
 const { presentPricing, presentAdminPricing } = require("../utils/pricing");
+const { openStatus } = require("../utils/serviceHours");
 
 // What customers see for an item: portion label + price/offer/effective_price.
 const presentCatalogItem = (row) => presentPricing(presentPortion(row));
@@ -20,7 +21,7 @@ const ITEM_COLUMNS = ["items.id", "items.name", "items.description", "items.pric
  * location-filtered catalog read (category items, category detail, search)
  * so they all agree on what "nearby" means.
  */
-async function getInRangeRestaurantIds(lat, lng, categoryId) {
+async function getInRangeRestaurants(lat, lng, categoryId) {
   let query = db("restaurants")
     .where("restaurants.status", "active")
     .andWhere("restaurants.verification_status", "approved")
@@ -30,10 +31,30 @@ async function getInRangeRestaurantIds(lat, lng, categoryId) {
       .join("restaurant_categories", "restaurants.id", "restaurant_categories.restaurant_id")
       .andWhere("restaurant_categories.category_id", categoryId);
   }
-  const restaurants = await query.select("restaurants.id", "restaurants.lat", "restaurants.lng");
-  return restaurants
-    .filter((r) => haversineDistanceKm(Number(lat), Number(lng), Number(r.lat), Number(r.lng)) <= CATALOG_RANGE_KM)
-    .map((r) => r.id);
+  const restaurants = await query.select("restaurants.id", "restaurants.lat", "restaurants.lng", "restaurants.opens_at", "restaurants.closes_at");
+  return restaurants.filter((r) => haversineDistanceKm(Number(lat), Number(lng), Number(r.lat), Number(r.lng)) <= CATALOG_RANGE_KM);
+}
+
+async function getInRangeRestaurantIds(lat, lng, categoryId) {
+  return (await getInRangeRestaurants(lat, lng, categoryId)).map((r) => r.id);
+}
+
+/**
+ * Closed-hours state per category near a location. A category is NEVER hidden for being closed (client's choice: "show it as
+ * closed"): `closed` is true only when it has in-range kitchens and none of them is open right now, and `opens_at` ("HH:MM", IST)
+ * is the earliest next opening among them.
+ */
+async function getCategoryOpenStatus(lat, lng) {
+  const inRange = await getInRangeRestaurants(lat, lng);
+  if (inRange.length === 0) return new Map();
+  const byId = new Map(inRange.map((r) => [r.id, r]));
+  const rows = await db("restaurant_categories").whereIn("restaurant_id", [...byId.keys()]).select("category_id", "restaurant_id");
+  const kitchensByCategory = new Map();
+  for (const { category_id, restaurant_id } of rows) {
+    if (!kitchensByCategory.has(category_id)) kitchensByCategory.set(category_id, []);
+    kitchensByCategory.get(category_id).push(byId.get(restaurant_id));
+  }
+  return new Map([...kitchensByCategory].map(([categoryId, kitchens]) => [categoryId, openStatus(kitchens)]));
 }
 
 /**
@@ -82,7 +103,7 @@ async function attachRatings(items) {
  * and the photo to the first dish photo in the category (else null — the
  * client shows a placeholder). blurb stays null when there is none.
  */
-function serializeCategory(c, { imageFallback, clubPartnerIds } = {}) {
+function serializeCategory(c, { imageFallback, clubPartnerIds, openState } = {}) {
   const hasOwnPrep = c.prep_time_min_minutes != null && c.prep_time_max_minutes != null;
   return {
     id: c.id,
@@ -93,6 +114,8 @@ function serializeCategory(c, { imageFallback, clubPartnerIds } = {}) {
     prepTimeMaxMinutes: hasOwnPrep ? c.prep_time_max_minutes : categoryService.DEFAULT_PREP_MAX_MINUTES,
     minOrder: c.min_order_override != null ? Number(c.min_order_override) : GLOBAL_MIN_ORDER_VALUE,
     ...(clubPartnerIds ? { clubPartnerIds } : {}),
+    closed: openState ? openState.closed : false, // every in-range kitchen for it is outside its service hours right now
+    opens_at: openState ? openState.opens_at : null, // "HH:MM" (IST): earliest next opening; null unless closed
   };
 }
 
@@ -137,9 +160,11 @@ async function listCategories(req, res) {
   }
 
   let categories = await db("categories").where({ is_active: true }).orderBy("name");
+  let openStates = new Map();
   if (located) {
     const visible = await getCategoryIdsWithStock(lat, lng);
     categories = categories.filter((c) => visible.has(c.id));
+    openStates = await getCategoryOpenStatus(lat, lng);
   }
   const shownIds = new Set(categories.map((c) => c.id));
 
@@ -157,7 +182,7 @@ async function listCategories(req, res) {
 
   const imageFallback = await categoryService.firstItemImageByCategory(categories.filter((c) => !c.image_url).map((c) => c.id));
   res.json({
-    categories: categories.map((c) => serializeCategory(c, { imageFallback, clubPartnerIds: partnersByCategory.get(c.id) || [] })),
+    categories: categories.map((c) => serializeCategory(c, { imageFallback, clubPartnerIds: partnersByCategory.get(c.id) || [], openState: openStates.get(c.id) })),
   });
 }
 
@@ -226,6 +251,7 @@ async function getCategoryDetail(req, res) {
   res.json({
     category: serializeCategory(category, {
       imageFallback: await categoryService.firstItemImageByCategory(category.image_url ? [] : [category.id]),
+      openState: (await getCategoryOpenStatus(lat, lng)).get(category.id),
     }),
     sections: [
       { title: "Popular", items: popular },
@@ -247,9 +273,11 @@ async function listItemsForCategory(req, res) {
     return res.status(400).json({ error: "lat and lng query params are required" });
   }
 
-  const inRangeRestaurantIds = await getInRangeRestaurantIds(lat, lng, categoryId);
+  const inRangeRestaurants = await getInRangeRestaurants(lat, lng, categoryId);
+  const inRangeRestaurantIds = inRangeRestaurants.map((r) => r.id);
+  const { closed, opens_at } = openStatus(inRangeRestaurants);
   if (inRangeRestaurantIds.length === 0) {
-    return res.json({ items: [] });
+    return res.json({ items: [], closed, opens_at });
   }
 
   const items = await db("items")
@@ -261,7 +289,7 @@ async function listItemsForCategory(req, res) {
     .groupBy(...ITEM_COLUMNS)
     .select(ITEM_COLUMNS);
 
-  res.json({ items: (await attachRatings(items)).map(presentCatalogItem) });
+  res.json({ items: (await attachRatings(items)).map(presentCatalogItem), closed, opens_at });
 }
 
 /**

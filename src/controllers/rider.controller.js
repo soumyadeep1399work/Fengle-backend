@@ -4,6 +4,7 @@ const riderBank = require("../services/riderBank.service");
 const { CURRENT_AGREEMENT_VERSION, agreementRequired } = require("../utils/agreement");
 const storage = require("../services/storage.service");
 const partnerDocuments = require("../services/partnerDocuments.service");
+const riderDispatch = require("../services/riderDispatch.service");
 
 const VEHICLE_TYPES = ["bike", "scooter", "bicycle", "car"];
 
@@ -162,6 +163,8 @@ async function setAvailability(req, res) {
     return res.status(400).json({ error: "status must be 'active' or 'inactive'" });
   }
   await db("riders").where({ id: req.auth.id }).update({ status });
+  // Going online: hand this rider the longest-waiting accepted order right away (the app polls GET /orders and sees it).
+  if (status === "active") await riderDispatch.assignWaitingOrdersSafe();
   res.json({ message: `Rider marked ${status}` });
 }
 
@@ -177,7 +180,10 @@ async function updateLocation(req, res) {
   if (lat == null || lng == null) {
     return res.status(400).json({ error: "lat and lng are required" });
   }
+  const rider = await db("riders").where({ id: req.auth.id }).select("status").first();
   await db("riders").where({ id: req.auth.id }).update({ last_known_lat: lat, last_known_lng: lng });
+  // A rider who was online without a known position only becomes assignable now; and a waiting order may be nearer to this ping.
+  if (rider && rider.status === "active") await riderDispatch.assignWaitingOrdersSafe();
   res.json({ message: "Location updated" });
 }
 

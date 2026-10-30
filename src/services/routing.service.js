@@ -1,6 +1,7 @@
 const db = require("../config/db");
 const { haversineDistanceKm } = require("../utils/geo");
 const { applyDocumentsGate } = require("./partnerDocuments.service");
+const { isOpenNow, openStatus } = require("../utils/serviceHours");
 
 const CASCADE_CEILING_KM = 7; // hard outer search limit, per confirmed business rule
 const DEFAULT_DELIVERY_RATE_PER_KM = 5; // ₹/km beyond a restaurant's own free radius
@@ -18,9 +19,11 @@ const DEFAULT_DELIVERY_RATE_PER_KM = 5; // ₹/km beyond a restaurant's own free
  * @param {Array<{itemId:number, categoryId:number}>} params.items - deduplicated cart items
  * @param {number} params.customerLat
  * @param {number} params.customerLng
+ * @param {boolean} [params.includeClosed] - default false: kitchens outside their service hours are skipped, so a cascade/reject
+ *   moves on to the next OPEN kitchen. Only the "is the closest answer just closed?" check passes true.
  * @returns {Promise<Array<{restaurant:object, distanceKm:number, missingItemIds:number[]}>>}
  */
-async function findCandidates({ items, customerLat, customerLng }) {
+async function findCandidates({ items, customerLat, customerLng, includeClosed = false }) {
   const categoryIds = [...new Set(items.map((i) => i.categoryId))];
 
   if (categoryIds.length > 2) {
@@ -49,6 +52,7 @@ async function findCandidates({ items, customerLat, customerLng }) {
   for (const restaurant of restaurants) {
     const distanceKm = haversineDistanceKm(customerLat, customerLng, Number(restaurant.lat), Number(restaurant.lng));
     if (distanceKm > CASCADE_CEILING_KM) continue; // outside the hard cascade ceiling
+    if (!includeClosed && !isOpenNow(restaurant)) continue; // outside its service hours
 
     const stockRows = await db("restaurant_items")
       .where({ restaurant_id: restaurant.id })
@@ -90,6 +94,17 @@ async function findRestaurantForCart({ items, customerLat, customerLng }) {
 }
 
 /**
+ * Called when no OPEN kitchen can take the cart: is there a fully-stocked kitchen in range that is merely closed right now?
+ * Returns { match (the nearest such kitchen, for pricing), opens_at ("HH:MM", earliest next opening among them) } or null.
+ */
+async function findClosedMatch({ items, customerLat, customerLng }) {
+  const candidates = await findCandidates({ items, customerLat, customerLng, includeClosed: true });
+  const closed = candidates.filter((c) => c.missingItemIds.length === 0 && !isOpenNow(c.restaurant));
+  if (closed.length === 0) return null;
+  return { match: closed[0], opens_at: openStatus(closed.map((c) => c.restaurant)).opens_at };
+}
+
+/**
  * Computes delivery fee: free within the restaurant's own radius_km, then
  * charged per km beyond that (both admin-configurable).
  */
@@ -103,6 +118,7 @@ function computeDeliveryFee(distanceKm, restaurant) {
 module.exports = {
   findCandidates,
   findRestaurantForCart,
+  findClosedMatch,
   computeDeliveryFee,
   CASCADE_CEILING_KM,
 };

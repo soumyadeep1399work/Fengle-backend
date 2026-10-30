@@ -9,12 +9,13 @@ const { presentPricing } = require("../utils/pricing");
 const { reviewPartner } = require("../services/partnerVerification.service");
 const partnerDocuments = require("../services/partnerDocuments.service");
 const restaurantBank = require("../services/restaurantBank.service");
+const { validateHoursPatch, presentHours } = require("../utils/serviceHours");
 
 // Never password_hash — every admin-facing restaurant read goes through this
 // column list rather than select("*")/first() on the raw table.
 const RESTAURANT_PUBLIC_COLUMNS = [
   "id", "name", "owner_name", "phone", "email", "address", "lat", "lng",
-  "radius_km", "commission_rate_percent", "status", "onboarded_by", "created_at", "updated_at",
+  "radius_km", "commission_rate_percent", "status", "onboarded_by", "created_at", "updated_at", "opens_at", "closes_at",
 ];
 
 /**
@@ -57,7 +58,7 @@ async function onboardRestaurant(req, res) {
     return trx("restaurants").where({ id: restaurantId }).select(RESTAURANT_PUBLIC_COLUMNS).first();
   });
 
-  res.status(201).json({ restaurant: result });
+  res.status(201).json({ restaurant: presentHours(result) });
 }
 
 /** GET /admin/restaurants?page=&limit= — each row includes its order_count. */
@@ -83,7 +84,7 @@ async function listRestaurants(req, res) {
 
   res.json({
     restaurants: restaurants.map((r) => ({
-      ...r, hasAgreementSelfie: !!r.hasAgreementSelfie, has_bank_account: !!r.has_bank_account, order_count: orderCountById[r.id] || 0, documents: docSummaries.get(Number(r.id)),
+      ...presentHours(r), hasAgreementSelfie: !!r.hasAgreementSelfie, has_bank_account: !!r.has_bank_account, order_count: orderCountById[r.id] || 0, documents: docSummaries.get(Number(r.id)),
     })),
     page, limit, total: Number(total),
   });
@@ -101,7 +102,13 @@ async function updateRestaurant(req, res) {
     return res.status(400).json({ error: "status must be 'active', 'inactive' or 'suspended'" });
   }
 
+  const current = await db("restaurants").where({ id }).first();
+  if (!current) return res.status(404).json({ error: "Restaurant not found" });
+  const hours = validateHoursPatch(req.body, current); // opens_at / closes_at: "HH:MM" or null; both or neither
+  if (hours.error) return res.status(400).json({ error: hours.error });
+
   const updates = {};
+  if (hours.value) Object.assign(updates, hours.value);
   if (radius_km != null) updates.radius_km = radius_km;
   if (commission_rate_percent != null) updates.commission_rate_percent = commission_rate_percent;
   if (status) updates.status = status;
@@ -127,7 +134,7 @@ async function updateRestaurant(req, res) {
   }
 
   const restaurant = await db("restaurants").where({ id }).select(RESTAURANT_PUBLIC_COLUMNS).first();
-  res.json({ restaurant });
+  res.json({ restaurant: presentHours(restaurant) });
 }
 
 async function addRestaurantCategory(req, res) {
@@ -166,6 +173,7 @@ async function getRestaurantDetail(req, res) {
     .first();
   if (!restaurant) return res.status(404).json({ error: "Restaurant not found" });
   restaurant.hasAgreementSelfie = !!restaurant.hasAgreementSelfie;
+  Object.assign(restaurant, presentHours(restaurant)); // opens_at / closes_at as "HH:MM" + is_open_now
 
   const categories = await db("restaurant_categories")
     .join("categories", "categories.id", "restaurant_categories.category_id")

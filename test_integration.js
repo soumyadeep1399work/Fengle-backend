@@ -3391,6 +3391,277 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 50: Rider availability gate (no riders online blocks ordering) + waiting orders go to the next free rider ---");
+  {
+    const http = require("http");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const dispatch = require("./src/services/riderDispatch.service");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { Authorization: `Bearer ${token}`, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    const waitFor = async (fn, ms = 4000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (await fn()) return true; await sleep(60); } return false; };
+    const savedRiders = await db("riders").select("id", "status");
+    await db("riders").update({ status: "inactive" }); // start with nobody online; restored in finally
+    // Earlier tests leave accepted-but-riderless orders behind; "oldest waiting first" would hand those out before ours.
+    await db("orders").where({ status: "accepted" }).whereNull("rider_id").update({ status: "cancelled" });
+    try {
+      const LAT = 22.70, LNG = 88.60; // far from every kitchen seeded by the earlier tests
+      const [cat] = await db("categories").insert({ name: "Gate Category" });
+      const [dish] = await db("items").insert({ category_id: cat, name: "Gate Dish", price: 200, created_by_type: "admin" });
+      const [kit] = await db("restaurants").insert({ name: "Gate Kitchen", phone: "8600005001", address: "Newtown", lat: LAT, lng: LNG, radius_km: 5, status: "active" });
+      await db("restaurant_categories").insert({ restaurant_id: kit, category_id: cat });
+      await db("restaurant_items").insert({ restaurant_id: kit, item_id: dish, is_available: true });
+      const [cust] = await db("users").insert({ name: "Gate Customer", phone: "8000005001", wallet_balance: 500 });
+      const mkRider = async (name, phone, extra = {}) => (await db("riders").insert({ name, phone, status: "active", wallet_balance: 0, last_known_lat: LAT + 0.01, last_known_lng: LNG, ...extra }))[0];
+      const custTok = signToken({ id: cust, type: "customer" });
+      const kitTok = signToken({ id: kit, type: "restaurant" });
+      const riderTok = (id) => signToken({ id, type: "rider" });
+      const orderBody = (pm = "cod") => ({ items: [{ item_id: dish, quantity: 1 }], delivery_lat: LAT + 0.005, delivery_lng: LNG, delivery_address: "Gate Address", payment_method: pm });
+      const quote = () => call(custTok, "POST", "/cart/quote", { items: [{ item_id: dish, quantity: 1 }], delivery_lat: LAT + 0.005, delivery_lng: LNG });
+      const orderCount = async () => Number((await db("orders").where({ customer_id: cust }).count({ n: "*" }).first()).n);
+      const place = async (pm) => { const r = await call(custTok, "POST", "/orders", orderBody(pm)); return r; };
+      const accept = (id) => call(kitTok, "POST", `/orders/${id}/accept`, {});
+      const riderOf = async (id) => (await db("orders").where({ id }).first()).rider_id;
+
+      // ---- nobody online: the quote explains it, the order is refused before anything is created or charged
+      const q0 = await quote();
+      check("quote with no riders online: 200, valid:false, delivery_available:false, unavailable_reason no_riders_online, and a readable reason (the bill is still priced)",
+        q0.status === 200 && q0.body.valid === false && q0.body.delivery_available === false && q0.body.unavailable_reason === "no_riders_online" && q0.body.clubbable === true && /No delivery partners are online/.test(q0.body.reason) && q0.body.grandTotal > 0);
+      const noRiderMsg = "No delivery partners are online right now. Please try again in a few minutes.";
+      const results = await Promise.all(["cod", "wallet", "upi"].map((pm) => place(pm)));
+      check("POST /orders with no riders online -> 409 { code: no_riders_online, error } for COD, wallet and online payments alike",
+        results.every((r) => r.status === 409 && r.body.code === "no_riders_online" && r.body.error === noRiderMsg));
+      check("nothing was created or charged: no order row, wallet untouched", (await orderCount()) === 0 && Number((await db("users").where({ id: cust }).first()).wallet_balance) === 500 && (await db("orders").whereNotNull("razorpay_order_id").where({ customer_id: cust }).count({ n: "*" }).first()).n === 0);
+
+      // ---- who counts as "online": active + approved + a known location (suspended / unapproved / no location don't)
+      const noLoc = await mkRider("Gate NoLoc", "8500005001", { last_known_lat: null, last_known_lng: null });
+      const suspended = await mkRider("Gate Suspended", "8500005002", { status: "suspended" });
+      const pendingR = await mkRider("Gate Pending", "8500005003", { verification_status: "pending" });
+      const offline = await mkRider("Gate Offline", "8500005004", { status: "inactive" });
+      check("active-without-a-location, suspended, unapproved and offline riders don't count as online (still 409)", (await place("cod")).body.code === "no_riders_online" && (await quote()).body.unavailable_reason === "no_riders_online");
+      const r1 = await mkRider("Gate Rider 1", "8500005005");
+      const q1 = await quote();
+      check("an online rider (active + approved + location) lifts the block: quote valid, delivery_available true, no reason", q1.body.valid === true && q1.body.delivery_available === true && q1.body.unavailable_reason === null && q1.body.reason === null);
+
+      // ---- reorder is gated the same way
+      const o1 = (await place("cod")).body.order;
+      check("with a rider online the order is placed (201) and still waiting for the kitchen", !!o1 && o1.status === "placed");
+      await db("riders").where({ id: r1 }).update({ status: "inactive" });
+      const reo = await call(custTok, "POST", `/orders/${o1.id}/reorder`, { delivery_lat: LAT + 0.005, delivery_lng: LNG, delivery_address: "Gate Address", payment_method: "cod" });
+      check("reorder with no riders online -> 409 no_riders_online, no second order", reo.status === 409 && reo.body.code === "no_riders_online" && (await orderCount()) === 1);
+      await db("riders").where({ id: r1 }).update({ status: "active" });
+
+      // ---- accepted order -> assigned; a busy-only fleet still lets orders in and they wait
+      await accept(o1.id);
+      check("accept auto-assigns the only online rider", (await riderOf(o1.id)) === r1);
+      const o2 = (await place("cod"));
+      check("all online riders merely busy: the order is still allowed (201)", o2.status === 201);
+      const o2id = o2.body.order.id;
+      check("quote while every rider is busy is still deliverable", (await quote()).body.delivery_available === true);
+      await accept(o2id);
+      check("an accepted order with every rider busy waits: rider_id stays null", (await riderOf(o2id)) === null);
+
+      // ---- trigger 1: a rider going online gets the waiting order at once, and the rider's own list shows it
+      const r2 = await mkRider("Gate Rider 2", "8500005006", { status: "inactive" });
+      const on = await call(riderTok(r2), "PATCH", "/riders/me/availability", { status: "active" });
+      check("PATCH /riders/me/availability active hands the waiting order to that rider immediately", on.status === 200 && (await riderOf(o2id)) === r2);
+      const mine = await call(riderTok(r2), "GET", "/orders");
+      check("the rider's GET /orders already includes the newly assigned order", mine.status === 200 && JSON.stringify(mine.body).includes(`"id":${o2id}`));
+
+      // ---- trigger 3: delivering frees a rider, who picks up the longest-waiting order
+      const o3 = (await place("cod")).body.order; await accept(o3.id);
+      const o4 = (await place("cod")).body.order; await accept(o4.id);
+      check("two more accepted orders wait while both riders are busy", (await riderOf(o3.id)) === null && (await riderOf(o4.id)) === null);
+      const deliver = async (orderId, riderId) => {
+        const row = await db("orders").where({ id: orderId }).first();
+        await call(riderTok(riderId), "POST", `/orders/${orderId}/picked-up`, {});
+        await call(riderTok(riderId), "POST", `/orders/${orderId}/on-the-way`, {});
+        return call(riderTok(riderId), "POST", `/orders/${orderId}/delivered`, { delivery_otp: row.delivery_otp, cod_amount_collected: Number(row.grand_total) });
+      };
+      const del = await deliver(o1.id, r1);
+      check("rider 1 delivers order 1", del.status === 200);
+      check("right after delivering, the freed rider is given the OLDEST waiting order (order 3, not order 4)", await waitFor(async () => (await riderOf(o3.id)) === r1));
+      check("order 4 keeps waiting (nobody else is free)", (await riderOf(o4.id)) === null);
+
+      // ---- trigger 2: a location ping from an online rider with no known position
+      const r3 = await mkRider("Gate Rider 3", "8500005007", { last_known_lat: null, last_known_lng: null });
+      check("a rider who is 'active' but has no location can't take the waiting order yet", (await dispatch.assignWaitingOrders()).length === 0 && (await riderOf(o4.id)) === null);
+      const ping = await call(riderTok(r3), "PATCH", "/riders/me/location", { lat: LAT + 0.02, lng: LNG });
+      check("PATCH /riders/me/location from an active rider assigns the waiting order", ping.status === 200 && (await riderOf(o4.id)) === r3);
+
+      // ---- trigger 4 (the safety-net tick runs assignWaitingOrders) and the double-assignment guard
+      await db("orders").where({ id: o1.id }).update({ restaurant_rating_skipped: true }); // the rating gate would otherwise block the next order
+      const o5 = (await place("cod")).body.order; await accept(o5.id);
+      const r4 = await mkRider("Gate Rider 4", "8500005008"); // went online by a path with no trigger (e.g. an admin edit)
+      check("the safety-net pass (what the 30 s tick runs) assigns it", (await dispatch.assignWaitingOrders()).some((a) => a.order_id === o5.id && a.rider_id === r4) && (await riderOf(o5.id)) === r4);
+      check("the tick interval is 30 seconds", dispatch.TICK_MS === 30000);
+      const o6 = (await place("cod")).body.order; await accept(o6.id);
+      const r5 = await mkRider("Gate Rider 5", "8500005009");
+      const r6 = await mkRider("Gate Rider 6", "8500005010");
+      const passes = await Promise.all([dispatch.assignWaitingOrders(), dispatch.assignWaitingOrders(), dispatch.assignOne(o6.id)]);
+      const holders = await db("orders").whereIn("status", ["accepted"]).whereIn("rider_id", [r5, r6]).select("id", "rider_id");
+      check("racing triggers can't double-assign: order 6 got exactly one rider, and no rider holds two orders", passes.flat().length >= 1 && holders.filter((h) => h.id === o6.id).length === 1 && new Set(holders.map((h) => h.rider_id)).size === holders.length);
+
+      // ---- nothing left to do
+      const waitingNone = await dispatch.assignWaitingOrders();
+      check("assignWaitingOrders with nothing waiting is a no-op", Array.isArray(waitingNone) && waitingNone.length === 0);
+    } finally {
+      for (const r of savedRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+
+  console.log("\n--- Test 51: Kitchen service hours — closed kitchens are skipped, categories show as closed, orders refused, admin sets the window ---");
+  {
+    const hours = require("./src/utils/serviceHours");
+    // 2026-10-30 13:30 UTC = 19:00 IST
+    const at = (hh, mm) => new Date(Date.UTC(2026, 9, 30, hh, mm) - 330 * 60000); // an IST wall-clock time on that day
+    const win = (o, c) => ({ opens_at: o, closes_at: c });
+    check("no hours (both null) = always open", hours.isOpenNow(win(null, null), at(3, 0)) && hours.isOpenNow(win(null, null), at(23, 59)));
+    const day = win("09:00:00", "22:00:00");
+    check("daily window 09:00-22:00 IST: closed 08:59, open 09:00, open 21:59, closed 22:00 (TIME columns arrive as HH:MM:SS)",
+      !hours.isOpenNow(day, at(8, 59)) && hours.isOpenNow(day, at(9, 0)) && hours.isOpenNow(day, at(21, 59)) && !hours.isOpenNow(day, at(22, 0)));
+    const night = win("18:00", "02:00");
+    check("overnight window 18:00-02:00: open 18:00, 23:00 and 01:59; closed 02:00 and noon",
+      hours.isOpenNow(night, at(18, 0)) && hours.isOpenNow(night, at(23, 0)) && hours.isOpenNow(night, at(1, 59)) && !hours.isOpenNow(night, at(2, 0)) && !hours.isOpenNow(night, at(12, 0)));
+    check("the clock is IST, not UTC (22:00 UTC is already 03:30 IST the next day)", !hours.isOpenNow(day, new Date(Date.UTC(2026, 9, 30, 22, 0))) && hours.isOpenNow(night, new Date(Date.UTC(2026, 9, 30, 22, 0))) === false);
+    check("minutesUntilOpen: 0 when open, wraps past midnight when closed, null with no hours", hours.minutesUntilOpen(day, at(10, 0)) === 0 && hours.minutesUntilOpen(day, at(23, 0)) === 600 && hours.minutesUntilOpen(day, at(8, 0)) === 60 && hours.minutesUntilOpen(win(null, null), at(8, 0)) === null);
+    const st = hours.openStatus([win("09:00", "22:00"), win("18:00", "23:00")], at(7, 0));
+    check("openStatus: closed only when none is open, opens_at is the earliest next opening ('HH:MM'); one open kitchen = not closed; no kitchens = not closed",
+      st.closed === true && st.opens_at === "09:00" && hours.openStatus([win("09:00", "22:00"), win(null, null)], at(7, 0)).closed === false && hours.openStatus([], at(7, 0)).closed === false && hours.openStatus([win("09:00", "22:00"), win("18:00", "23:00")], at(19, 0)).closed === false);
+    check("friendly text: 19:00 -> 7:00 PM, 00:30 -> 12:30 AM, 12:00 -> 12:00 PM", hours.friendlyTime("19:00") === "7:00 PM" && hours.friendlyTime("00:30") === "12:30 AM" && hours.friendlyTime("12:00") === "12:00 PM");
+    const bad = [{ opens_at: "9:00", closes_at: "22:00" }, { opens_at: "25:00", closes_at: "22:00" }, { opens_at: "09:00" }, { opens_at: "09:00", closes_at: null }, { opens_at: "09:00", closes_at: "09:00" }, { opens_at: 900, closes_at: "22:00" }, { opens_at: "09:60", closes_at: "22:00" }];
+    check("validateHoursPatch rejects a bad time, only one of the pair, and opens == closes", bad.every((b) => hours.validateHoursPatch(b, { opens_at: null, closes_at: null }).error));
+    check("validateHoursPatch accepts both set, both null/'' (clears), nothing given, and a single field against the stored other one",
+      hours.validateHoursPatch({ opens_at: "09:00", closes_at: "22:00" }, win(null, null)).value.opens_at === "09:00" && hours.validateHoursPatch({ opens_at: null, closes_at: null }, win("09:00:00", "22:00:00")).value.opens_at === null
+      && hours.validateHoursPatch({ opens_at: "", closes_at: "" }, win("09:00:00", "22:00:00")).value.closes_at === null && hours.validateHoursPatch({ name: "x" }, win(null, null)).value === null
+      && hours.validateHoursPatch({ closes_at: "23:00" }, win("09:00:00", "22:00:00")).value.opens_at === "09:00" && hours.validateHoursPatch({ closes_at: "09:00" }, win("09:00:00", "22:00:00")).error);
+
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    const savedRiders = await db("riders").select("id", "status");
+    await db("riders").update({ status: "inactive" });
+    try {
+      const LAT = 22.80, LNG = 88.70; // far from every kitchen the earlier tests created
+      const [cat] = await db("categories").insert({ name: "Hours Category" });
+      const [dish] = await db("items").insert({ category_id: cat, name: "Hours Dish", price: 200, created_by_type: "admin" });
+      const mkKitchen = async (name, phone, dLat, extra = {}) => {
+        const [id] = await db("restaurants").insert({ name, phone, address: "Newtown", lat: LAT + dLat, lng: LNG, radius_km: 5, status: "active", ...extra });
+        await db("restaurant_categories").insert({ restaurant_id: id, category_id: cat });
+        await db("restaurant_items").insert({ restaurant_id: id, item_id: dish, is_available: true });
+        return id;
+      };
+      const kNear = await mkKitchen("Hours Near", "8600005101", 0.005); // nearest
+      const kFar = await mkKitchen("Hours Far", "8600005102", 0.03);
+      const [cust] = await db("users").insert({ name: "Hours Customer", phone: "8000005101", wallet_balance: 0 });
+      await db("riders").insert({ name: "Hours Rider", phone: "8500005101", status: "active", wallet_balance: 0, last_known_lat: LAT, last_known_lng: LNG });
+      const custTok = signToken({ id: cust, type: "customer" });
+      const [adminId] = await db("admins").insert({ name: "hours-super", email: "hours-super@hours.test", password_hash: await bcrypt.hash("a-long-password-1", 4), role: "super_admin" });
+      const [supId] = await db("admins").insert({ name: "hours-support", email: "hours-support@hours.test", password_hash: await bcrypt.hash("a-long-password-1", 4), role: "support" });
+      const adminTok = signToken({ id: adminId, type: "admin" });
+      const supTok = signToken({ id: supId, type: "admin" });
+      const here = { lat: LAT, lng: LNG };
+      const orderBody = { items: [{ item_id: dish, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Hours Address", payment_method: "cod" };
+      const quote = () => call(custTok, "POST", "/cart/quote", { items: orderBody.items, delivery_lat: LAT, delivery_lng: LNG });
+      const patchHours = (id, body) => call(adminTok, "PATCH", `/admin/restaurants/${id}`, body);
+      const orderCount = async () => Number((await db("orders").where({ customer_id: cust }).count({ n: "*" }).first()).n);
+      const hhmm = (min) => { const m = ((min % 1440) + 1440) % 1440; return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`; };
+      const nowMin = hours.nowMinutesIst();
+      const closedWin = { opens_at: hhmm(nowMin + 120), closes_at: hhmm(nowMin + 240) }; // opens in 2 hours: closed right now
+      const openWin = { opens_at: hhmm(nowMin - 60), closes_at: hhmm(nowMin + 60) };       // open right now
+      const nearlyAllDay = { opens_at: hhmm(nowMin + 720), closes_at: hhmm(nowMin + 660) }; // 23 h window that contains now (an overnight one when it wraps)
+
+      // ---- admin sets the window
+      const detail0 = await call(adminTok, "GET", `/admin/restaurants/${kNear}`);
+      check("a kitchen with no hours reads opens_at null / closes_at null / is_open_now true (every existing kitchen: always open)", detail0.body.restaurant.opens_at === null && detail0.body.restaurant.closes_at === null && detail0.body.restaurant.is_open_now === true);
+      const badPatches = await Promise.all([{ opens_at: "9:00", closes_at: "22:00" }, { opens_at: "09:00" }, { opens_at: "10:00", closes_at: "10:00" }, { opens_at: "99:00", closes_at: "22:00" }].map((b) => patchHours(kNear, b)));
+      check("PATCH /admin/restaurants/:id rejects a malformed time, only one of opens_at/closes_at, and opens == closes (400 with a readable error)", badPatches.every((r) => r.status === 400 && typeof r.body.error === "string"));
+      check("support can't set hours (403) and a missing kitchen is 404", (await call(supTok, "PATCH", `/admin/restaurants/${kNear}`, closedWin)).status === 403 && (await patchHours(999999, closedWin)).status === 404);
+      const setClosed = await patchHours(kNear, closedWin);
+      check("PATCH sets the window: 200, the kitchen comes back with 'HH:MM' times and is_open_now false", setClosed.status === 200 && setClosed.body.restaurant.opens_at === closedWin.opens_at && setClosed.body.restaurant.closes_at === closedWin.closes_at && setClosed.body.restaurant.is_open_now === false);
+      const detail1 = await call(adminTok, "GET", `/admin/restaurants/${kNear}`);
+      const list1 = await call(adminTok, "GET", "/admin/restaurants?limit=200");
+      check("GET detail and GET list carry opens_at / closes_at ('HH:MM') and is_open_now", detail1.body.restaurant.opens_at === closedWin.opens_at && detail1.body.restaurant.is_open_now === false && list1.body.restaurants.find((r) => r.id === kNear).closes_at === closedWin.closes_at && list1.body.restaurants.find((r) => r.id === kNear).is_open_now === false && list1.body.restaurants.find((r) => r.id === kFar).is_open_now === true);
+      check("patching another field leaves the hours alone", (await patchHours(kNear, { radius_km: 5 })).body.restaurant.opens_at === closedWin.opens_at);
+
+      // ---- routing skips the closed kitchen: the cascade goes to the next OPEN one
+      const candDefault = await routing.findCandidates({ items: [{ itemId: dish, categoryId: cat }], customerLat: LAT, customerLng: LNG });
+      const candAll = await routing.findCandidates({ items: [{ itemId: dish, categoryId: cat }], customerLat: LAT, customerLng: LNG, includeClosed: true });
+      check("findCandidates skips the closed nearest kitchen by default (and lists it with includeClosed)", candDefault.length === 1 && candDefault[0].restaurant.id === kFar && candAll.length === 2 && candAll[0].restaurant.id === kNear);
+      const q1 = await quote();
+      check("quote with the nearest kitchen closed but another open: valid (priced from the open kitchen)", q1.body.valid === true && q1.body.delivery_available === true && q1.body.unavailable_reason === null);
+      const placed1 = await call(custTok, "POST", "/orders", orderBody);
+      check("the order is routed past the closed kitchen to the open one", placed1.status === 201 && placed1.body.order.restaurant_id === kFar);
+      // an order placed while open can still be accepted after the kitchen closes
+      await patchHours(kFar, closedWin);
+      const acc = await call(signToken({ id: kFar, type: "restaurant" }), "POST", `/orders/${placed1.body.order.id}/accept`, {});
+      check("an order already placed before closing can still be accepted", acc.status === 200 && acc.body.order.status === "accepted");
+
+      // ---- every kitchen for the category closed: shown as closed, quote + order + reorder refused
+      const opensAtExpected = hhmm(nowMin + 120);
+      const cats = await call(null, "GET", `/categories?lat=${LAT}&lng=${LNG}`);
+      const c1 = cats.body.categories.find((c) => c.id === cat);
+      check("GET /categories (with lat/lng) does NOT hide a closed category: closed:true and opens_at = the earliest next opening", !!c1 && c1.closed === true && c1.opens_at === opensAtExpected);
+      const detailCat = await call(null, "GET", `/categories/${cat}?lat=${LAT}&lng=${LNG}`);
+      check("GET /categories/:id carries the same closed / opens_at, and still lists the dishes", detailCat.body.category.closed === true && detailCat.body.category.opens_at === opensAtExpected && detailCat.body.sections.flatMap((s) => s.items).length === 1);
+      const itemsRes = await call(null, "GET", `/categories/${cat}/items?lat=${LAT}&lng=${LNG}`);
+      check("GET /categories/:id/items likewise: items still returned, closed:true, opens_at", itemsRes.body.items.length === 1 && itemsRes.body.closed === true && itemsRes.body.opens_at === opensAtExpected);
+      const qc = await quote();
+      check("quote: valid:false, delivery_available:false, unavailable_reason kitchen_closed, opens_at and a readable reason (still priced, clubbable)",
+        qc.body.valid === false && qc.body.delivery_available === false && qc.body.unavailable_reason === "kitchen_closed" && qc.body.opens_at === opensAtExpected && qc.body.clubbable === true && qc.body.grandTotal > 0 && /closed right now\. It opens at \d{1,2}:\d{2} (AM|PM)\./.test(qc.body.reason));
+      const before = await orderCount();
+      const pc = await call(custTok, "POST", "/orders", orderBody);
+      check("POST /orders -> 409 { code: kitchen_closed, opens_at, error } and nothing is created", pc.status === 409 && pc.body.code === "kitchen_closed" && pc.body.opens_at === opensAtExpected && /closed right now\. It opens at/.test(pc.body.error) && (await orderCount()) === before);
+      const rc = await call(custTok, "POST", `/orders/${placed1.body.order.id}/reorder`, { delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Hours Address", payment_method: "cod" });
+      check("reorder is refused the same way (409 kitchen_closed)", rc.status === 409 && rc.body.code === "kitchen_closed" && (await orderCount()) === before);
+
+      // ---- opening up again
+      await patchHours(kNear, openWin);
+      const catsOpen = await call(null, "GET", `/categories?lat=${LAT}&lng=${LNG}`);
+      const c2 = catsOpen.body.categories.find((c) => c.id === cat);
+      check("with one kitchen open the category is open again (closed:false, opens_at null)", c2.closed === false && c2.opens_at === null);
+      const po = await call(custTok, "POST", "/orders", orderBody);
+      check("and orders go through to the open nearest kitchen", po.status === 201 && po.body.order.restaurant_id === kNear);
+      const reNow = await call(custTok, "POST", `/orders/${placed1.body.order.id}/reorder`, { delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Hours Address", payment_method: "cod" });
+      check("reorder works while a kitchen is open", reNow.status === 201);
+
+      // ---- reject cascade only moves to an OPEN kitchen
+      const orderPlacedNear = po.body.order.id;
+      await patchHours(kNear, openWin); // still open for the reject itself
+      const rej = await call(signToken({ id: kNear, type: "restaurant" }), "POST", `/orders/${orderPlacedNear}/reject`, {});
+      const afterRej = await db("orders").where({ id: orderPlacedNear }).first();
+      check("reject cascade never lands on a closed kitchen (the only other kitchen is closed -> the order is cancelled, not given to it)", rej.status === 200 && afterRej.restaurant_id !== kFar && afterRej.status === "cancelled");
+
+      // ---- overnight / long windows, and clearing
+      check("a long window that contains now (overnight when it wraps) is open", (await patchHours(kFar, nearlyAllDay)).body.restaurant.is_open_now === true);
+      const cleared = await patchHours(kFar, { opens_at: null, closes_at: null });
+      check("null/null clears the window (always open again)", cleared.status === 200 && cleared.body.restaurant.opens_at === null && cleared.body.restaurant.closes_at === null && cleared.body.restaurant.is_open_now === true);
+      const setBoth = await patchHours(kFar, openWin);
+      const onlyOne = await patchHours(kFar, { opens_at: null });
+      check("clearing only one side while the other is set is refused (400), and the window is untouched", setBoth.status === 200 && onlyOne.status === 400 && (await call(adminTok, "GET", `/admin/restaurants/${kFar}`)).body.restaurant.opens_at === openWin.opens_at);
+    } finally {
+      for (const r of savedRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@hours.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

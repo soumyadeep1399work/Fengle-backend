@@ -182,6 +182,19 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   (`PATCH /riders/me/availability`) and admin suspension. There is deliberately
   no location-staleness filter in auto-assignment (pings are foreground-only, so
   a rider with a locked phone would silently stop getting orders).
+- **No rider online = no orders; waiting orders find a rider** (2026-10-30): if
+  no rider is online (active + approved + a known location; busy riders still count)
+  `POST /cart/quote` says `no_riders_online` and `POST /orders`/reorder 409 before
+  anything is created or charged. An accepted order nobody was free for waits with
+  `rider_id` null and `services/riderDispatch.service.js` hands it to the next free
+  rider — oldest first, nearest to its kitchen — when a rider goes online, pings a
+  location, delivers, or on a 30 s tick. All assignment goes through that module.
+- **Kitchen service hours** (2026-10-30): `restaurants.opens_at`/`closes_at`, one
+  daily IST window (both null = always open, overnight allowed), set by an admin.
+  Routing skips closed kitchens (so the reject-cascade goes to the next open one);
+  the catalog still shows a closed category with `closed`/`opens_at`; quote and
+  order say `kitchen_closed` + `opens_at`. An order placed before closing can still
+  be accepted. The rule lives in `utils/serviceHours.js`.
 - **Wallet** is shared infrastructure for both customer refunds/credits and
   rider COD reconciliation — see `wallet_ledger` table (owner_type/owner_id
   polymorphic pattern).
