@@ -17,6 +17,9 @@ const { applyDocumentsGate } = require("./partnerDocuments.service");
 
 const BUSY_STATUSES = ["accepted", "picked_up", "on_the_way"];
 const TICK_MS = 30 * 1000;
+// An accepted order nobody has picked up for this long is stale (a forgotten test order, a dead delivery): the waiting-order pass never
+// hands it to a rider. Admins can still reassign it by hand.
+const WAITING_MAX_AGE_HOURS = Number(process.env.WAITING_ORDER_MAX_AGE_HOURS) > 0 ? Number(process.env.WAITING_ORDER_MAX_AGE_HOURS) : 6;
 const NO_RIDERS_MESSAGE = "No delivery partners are online right now. Please try again in a few minutes.";
 
 function onlineRiderQuery(conn = db) {
@@ -76,11 +79,12 @@ function assignOne(orderId) {
 
 /**
  * Gives every accepted-but-riderless order, oldest first, to the nearest free online rider. A rider handed an order earlier in the
- * same pass counts as busy for the rest. Returns [{ order_id, rider_id }].
+ * same pass counts as busy for the rest. Orders older than WAITING_MAX_AGE_HOURS are skipped. Returns [{ order_id, rider_id }].
  */
 function assignWaitingOrders() {
   return serialised(async () => {
-    const waiting = await db("orders").where({ status: "accepted" }).whereNull("rider_id").orderBy("created_at", "asc").orderBy("id", "asc").select("id", "restaurant_id");
+    const cutoff = new Date(Date.now() - WAITING_MAX_AGE_HOURS * 3600 * 1000);
+    const waiting = await db("orders").where({ status: "accepted" }).whereNull("rider_id").where("created_at", ">=", cutoff).orderBy("created_at", "asc").orderBy("id", "asc").select("id", "restaurant_id");
     if (waiting.length === 0) return [];
     const busy = await busyRiderIds();
     const givenThisPass = [];
@@ -117,4 +121,4 @@ function startTick() {
   timer.unref();
 }
 
-module.exports = { onlineRiderQuery, hasOnlineRider, assignOne, assignWaitingOrders, assignWaitingOrdersSafe, startTick, TICK_MS, BUSY_STATUSES, NO_RIDERS_MESSAGE };
+module.exports = { onlineRiderQuery, hasOnlineRider, assignOne, assignWaitingOrders, assignWaitingOrdersSafe, startTick, TICK_MS, WAITING_MAX_AGE_HOURS, BUSY_STATUSES, NO_RIDERS_MESSAGE };

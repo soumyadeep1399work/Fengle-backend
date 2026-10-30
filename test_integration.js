@@ -3508,6 +3508,16 @@ async function main() {
       const holders = await db("orders").whereIn("status", ["accepted"]).whereIn("rider_id", [r5, r6]).select("id", "rider_id");
       check("racing triggers can't double-assign: order 6 got exactly one rider, and no rider holds two orders", passes.flat().length >= 1 && holders.filter((h) => h.id === o6.id).length === 1 && new Set(holders.map((h) => h.rider_id)).size === holders.length);
 
+      // ---- stale orders are never auto-assigned (a forgotten accepted order must not grab a rider days later)
+      const o7 = (await place("cod")).body.order; await accept(o7.id);
+      await db("orders").where({ id: o7.id }).update({ rider_id: null, created_at: new Date(Date.now() - 8 * 3600 * 1000) }); // free riders existed, so accept assigned one: put it back to "waiting", 8 h old
+      const r7 = await mkRider("Gate Rider 7", "8500005011");
+      const swept = await dispatch.assignWaitingOrders();
+      check("an accepted order older than the max wait (6 h by default) is NOT handed to a free rider", dispatch.WAITING_MAX_AGE_HOURS === 6 && !swept.some((x) => x.order_id === o7.id) && (await riderOf(o7.id)) === null);
+      const o8 = (await place("cod")).body.order; await accept(o8.id);
+      check("a fresh accepted order is still assigned to a free rider (the guard only skips stale ones)", (await riderOf(o8.id)) !== null && (await riderOf(o7.id)) === null);
+      await db("orders").where({ id: o7.id }).update({ status: "cancelled" });
+
       // ---- nothing left to do
       const waitingNone = await dispatch.assignWaitingOrders();
       check("assignWaitingOrders with nothing waiting is a no-op", Array.isArray(waitingNone) && waitingNone.length === 0);
