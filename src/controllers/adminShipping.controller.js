@@ -10,7 +10,11 @@ const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 class HttpError extends Error {
   constructor(status, message, code) { super(message); this.status = status; this.code = code; }
 }
-const fail = (res, e) => res.status(e.status || 500).json({ error: e.message, ...(e.code ? { code: e.code } : {}) });
+const fail = (res, e) => {
+  const status = e.status || 500;
+  if (status >= 500) console.error("[shipping]", e); // an unexpected fault (database, bug): log it, never send its text to the client
+  return res.status(status).json({ error: status >= 500 ? "Something went wrong on our side. Please try again in a moment." : e.message, ...(e.code && status < 500 ? { code: e.code } : {}) });
+};
 
 const isNum = (v) => typeof v === "number" && Number.isFinite(v);
 const toNum = (v) => (typeof v === "string" && v.trim() !== "" ? Number(v) : v);

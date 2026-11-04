@@ -3745,6 +3745,54 @@ async function main() {
     check("...and ?include_unpaid=1 brings them back", (await adminHas(oldUnpaid, { include_unpaid: "1" })) && (await adminHas(midUnpaid, { include_unpaid: "1" })));
   }
 
+  console.log("\n--- Test 52: unexpected server errors never leak internals; a deleted customer's token is refused ---");
+  {
+    const http = require("http");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const savedEnv = process.env.NODE_ENV;
+    const fakeRes = () => { const r = {}; r.status = (c) => { r.statusCode = c; return r; }; r.json = (b) => { r.body = b; return r; }; return r; };
+    const fakeReq = { method: "POST", originalUrl: "/api/v1/addresses" };
+    const sqlErr = Object.assign(new Error("insert into `addresses` (`address_line`, `customer_id`) values ('Dealer House', 12) - Cannot add or update a child row: a foreign key constraint fails (`food_delivery`.`addresses`, CONSTRAINT `addresses_customer_id_foreign` FOREIGN KEY (`customer_id`) REFERENCES `users` (`id`))"), { code: "ER_NO_REFERENCED_ROW_2", errno: 1452, sqlMessage: "secret internals" });
+    const origError = console.error; console.error = () => {}; // the handler logs the full error on purpose
+    try {
+      process.env.NODE_ENV = "production";
+      const prod = fakeRes(); app.errorHandler(sqlErr, fakeReq, prod, () => {});
+      check("production: a database error becomes a generic 500 with a ref — no SQL, table, column or constraint text, no code",
+        prod.statusCode === 500 && /Something went wrong on our side/.test(prod.body.error) && /^[0-9a-f]{8}$/.test(prod.body.ref) && !JSON.stringify(prod.body).match(/insert into|addresses|foreign key|customer_id|users|ER_NO_REFERENCED|secret internals|Dealer House/i) && Object.keys(prod.body).sort().join() === "error,ref");
+      const plainBug = fakeRes(); app.errorHandler(new TypeError("Cannot read properties of undefined (reading 'lat')"), fakeReq, plainBug, () => {});
+      check("production: a plain code bug is hidden the same way", plainBug.statusCode === 500 && !/Cannot read properties|lat/.test(JSON.stringify(plainBug.body)));
+      const refs = new Set([prod.body.ref, plainBug.body.ref]);
+      check("each failure gets its own ref (so a support report can be matched to the log)", refs.size === 2);
+      const deliberate = fakeRes(); app.errorHandler(Object.assign(new Error("An order cannot span more than 2 categories"), { status: 400 }), fakeReq, deliberate, () => {});
+      check("production: a deliberate error (status < 500) keeps its readable message and status", deliberate.statusCode === 400 && deliberate.body.error === "An order cannot span more than 2 categories" && deliberate.body.ref === undefined);
+      const unavailable = fakeRes(); app.errorHandler(Object.assign(new Error("Bank details can't be saved on this server yet"), { status: 503 }), fakeReq, unavailable, () => {});
+      check("production: any 5xx that reaches the handler is hidden too, but keeps its status", unavailable.statusCode === 503 && /Something went wrong/.test(unavailable.body.error));
+      process.env.NODE_ENV = "development";
+      const dev = fakeRes(); app.errorHandler(sqlErr, fakeReq, dev, () => {});
+      check("outside production the detail is still returned (for developers), with the ref", dev.statusCode === 500 && /foreign key/.test(dev.body.error) && !!dev.body.ref);
+    } finally {
+      console.error = origError;
+      if (savedEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = savedEnv;
+    }
+
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    try {
+      const gone = signToken({ id: 987654, type: "customer" }); // a valid, signed token for a customer row that doesn't exist
+      const call = (p, method = "GET", body) => fetch(base + p, { method, headers: { Authorization: `Bearer ${gone}`, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      const saveAddr = await call("/addresses", "POST", { label: "Home", address_line: "Somewhere", lat: 22.58, lng: 88.47, is_default: true });
+      const text = await saveAddr.text();
+      check("a signed token for a customer that no longer exists is refused with 401 'Invalid or expired token' (no foreign-key error, nothing leaked)", saveAddr.status === 401 && /Invalid or expired token/.test(text) && !/insert into|foreign key/i.test(text));
+      check("the same on reads and on placing an order (401 everywhere, so the app signs the customer out)", (await call("/profile/me")).status === 401 && (await call("/orders", "POST", { items: [] })).status === 401);
+      const [realCust] = await db("users").insert({ name: "Exists Customer", phone: "8000005201", wallet_balance: 0 });
+      const okRes = await fetch(base + "/profile/me", { headers: { Authorization: `Bearer ${signToken({ id: realCust, type: "customer" })}` } });
+      check("an existing customer's token still works", okRes.status === 200);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

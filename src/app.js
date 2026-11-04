@@ -55,10 +55,27 @@ app.use((req, res) => {
   res.status(404).json({ error: "Not found" });
 });
 
-// Central error handler — every controller can just throw/reject and land here
-app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(err.status || 500).json({ error: err.message || "Internal server error" });
-});
+/**
+ * Central error handler — every controller can just throw/reject and land here.
+ * Deliberate errors (an `err.status` below 500: validation, BankError, bad JSON) keep their message. Anything else is an unexpected
+ * server fault — a database error, a bug — and in production its text is NEVER sent to the client: it would hand table names, column
+ * names and constraint names (and sometimes the failing query's values) to whoever triggers it, and the apps print it on screen. The
+ * client gets a generic message plus a short `ref`; the full error is logged server-side under the same ref.
+ */
+function errorHandler(err, req, res, next) {
+  const status = Number(err.status) >= 400 && Number(err.status) < 600 ? Number(err.status) : 500;
+  if (status < 500) {
+    console.error(err);
+    return res.status(status).json({ error: err.message || "Request failed" });
+  }
+  const ref = require("crypto").randomBytes(4).toString("hex");
+  console.error(`[error ${ref}] ${req.method} ${req.originalUrl}`, err);
+  if (process.env.NODE_ENV === "production") {
+    return res.status(status).json({ error: "Something went wrong on our side. Please try again in a moment.", ref });
+  }
+  return res.status(status).json({ error: err.message || "Internal server error", ref }); // detail only outside production
+}
+app.use(errorHandler);
+app.errorHandler = errorHandler;
 
 module.exports = app;

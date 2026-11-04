@@ -50,6 +50,17 @@ function requireAuth(allowedTypes, { allowUnverified = false } = {}) {
       }
     }
 
+    // A customer whose account row is gone (deleted, or the token came from another database) must not keep a working session: every
+    // write that references users(id) would hit a foreign-key error. 401 is what the apps already treat as "sign in again".
+    if (decoded.type === "customer") {
+      try {
+        const customer = await db("users").where({ id: decoded.id }).select("id").first();
+        if (!customer) return res.status(401).json({ error: "Invalid or expired token" });
+      } catch (err) {
+        return next(err);
+      }
+    }
+
     const partnerTable = PARTNER_TABLES[decoded.type];
     if (partnerTable && !allowUnverified) {
       try {

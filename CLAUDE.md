@@ -196,6 +196,12 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   the catalog still shows a closed category with `closed`/`opens_at`; quote and
   order say `kitchen_closed` + `opens_at`. An order placed before closing can still
   be accepted. The rule lives in `utils/serviceHours.js`.
+- **Never send raw server errors to a client** (2026-11-04): the central error
+  handler in `app.js` returns a generic message + `ref` for any 5xx in production
+  (the real error is logged under that ref); only deliberate 4xx messages are shown.
+  Don't write `res.status(500).json({ error: err.message })` in a controller — throw
+  and let the handler decide. `requireAuth` also 401s a customer token whose `users`
+  row is gone.
 - **Wallet** is shared infrastructure for both customer refunds/credits and
   rider COD reconciliation — see `wallet_ledger` table (owner_type/owner_id
   polymorphic pattern).

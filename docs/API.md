@@ -608,6 +608,10 @@ One **daily window** per kitchen (the same every day), in **IST** (`REPORT_TZ_OF
 - **Cart quote**: kitchen closed → `valid: false`, `delivery_available: false`, `unavailable_reason: "kitchen_closed"`, `opens_at`, `reason: "This kitchen is closed right now. It opens at 7:00 PM."`; still priced. Closed wins over `no_riders_online` when both apply.
 - **Orders**: `POST /orders` and reorder → **409** `{ code: "kitchen_closed", opens_at: "HH:MM", error: "This kitchen is closed right now. It opens at 7:00 PM." }`; nothing is created.
 
+## Error responses (hardened 2026-11-04)
+
+Deliberate errors (validation, business rules — anything with a 4xx status) return `{ error: "<readable message>", code? }`. An **unexpected server fault** (a database error, a bug) returns **500** `{ error: "Something went wrong on our side. Please try again in a moment.", ref: "a1b2c3d4" }` in production — the SQL, table/column/constraint names and values are never sent; the full error is logged server-side under the same `ref` (`[error a1b2c3d4] METHOD /path`). Outside production the detail is still returned (plus `ref`) for developers. A **customer token whose user row no longer exists** (deleted account, or a token from another database) is refused with **401** `Invalid or expired token`, like any bad token, rather than failing later on a foreign key.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**
