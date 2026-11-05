@@ -5,6 +5,7 @@ const adminOrders = require("../controllers/adminOrders.controller");
 const adminCustomers = require("../controllers/adminCustomers.controller");
 const adminCategories = require("../controllers/adminCategories.controller");
 const adminCoupons = require("../controllers/adminCoupons.controller");
+const onboardingSlides = require("../controllers/onboardingSlides.controller");
 const adminAdmins = require("../controllers/adminAdmins.controller");
 const adminSettings = require("../controllers/adminSettings.controller");
 const adminCod = require("../controllers/adminCod.controller");
@@ -63,6 +64,13 @@ router.get("/coupons", adminCoupons.listCoupons);
 router.patch("/coupons/:id", superOnly, adminCoupons.updateCoupon);
 
 // Customers
+// Customer-app intro slides (picture + headline + text), shown before login. Staff (super_admin, ops) can manage them.
+router.get("/onboarding-slides", onboardingSlides.listAdmin);
+router.post("/onboarding-slides", staff, onboardingSlides.create);
+router.post("/onboarding-slides/reorder", staff, onboardingSlides.reorder); // before /:id
+router.patch("/onboarding-slides/:id", staff, onboardingSlides.update);
+router.delete("/onboarding-slides/:id", staff, onboardingSlides.remove);
+
 router.get("/customers/export.csv", superOnly, adminCustomers.exportCustomersCsv); // before /:id — "export.csv" would otherwise look like an :id
 router.get("/customers", adminCustomers.listCustomers);
 router.get("/customers/:id", adminCustomers.getCustomer);

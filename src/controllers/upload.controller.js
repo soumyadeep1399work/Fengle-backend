@@ -29,7 +29,8 @@ async function uploadImage(req, res) {
 
   let webp;
   try {
-    webp = await toWebp(req.file.buffer);
+    // ?purpose=banner keeps a larger picture (full-screen intro slides); everything else is the usual small catalog size.
+    webp = await toWebp(req.file.buffer, { large: req.query?.purpose === "banner" });
   } catch (err) {
     // Right magic bytes but undecodable (truncated, corrupt) or absurdly large in pixels.
     return res.status(400).json({ error: "That image could not be read. Try a different photo." });

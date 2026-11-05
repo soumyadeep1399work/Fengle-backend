@@ -13,6 +13,7 @@ sharp.cache(false);
 sharp.concurrency(1);
 
 const MAX_EDGE_PX = 1000; // longest side; the apps already send ~800 px
+const MAX_EDGE_PX_LARGE = 1800; // full-screen pictures (the Customer app's intro slides), which 1000 px would leave blurry on a phone
 const WEBP_QUALITY = 78;
 const MAX_INPUT_PIXELS = 40_000_000; // ~40 MP; a 12 MP phone photo is 30% of this
 
@@ -23,11 +24,12 @@ let queue = Promise.resolve();
  * Rejects if the bytes can't actually be decoded (truncated/corrupt file).
  * Jobs run strictly one after another.
  */
-function toWebp(buffer) {
+function toWebp(buffer, { large = false } = {}) {
+  const edge = large ? MAX_EDGE_PX_LARGE : MAX_EDGE_PX;
   const job = queue.then(() =>
     sharp(buffer, { limitInputPixels: MAX_INPUT_PIXELS, failOn: "error" })
       .rotate() // apply the EXIF orientation before the metadata is dropped
-      .resize({ width: MAX_EDGE_PX, height: MAX_EDGE_PX, fit: "inside", withoutEnlargement: true })
+      .resize({ width: edge, height: edge, fit: "inside", withoutEnlargement: true })
       .webp({ quality: WEBP_QUALITY })
       .toBuffer()
   );

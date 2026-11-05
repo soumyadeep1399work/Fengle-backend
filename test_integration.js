@@ -3902,6 +3902,51 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 55: Customer-app intro slides — public list, admin create/edit/hide/reorder/delete, limits ---");
+  {
+    const slides = require("./src/controllers/onboardingSlides.controller");
+    const call = async (fn, body = {}, params = {}) => { const r = fakeRes(); r.set = () => r; await fn(fakeReq(body, params, { id: 1, type: "admin", role: "super_admin" }), r); return r; };
+    await db("onboarding_slides").delete();
+    const img = (n) => `https://cdn.example.test/slide-${n}.webp`;
+    check("no slides yet: the public list is empty (the app then uses its built-in slides)", (await call(slides.listPublic)).body.slides.length === 0);
+
+    check("create needs a real image URL", (await call(slides.create, { image_url: "not a url", headline: "Hi" })).statusCode === 400);
+    check("create needs a headline", (await call(slides.create, { image_url: img(1), headline: "  " })).statusCode === 400);
+    check("headline over 80 characters -> 400", (await call(slides.create, { image_url: img(1), headline: "x".repeat(81) })).statusCode === 400);
+    check("body over 200 characters -> 400", (await call(slides.create, { image_url: img(1), headline: "Ok", body: "y".repeat(201) })).statusCode === 400);
+
+    const ids = [];
+    for (let n = 1; n <= 3; n++) {
+      const r = await call(slides.create, { image_url: img(n), headline: `Slide ${n}`, body: n === 3 ? "" : `Text ${n}` });
+      ids.push(r.body.slide?.id);
+      if (n === 1) check("create -> 201 with the slide, active, first in order", r.statusCode === 201 && r.body.slide.is_active === true && r.body.slide.sort_order >= 1);
+    }
+    let pub = (await call(slides.listPublic)).body.slides;
+    check("public list shows the 3 slides in creation order, with image, headline and body only",
+      pub.map((s) => s.headline).join() === "Slide 1,Slide 2,Slide 3" && pub[0].body === "Text 1" && pub[2].body === null && Object.keys(pub[0]).sort().join() === "body,headline,id,image_url");
+
+    check("reorder must name every slide exactly once", (await call(slides.reorder, { ids: [ids[0], ids[1]] })).statusCode === 400 && (await call(slides.reorder, { ids: [ids[0], ids[0], ids[1]] })).statusCode === 400);
+    check("reorder -> 200 and the public order follows", (await call(slides.reorder, { ids: [ids[2], ids[0], ids[1]] })).body.slides.length === 3
+      && (await call(slides.listPublic)).body.slides.map((s) => s.headline).join() === "Slide 3,Slide 1,Slide 2");
+
+    const upd = await call(slides.update, { headline: "Renamed", body: "New text" }, { id: String(ids[0]) });
+    check("edit headline and text", upd.body.slide.headline === "Renamed" && upd.body.slide.body === "New text" && upd.body.slide.image_url === img(1));
+    check("edit with nothing to change -> 400; unknown slide -> 404", (await call(slides.update, {}, { id: String(ids[0]) })).statusCode === 400 && (await call(slides.update, { headline: "x" }, { id: "99999" })).statusCode === 404);
+
+    await call(slides.update, { is_active: false }, { id: String(ids[1]) });
+    check("a hidden slide leaves the public list but stays in the admin list",
+      (await call(slides.listPublic)).body.slides.length === 2 && (await call(slides.listAdmin)).body.slides.length === 3 && (await call(slides.listAdmin)).body.max_active === 5);
+
+    for (let n = 4; n <= 6; n++) await call(slides.create, { image_url: img(n), headline: `Slide ${n}` });
+    const sixth = await call(slides.create, { image_url: img(7), headline: "Slide 7" });
+    check("a 6th ACTIVE slide is refused (409, limit 5), though hidden ones don't count", sixth.statusCode === 409 && (await db("onboarding_slides").where({ is_active: true })).length === 5);
+    check("re-showing the hidden slide is refused while 5 are active", (await call(slides.update, { is_active: true }, { id: String(ids[1]) })).statusCode === 409);
+    check("the public list never returns more than 5", (await call(slides.listPublic)).body.slides.length === 5);
+
+    check("delete -> 200, then 404", (await call(slides.remove, {}, { id: String(ids[2]) })).body.deleted === true && (await call(slides.remove, {}, { id: String(ids[2]) })).statusCode === 404);
+    await db("onboarding_slides").delete();
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }
