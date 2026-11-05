@@ -3884,7 +3884,7 @@ async function main() {
       process.env.ONLINE_PAYMENTS_ENABLED = "false";
       m = await methods();
       check("switch off: UPI and Card come back disabled ('coming soon'), COD and credits stay enabled",
-        m.upi.enabled === false && m.card.enabled === false && /coming soon/.test(m.upi.label) && m.cod.enabled === true && m.wallet.enabled === true);
+        m.upi.enabled === false && m.card.enabled === false && /coming soon/i.test(m.upi.label) && m.cod.enabled === true && m.wallet.enabled === true);
       for (const method of ["upi", "card", "netbanking"]) {
         const r = await place(method);
         check(`switch off: placing an order with '${method}' -> 409 'isn't available', nothing created`, r.statusCode === 409 && /Online payment/.test(r.body.error));
@@ -3894,10 +3894,23 @@ async function main() {
       check("switch off: COD is NOT blocked by the switch (it gets past it to normal validation)", cod.statusCode !== 409 || !/Online payment/.test(cod.body?.error || ""));
 
       process.env.ONLINE_PAYMENTS_ENABLED = " FALSE ";
+      m = await methods();
+      check("switch off: the UPI and Card LABELS carry the full message (default: 'Coming soon. To pay online, use fengle.in/shop'); COD and credits keep their labels",
+        m.upi.label === "UPI: Coming soon. To pay online, use fengle.in/shop" && m.card.label === "Card: Coming soon. To pay online, use fengle.in/shop" && m.cod.label === "Cash on Delivery" && m.wallet.label === "Fengle Credits");
+      check("...and no extra fields were added (the apps need no update)", Object.keys(m.upi).sort().join() === "enabled,id,label");
+      const refused = await place("upi");
+      check("the refusal text for an order repeats the message and still points to COD/credits", /fengle\.in\/shop/.test(refused.body.error) && /Cash on delivery/.test(refused.body.error));
+      process.env.ONLINE_PAYMENTS_MESSAGE = "Paused today, please choose cash on delivery";
+      m = await methods();
+      check("ONLINE_PAYMENTS_MESSAGE in .env replaces the wording without a code change", m.upi.label === "UPI: Paused today, please choose cash on delivery" && m.card.label === "Card: Paused today, please choose cash on delivery");
+      delete process.env.ONLINE_PAYMENTS_MESSAGE;
+      process.env.ONLINE_PAYMENTS_ENABLED = " FALSE ";
       check("the value is forgiving about case and spaces", (await methods()).upi.enabled === false);
       process.env.ONLINE_PAYMENTS_ENABLED = "true";
-      check("switch back on: UPI and Card are enabled again", (await methods()).upi.enabled === true);
+      m = await methods();
+      check("switch back on: UPI and Card are enabled again with their normal labels", m.upi.enabled === true && m.upi.label === "UPI" && m.card.label === "Card");
     } finally {
+      delete process.env.ONLINE_PAYMENTS_MESSAGE;
       if (savedSwitch === undefined) delete process.env.ONLINE_PAYMENTS_ENABLED; else process.env.ONLINE_PAYMENTS_ENABLED = savedSwitch;
     }
   }

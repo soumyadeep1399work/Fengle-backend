@@ -17,8 +17,9 @@ async function getPaymentMethods(req, res) {
   const online = payment.onlinePaymentsEnabled(); // ONLINE_PAYMENTS_ENABLED=false hides UPI/Card without an app update
   res.json({
     methods: [
-      { id: "upi", label: online ? "UPI" : "UPI (coming soon)", enabled: online },
-      { id: "card", label: online ? "Card" : "Card (coming soon)", enabled: online },
+      // Switched off: the label itself carries the message (the apps show `label` as-is, so no app update is needed to change it).
+      { id: "upi", label: online ? "UPI" : `UPI: ${payment.onlinePaymentsMessage()}`, enabled: online },
+      { id: "card", label: online ? "Card" : `Card: ${payment.onlinePaymentsMessage()}`, enabled: online },
       { id: "cod", label: "Cash on Delivery", enabled: true },
       { id: "wallet", label: "Fengle Credits", enabled: true, balance },
     ],

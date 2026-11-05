@@ -91,4 +91,9 @@ function verifyWebhookSignature(rawBody, signature) {
  */
 const onlinePaymentsEnabled = () => String(process.env.ONLINE_PAYMENTS_ENABLED ?? "true").trim().toLowerCase() !== "false";
 
-module.exports = { createPaymentOrder, verifyPaymentSignature, verifyWebhookSignature, isConfigured, getPublicKeyId, onlinePaymentsEnabled };
+/** What customers are told while online payment is switched off; it goes into the UPI and Card labels the apps already show.
+ *  Change it with ONLINE_PAYMENTS_MESSAGE in .env (no code change, no app update). */
+const DEFAULT_ONLINE_PAYMENTS_MESSAGE = "Coming soon. To pay online, use fengle.in/shop";
+const onlinePaymentsMessage = () => String(process.env.ONLINE_PAYMENTS_MESSAGE || "").trim().slice(0, 200) || DEFAULT_ONLINE_PAYMENTS_MESSAGE;
+
+module.exports = { createPaymentOrder, verifyPaymentSignature, verifyWebhookSignature, isConfigured, getPublicKeyId, onlinePaymentsEnabled, onlinePaymentsMessage };
