@@ -14,7 +14,8 @@ const orderPush = require("../services/orderNotifications.service");
  */
 async function getPaymentMethods(req, res) {
   const balance = await wallet.getBalance("customer", req.auth.id);
-  const online = payment.onlinePaymentsEnabled(); // ONLINE_PAYMENTS_ENABLED=false hides UPI/Card without an app update
+  // ONLINE_PAYMENTS_ENABLED=false hides UPI/Card without an app update, but never for the web store (fengle.in/shop).
+  const online = payment.onlinePaymentsEnabledFor(req);
   res.json({
     methods: [
       // Switched off: the label itself carries the message (the apps show `label` as-is, so no app update is needed to change it).

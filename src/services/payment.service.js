@@ -96,4 +96,24 @@ const onlinePaymentsEnabled = () => String(process.env.ONLINE_PAYMENTS_ENABLED ?
 const DEFAULT_ONLINE_PAYMENTS_MESSAGE = "Coming soon. To pay online, use fengle.in/shop";
 const onlinePaymentsMessage = () => String(process.env.ONLINE_PAYMENTS_MESSAGE || "").trim().slice(0, 200) || DEFAULT_ONLINE_PAYMENTS_MESSAGE;
 
-module.exports = { createPaymentOrder, verifyPaymentSignature, verifyWebhookSignature, isConfigured, getPublicKeyId, onlinePaymentsEnabled, onlinePaymentsMessage };
+/**
+ * The web store (https://fengle.in/shop) is exempt from the master switch above: online payment is always available there,
+ * even while the mobile apps have it switched off. Browsers always send an Origin header on cross-origin requests and the
+ * native apps don't, so the request's Origin tells the two apart. Extra origins can be added with WEB_STORE_ORIGINS
+ * (comma-separated) in .env. This is a business switch, not a security boundary: a hand-made request can send any Origin.
+ */
+const webStoreOrigins = () =>
+  String(process.env.WEB_STORE_ORIGINS || "https://fengle.in,https://www.fengle.in")
+    .split(",")
+    .map((s) => s.trim().replace(/\/$/, "").toLowerCase())
+    .filter(Boolean);
+
+const isWebStoreRequest = (req) => {
+  const origin = String((req && req.get && req.get("origin")) || "").trim().replace(/\/$/, "").toLowerCase();
+  return origin !== "" && webStoreOrigins().includes(origin);
+};
+
+/** Is online payment offered to THIS request: always for the web store, otherwise whatever the master switch says. */
+const onlinePaymentsEnabledFor = (req) => isWebStoreRequest(req) || onlinePaymentsEnabled();
+
+module.exports = { createPaymentOrder, verifyPaymentSignature, verifyWebhookSignature, isConfigured, getPublicKeyId, onlinePaymentsEnabled, onlinePaymentsEnabledFor, isWebStoreRequest, onlinePaymentsMessage };
