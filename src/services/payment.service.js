@@ -83,4 +83,12 @@ function verifyWebhookSignature(rawBody, signature) {
   return expected.length === given.length && crypto.timingSafeEqual(expected, given);
 }
 
-module.exports = { createPaymentOrder, verifyPaymentSignature, verifyWebhookSignature, isConfigured, getPublicKeyId };
+/**
+ * Master switch for ONLINE payment (UPI / card / netbanking). On by default. Set ONLINE_PAYMENTS_ENABLED=false in .env to turn it
+ * off without an app update: /payments/methods then lists UPI and Card as unavailable (the apps grey them out and fall back to
+ * Cash on delivery), and placing an order with an online method is refused here too, so an old cached screen can't get around it.
+ * Cash on delivery and Fengle credits are never affected.
+ */
+const onlinePaymentsEnabled = () => String(process.env.ONLINE_PAYMENTS_ENABLED ?? "true").trim().toLowerCase() !== "false";
+
+module.exports = { createPaymentOrder, verifyPaymentSignature, verifyWebhookSignature, isConfigured, getPublicKeyId, onlinePaymentsEnabled };

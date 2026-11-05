@@ -14,10 +14,11 @@ const orderPush = require("../services/orderNotifications.service");
  */
 async function getPaymentMethods(req, res) {
   const balance = await wallet.getBalance("customer", req.auth.id);
+  const online = payment.onlinePaymentsEnabled(); // ONLINE_PAYMENTS_ENABLED=false hides UPI/Card without an app update
   res.json({
     methods: [
-      { id: "upi", label: "UPI", enabled: true },
-      { id: "card", label: "Card", enabled: true },
+      { id: "upi", label: online ? "UPI" : "UPI (coming soon)", enabled: online },
+      { id: "card", label: online ? "Card" : "Card (coming soon)", enabled: online },
       { id: "cod", label: "Cash on Delivery", enabled: true },
       { id: "wallet", label: "Fengle Credits", enabled: true, balance },
     ],

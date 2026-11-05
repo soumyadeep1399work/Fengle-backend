@@ -8,12 +8,18 @@ const helmet = require("helmet");
 const morgan = require("morgan");
 
 const routes = require("./routes");
+const rateLimitMiddleware = require("./middleware/rateLimit.middleware");
 const { UPLOAD_DIR } = require("./services/storage.service");
 
 const app = express();
 
+// Apache sits in front of Node on this server (one hop). Trusting exactly that hop makes req.ip the real client address from
+// X-Forwarded-For (needed by the rate limiter); trusting more would let a client spoof its IP with its own header.
+app.set("trust proxy", 1);
+
 app.use(helmet());
 app.use(cors());
+app.use(rateLimitMiddleware.general);
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 app.use(
   express.json({

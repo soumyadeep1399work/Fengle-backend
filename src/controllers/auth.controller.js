@@ -47,6 +47,33 @@ async function requestOtp(req, res) {
   }
 
   const demoOtp = demoOtpFor(phone);
+
+  // Per-PHONE limits (the per-IP ones can't stop someone rotating IPs against one victim's number): a cooldown between codes and
+  // an hourly cap. Each code costs an SMS, and each fresh code resets the 5-guess limit, so unlimited requests would also let
+  // an attacker keep guessing a 6-digit code. Counted from otp_verifications so it survives a restart. Demo phones are exempt
+  // (no SMS is sent for them). Rejected requests above insert no row, so they don't count. Limits read from env on each call.
+  if (!demoOtp) {
+    const cooldown = Number(process.env.OTP_RESEND_COOLDOWN_SECONDS ?? 30);
+    const perHour = Number(process.env.OTP_MAX_REQUESTS_PER_HOUR ?? 6);
+    const recent = await db("otp_verifications")
+      .where({ phone })
+      .whereRaw("created_at > (NOW() - INTERVAL 1 HOUR)")
+      .count({ n: "id" })
+      .first();
+    if (Number(recent.n) >= perHour) {
+      return res.status(429).json({ error: "Too many OTP requests for this number. Please try again in an hour." });
+    }
+    if (cooldown > 0) {
+      const last = await db("otp_verifications")
+        .where({ phone })
+        .whereRaw("created_at > (NOW() - INTERVAL ? SECOND)", [cooldown])
+        .first("id");
+      if (last) {
+        return res.status(429).json({ error: `Please wait ${cooldown} seconds before requesting another OTP.` });
+      }
+    }
+  }
+
   const otp = demoOtp || generateOtp();
   const otpHash = await hashOtp(otp);
 

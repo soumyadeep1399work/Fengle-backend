@@ -2,6 +2,8 @@
 // routing engine, clubbing, cascade, wallet/COD, and the full order
 // lifecycle through actual DB calls (not mocks).
 process.env.ORDER_CANCEL_BUFFER_SECONDS = "1"; // fast buffer so the expiry test below doesn't need to sleep 2 minutes
+process.env.RATE_LIMIT_DISABLED = "1"; // the suite fires hundreds of HTTP calls from one address; Test 53 turns the per-IP limits back on
+process.env.OTP_RESEND_COOLDOWN_SECONDS = "0"; // the per-phone OTP throttle is switched off for the suite; Test 49 turns it on
 require("dotenv").config();
 const db = require("./src/config/db");
 const routing = require("./src/services/routing.service");
@@ -3790,6 +3792,113 @@ async function main() {
       check("an existing customer's token still works", okRes.status === 200);
     } finally {
       await new Promise((resolve) => server.close(resolve));
+    }
+  }
+
+  console.log("\n--- Test 53: rate limits — per-phone OTP cooldown + hourly cap, per-IP admin-login/OTP caps, real client IP behind the proxy ---");
+  {
+    const authCtl = require("./src/controllers/auth.controller");
+    const http = require("http");
+    const app53 = require("./src/app");
+    const saved = {
+      cd: process.env.OTP_RESEND_COOLDOWN_SECONDS, hr: process.env.OTP_MAX_REQUESTS_PER_HOUR,
+      demoOtp: process.env.DEMO_LOGIN_OTP, demoPhones: process.env.DEMO_LOGIN_PHONES,
+      admin: process.env.RATE_LIMIT_ADMIN_LOGIN_PER_15MIN, otpIp: process.env.RATE_LIMIT_OTP_REQUEST_PER_10MIN,
+    };
+    const request = async (phone) => { const r = fakeRes(); await authCtl.requestOtp(fakeReq({ phone, purpose: "login" }, {}, null), r); return r; };
+    delete process.env.RATE_LIMIT_DISABLED;
+    try {
+      // ---- per phone: cooldown
+      process.env.OTP_RESEND_COOLDOWN_SECONDS = "30"; process.env.OTP_MAX_REQUESTS_PER_HOUR = "6";
+      check("the first OTP request for a phone goes through", (await request("8000005301")).body.message === "OTP sent");
+      const again = await request("8000005301");
+      check("a second request within the cooldown -> 429 'wait 30 seconds'", again.statusCode === 429 && /30 seconds/.test(again.body.error));
+      check("...and it created no second OTP row (no SMS cost)", (await db("otp_verifications").where({ phone: "8000005301" })).length === 1);
+      check("a different phone is unaffected by that cooldown", (await request("8000005302")).body.message === "OTP sent");
+      await db("otp_verifications").where({ phone: "8000005301" }).update({ created_at: db.raw("NOW() - INTERVAL 2 MINUTE") });
+      check("after the cooldown passes, a new request works again", (await request("8000005301")).body.message === "OTP sent");
+
+      // ---- per phone: hourly cap
+      process.env.OTP_RESEND_COOLDOWN_SECONDS = "0"; process.env.OTP_MAX_REQUESTS_PER_HOUR = "3";
+      for (let i = 0; i < 3; i++) await request("8000005303");
+      const capped = await request("8000005303");
+      check("the 4th request inside an hour (cap 3) -> 429 'try again in an hour'", capped.statusCode === 429 && /an hour/.test(capped.body.error));
+      check("...with still only 3 rows", (await db("otp_verifications").where({ phone: "8000005303" })).length === 3);
+      await db("otp_verifications").where({ phone: "8000005303" }).update({ created_at: db.raw("NOW() - INTERVAL 90 MINUTE") });
+      check("rows older than an hour no longer count", (await request("8000005303")).body.message === "OTP sent");
+
+      // ---- demo phones are exempt (no SMS goes out for them)
+      process.env.OTP_RESEND_COOLDOWN_SECONDS = "30"; process.env.OTP_MAX_REQUESTS_PER_HOUR = "1";
+      process.env.DEMO_LOGIN_OTP = "123456"; process.env.DEMO_LOGIN_PHONES = "8000005304";
+      await request("8000005304");
+      check("a demo phone can request repeatedly without being throttled", (await request("8000005304")).body.message === "OTP sent");
+    } finally {
+      for (const [k, v] of [["OTP_RESEND_COOLDOWN_SECONDS", "0"], ["OTP_MAX_REQUESTS_PER_HOUR", saved.hr], ["DEMO_LOGIN_OTP", saved.demoOtp], ["DEMO_LOGIN_PHONES", saved.demoPhones]]) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+
+    // ---- per IP, over real HTTP
+    const server = await new Promise((resolve) => { const s = http.createServer(app53).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const post = (p, body, ip) => fetch(base + p, { method: "POST", headers: { "Content-Type": "application/json", "X-Forwarded-For": ip }, body: JSON.stringify(body) });
+    try {
+      process.env.RATE_LIMIT_ADMIN_LOGIN_PER_15MIN = "3";
+      const statuses = [];
+      for (let i = 0; i < 5; i++) statuses.push((await post("/auth/admin/login", { email: "nobody@x.test", password: "wrong" }, "203.0.113.10")).status);
+      check("admin login: attempts beyond the cap from one IP -> 429 (3 allowed, then blocked)", statuses[2] !== 429 && statuses[3] === 429 && statuses[4] === 429);
+      const blocked = await post("/auth/admin/login", { email: "nobody@x.test", password: "wrong" }, "203.0.113.10");
+      check("...with a readable JSON error", /Too many sign-in attempts/.test((await blocked.json()).error));
+      check("a DIFFERENT client IP (X-Forwarded-For, trust proxy = 1) has its own allowance", (await post("/auth/admin/login", { email: "nobody@x.test", password: "wrong" }, "203.0.113.11")).status !== 429);
+
+      process.env.RATE_LIMIT_OTP_REQUEST_PER_10MIN = "2";
+      const otpStatuses = [];
+      for (const ph of ["8000005311", "8000005312", "8000005313"]) otpStatuses.push((await post("/auth/otp/request", { phone: ph, purpose: "login" }, "203.0.113.20")).status);
+      check("OTP requests: the 3rd from one IP (cap 2) -> 429, even for a fresh phone", otpStatuses[1] === 200 && otpStatuses[2] === 429);
+
+      const wh = await post("/payments/razorpay/webhook", {}, "203.0.113.10");
+      check("the Razorpay webhook is never rate-limited (answers 400/503 for an unsigned call, never 429)", wh.status !== 429);
+      check("/health is never rate-limited", (await fetch(base.replace("/api/v1", "") + "/health")).status === 200);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      process.env.RATE_LIMIT_DISABLED = "1";
+      for (const [k, v] of [["RATE_LIMIT_ADMIN_LOGIN_PER_15MIN", saved.admin], ["RATE_LIMIT_OTP_REQUEST_PER_10MIN", saved.otpIp]]) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+  }
+
+  console.log("\n--- Test 54: ONLINE_PAYMENTS_ENABLED=false hides UPI/Card and refuses online orders (COD and credits untouched) ---");
+  {
+    const payCtl = require("./src/controllers/payment.controller");
+    const [custId] = await db("users").insert({ name: "Switch Customer", phone: "8000005401", wallet_balance: 0 });
+    const auth = { id: custId, type: "customer" };
+    const savedSwitch = process.env.ONLINE_PAYMENTS_ENABLED;
+    const methods = async () => { const r = fakeRes(); await payCtl.getPaymentMethods(fakeReq({}, {}, auth), r); return Object.fromEntries(r.body.methods.map((m) => [m.id, m])); };
+    const place = async (method) => { const r = fakeRes(); await orderController.placeOrder(fakeReq({ items: [{ item_id: 1, quantity: 1 }], delivery_lat: 22.58, delivery_lng: 88.47, delivery_address: "x", payment_method: method }, {}, auth), r); return r; };
+    try {
+      delete process.env.ONLINE_PAYMENTS_ENABLED;
+      let m = await methods();
+      check("switch unset (default): UPI and Card are enabled with their normal labels", m.upi.enabled === true && m.card.enabled === true && m.upi.label === "UPI" && m.card.label === "Card");
+
+      process.env.ONLINE_PAYMENTS_ENABLED = "false";
+      m = await methods();
+      check("switch off: UPI and Card come back disabled ('coming soon'), COD and credits stay enabled",
+        m.upi.enabled === false && m.card.enabled === false && /coming soon/.test(m.upi.label) && m.cod.enabled === true && m.wallet.enabled === true);
+      for (const method of ["upi", "card", "netbanking"]) {
+        const r = await place(method);
+        check(`switch off: placing an order with '${method}' -> 409 'isn't available', nothing created`, r.statusCode === 409 && /Online payment/.test(r.body.error));
+      }
+      check("...and no order row was created for that customer", (await db("orders").where({ customer_id: custId })).length === 0);
+      const cod = await place("cod");
+      check("switch off: COD is NOT blocked by the switch (it gets past it to normal validation)", cod.statusCode !== 409 || !/Online payment/.test(cod.body?.error || ""));
+
+      process.env.ONLINE_PAYMENTS_ENABLED = " FALSE ";
+      check("the value is forgiving about case and spaces", (await methods()).upi.enabled === false);
+      process.env.ONLINE_PAYMENTS_ENABLED = "true";
+      check("switch back on: UPI and Card are enabled again", (await methods()).upi.enabled === true);
+    } finally {
+      if (savedSwitch === undefined) delete process.env.ONLINE_PAYMENTS_ENABLED; else process.env.ONLINE_PAYMENTS_ENABLED = savedSwitch;
     }
   }
 

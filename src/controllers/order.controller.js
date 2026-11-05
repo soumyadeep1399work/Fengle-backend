@@ -131,6 +131,9 @@ async function placeOrder(req, res) {
   if (!["upi", "card", "netbanking", "cod", "wallet"].includes(payment_method)) {
     return res.status(400).json({ error: "Invalid payment_method" });
   }
+  if (["upi", "card", "netbanking"].includes(payment_method) && !payment.onlinePaymentsEnabled()) {
+    return res.status(409).json({ error: "Online payment isn’t available right now. Please choose Cash on delivery or Fengle credits." });
+  }
 
   // Resolve items -> category + price (never trust client-supplied prices)
   const itemIds = items.map((i) => i.item_id);
