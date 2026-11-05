@@ -3947,6 +3947,51 @@ async function main() {
     await db("onboarding_slides").delete();
   }
 
+  console.log("\n--- Test 56: popup notice — only a LIVE notice is served; schedule, hide, re-show on edit, validation ---");
+  {
+    const notices = require("./src/controllers/appNotices.controller");
+    const call = async (fn, body = {}, params = {}) => { const r = fakeRes(); r.set = () => r; await fn(fakeReq(body, params, { id: 1, type: "admin", role: "super_admin" }), r); return r; };
+    const live = async () => (await call(notices.getLive)).body.notice;
+    const hours = (h) => new Date(Date.now() + h * 3600 * 1000).toISOString();
+    await db("app_notices").delete();
+
+    check("no notice -> the public endpoint answers { notice: null } (the app shows no popup)", (await call(notices.getLive)).body.notice === null);
+    check("create needs a title", (await call(notices.create, { title: "  " })).statusCode === 400);
+    check("a button that opens something needs its text", (await call(notices.create, { title: "Offer", cta_target: "coupons" })).statusCode === 400);
+    check("unknown button target -> 400; bad image URL -> 400", (await call(notices.create, { title: "x", cta_target: "moon", cta_label: "Go" })).statusCode === 400 && (await call(notices.create, { title: "x", image_url: "nope" })).statusCode === 400);
+    check("end before start -> 400", (await call(notices.create, { title: "x", starts_at: hours(2), ends_at: hours(1) })).statusCode === 400);
+    check("message over 500 characters -> 400", (await call(notices.create, { title: "x", body: "z".repeat(501) })).statusCode === 400);
+
+    const a = await call(notices.create, { title: "Weekend offer", body: "20% off biryani", cta_target: "coupons", cta_label: "See offers" });
+    check("create -> 201, live right away, revision 1", a.statusCode === 201 && a.body.notice.state === "live" && a.body.notice.revision === 1);
+    let n = await live();
+    check("the public endpoint serves it with title, text and button", n.title === "Weekend offer" && n.body === "20% off biryani" && n.cta_target === "coupons" && n.cta_label === "See offers" && n.revision === 1);
+
+    const idA = a.body.notice.id;
+    await call(notices.update, { is_active: false }, { id: String(idA) });
+    check("hiding it -> nothing served, admin list says 'hidden'", (await live()) === null && (await call(notices.listAdmin)).body.notices[0].state === "hidden");
+    check("hiding/showing does NOT bump the revision (customers who dismissed it are not shown it again)", (await db("app_notices").where({ id: idA }).first()).revision === 1);
+    await call(notices.update, { is_active: true }, { id: String(idA) });
+
+    const edit = await call(notices.update, { title: "Weekend offer (extended)" }, { id: String(idA) });
+    check("editing the visible wording bumps the revision (shown again to everyone)", edit.body.notice.revision === 2 && (await live()).revision === 2);
+    check("saving the same wording again does not bump it", (await call(notices.update, { title: "Weekend offer (extended)" }, { id: String(idA) })).body.notice.revision === 2);
+
+    const b = await call(notices.create, { title: "Newer notice" });
+    check("with two live notices the NEWEST is the one served", (await live()).title === "Newer notice");
+    await call(notices.update, { starts_at: hours(3) }, { id: String(b.body.notice.id) });
+    check("a scheduled (future) notice is not served; the older live one is", (await live()).title === "Weekend offer (extended)" && (await call(notices.listAdmin)).body.notices[0].state === "scheduled");
+    await call(notices.update, { starts_at: hours(-3), ends_at: hours(-1) }, { id: String(b.body.notice.id) });
+    check("an ended notice is not served either, and shows 'ended'", (await live()).title === "Weekend offer (extended)" && (await call(notices.listAdmin)).body.notices[0].state === "ended");
+    await call(notices.update, { ends_at: hours(5) }, { id: String(b.body.notice.id) });
+    check("inside its start/end window it is live again (and newest)", (await live()).title === "Newer notice");
+
+    check("a button set to 'nothing' never leaks a label to the app", await (async () => { await call(notices.update, { cta_target: "none" }, { id: String(b.body.notice.id) }); await db("app_notices").where({ id: b.body.notice.id }).update({ cta_label: "Stale" }); return (await live()).cta_label === null; })());
+    check("edit with nothing to change -> 400; unknown id -> 404", (await call(notices.update, {}, { id: String(idA) })).statusCode === 400 && (await call(notices.update, { title: "x" }, { id: "99999" })).statusCode === 404);
+    check("delete -> 200, then 404", (await call(notices.remove, {}, { id: String(idA) })).body.deleted === true && (await call(notices.remove, {}, { id: String(idA) })).statusCode === 404);
+    await db("app_notices").delete();
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

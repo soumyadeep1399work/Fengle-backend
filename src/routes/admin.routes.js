@@ -6,6 +6,7 @@ const adminCustomers = require("../controllers/adminCustomers.controller");
 const adminCategories = require("../controllers/adminCategories.controller");
 const adminCoupons = require("../controllers/adminCoupons.controller");
 const onboardingSlides = require("../controllers/onboardingSlides.controller");
+const appNotices = require("../controllers/appNotices.controller");
 const adminAdmins = require("../controllers/adminAdmins.controller");
 const adminSettings = require("../controllers/adminSettings.controller");
 const adminCod = require("../controllers/adminCod.controller");
@@ -70,6 +71,12 @@ router.post("/onboarding-slides", staff, onboardingSlides.create);
 router.post("/onboarding-slides/reorder", staff, onboardingSlides.reorder); // before /:id
 router.patch("/onboarding-slides/:id", staff, onboardingSlides.update);
 router.delete("/onboarding-slides/:id", staff, onboardingSlides.remove);
+
+// Popup notice shown to logged-in customers after login (offers, announcements). Staff (super_admin, ops) can manage them.
+router.get("/app-notices", appNotices.listAdmin);
+router.post("/app-notices", staff, appNotices.create);
+router.patch("/app-notices/:id", staff, appNotices.update);
+router.delete("/app-notices/:id", staff, appNotices.remove);
 
 router.get("/customers/export.csv", superOnly, adminCustomers.exportCustomersCsv); // before /:id — "export.csv" would otherwise look like an :id
 router.get("/customers", adminCustomers.listCustomers);

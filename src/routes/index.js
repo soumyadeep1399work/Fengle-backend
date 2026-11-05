@@ -37,6 +37,7 @@ router.use("/notifications", notificationRoutes);
 router.use("/uploads", uploadRoutes);
 router.use("/coupons", couponRoutes);
 router.get("/onboarding-slides", require("../controllers/onboardingSlides.controller").listPublic); // public: the Customer app's intro slides, shown before login
+router.get("/app-notice", require("../controllers/appNotices.controller").getLive); // public: the Customer app's popup notice (newest live one or null)
 router.use("/partner", partnerDocumentRoutes); // partner.fengle.in document portal
 
 // Dev/test tools (last-otp, advance order, add credit) exist only outside production.
