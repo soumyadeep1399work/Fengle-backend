@@ -4613,6 +4613,7 @@ async function main() {
       await alertSvc.remindDue(t(31)); await settle();
       check("(a fresh order is reminded too)", (await row(o3.id)).kitchen_reminders_sent === 1);
       const rej = await call(k1Tok, "POST", `/orders/${o3.id}/reject`, {});
+      for (let i = 0; i < 60 && !(await row(o3.id)).kitchen_notified_at; i++) await sleep(50); // the push runs after the response (setImmediate); wait for it rather than guess
       await settle();
       const r4 = await row(o3.id);
       check("a reject that re-routes to another kitchen resets the alarm clock for it: notified_at stamped afresh, not acknowledged, 0 reminders, and the new kitchen is pushed",
@@ -4841,6 +4842,177 @@ async function main() {
       for (const [k, v] of [["SUPPORT_PHONE", savedEnv.p], ["SUPPORT_WHATSAPP", savedEnv.w], ["SUPPORT_EMAIL", savedEnv.e], ["SUPPORT_HOURS", savedEnv.h]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
       await new Promise((resolve) => server.close(resolve));
       await db("admins").where("email", "like", "%@psupport.test").delete();
+    }
+  }
+
+  console.log("\n--- Test 63: Kitchen Sales & Earnings — sales by day/week/month, payouts, signed PDF/CSV downloads (day-level only) ---");
+  {
+    const http = require("http");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const signedUrl = require("./src/utils/signedUrl");
+    const reports = require("./src/services/kitchenReports.service");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const raw = async (token, method, p, body) => {
+      const r = await fetch(p.startsWith("http") ? p : base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) }, body: body !== undefined ? JSON.stringify(body) : undefined });
+      const buf = Buffer.from(await r.arrayBuffer());
+      const text = buf.toString("utf8");
+      let json = null; try { json = JSON.parse(text); } catch { /* csv / pdf */ }
+      return { status: r.status, body: json, text, buf, headers: r.headers };
+    };
+    try {
+      // ---- calendar helpers (pure)
+      check("rangeFor: a day; a Monday-Sunday week containing any day; a calendar month — each with the previous period of the same kind",
+        JSON.stringify(reports.rangeFor("day", "2026-03-10")) === JSON.stringify({ from: "2026-03-10", to: "2026-03-10", previous: { from: "2026-03-09", to: "2026-03-09" } })
+        && JSON.stringify(reports.rangeFor("week", "2026-03-15")) === JSON.stringify({ from: "2026-03-09", to: "2026-03-15", previous: { from: "2026-03-02", to: "2026-03-08" } })
+        && JSON.stringify(reports.rangeFor("week", "2026-03-09")) === JSON.stringify({ from: "2026-03-09", to: "2026-03-15", previous: { from: "2026-03-02", to: "2026-03-08" } })
+        && JSON.stringify(reports.rangeFor("month", "2026-03-10")) === JSON.stringify({ from: "2026-03-01", to: "2026-03-31", previous: { from: "2026-02-01", to: "2026-02-28" } })
+        && reports.rangeFor("month", "2026-01-31").previous.to === "2025-12-31" && reports.rangeFor("month", "2024-03-05").previous.to === "2024-02-29");
+      check("isValidDate rejects 2026-02-30, other formats and junk", reports.isValidDate("2026-02-28") && !reports.isValidDate("2026-02-30") && !reports.isValidDate("26-02-28") && !reports.isValidDate("") && !reports.isValidDate(undefined));
+      const tok = signedUrl.sign({ a: 1 }, 60);
+      check("signed tokens verify; an edited, truncated, junk or expired one doesn't", signedUrl.verify(tok).a === 1 && signedUrl.verify(tok.replace(/.$/, (c) => (c === "A" ? "B" : "A"))) === null && signedUrl.verify(tok.split(".")[0]) === null && signedUrl.verify("x.y") === null && signedUrl.verify(undefined) === null && signedUrl.verify(signedUrl.sign({ a: 1 }, -5)) === null);
+
+      // ---- data: IST instants for a day and wall-clock time
+      const ist = (day, hh, mm = 0) => { const [y, m, d] = day.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d, hh, mm) - 330 * 60000); };
+      const mkKitchen = async (name, phone, extra = {}) => (await db("restaurants").insert({ name, phone, address: "Newtown", lat: 23.4, lng: 89.2, radius_km: 5, status: "active", ...extra }))[0];
+      const K = await mkKitchen("Earnings Kitchen", "8600006301"), K2 = await mkKitchen("Other Earnings Kitchen", "8600006302"), pendingK = await mkKitchen("Earnings Pending", "8600006303", { verification_status: "pending" });
+      const [cust] = await db("users").insert({ name: "Earnings Customer", phone: "8000006301", wallet_balance: 0 });
+      const mkOrder = async (restaurantId, { payment_method = "cod", payment_status = "pending", status = "placed", placed, delivered, cancelled, item_total, payable, cancel_reason = null }) => {
+        const [id] = await db("orders").insert({
+          customer_id: cust, restaurant_id: restaurantId, status, payment_method, payment_status, delivery_lat: 23.4, delivery_lng: 89.2, delivery_address: "Somewhere",
+          item_total, delivery_fee: 0, cgst_amount: 0, sgst_amount: 0, grand_total: item_total, commission_amount: 0, restaurant_payable: payable === undefined ? null : payable,
+          created_at: placed, delivered_at: delivered || null, cancelled_at: cancelled || null, cancel_reason,
+        });
+        return id;
+      };
+      const o1 = await mkOrder(K, { status: "delivered", payment_status: "paid", placed: ist("2026-03-10", 11), delivered: ist("2026-03-10", 12), item_total: 300, payable: 200 });
+      await mkOrder(K, { status: "delivered", payment_status: "paid", placed: ist("2026-03-10", 23), delivered: ist("2026-03-10", 23, 50), item_total: 100, payable: 70 });
+      const o3 = await mkOrder(K, { status: "delivered", payment_method: "upi", payment_status: "paid", placed: ist("2026-03-10", 23, 55), delivered: ist("2026-03-11", 0, 10), item_total: 500, payable: 350 });
+      await mkOrder(K, { status: "cancelled", placed: ist("2026-03-12", 9, 50), cancelled: ist("2026-03-12", 10), item_total: 150 });
+      const o5 = await mkOrder(K, { status: "cancelled", payment_method: "upi", payment_status: "refunded", placed: ist("2026-03-12", 9), cancelled: ist("2026-03-12", 11), item_total: 250 });
+      await mkOrder(K, { status: "cancelled", payment_method: "upi", payment_status: "pending", placed: ist("2026-03-12", 8), cancelled: ist("2026-03-12", 8, 5), item_total: 999, cancel_reason: "payment_not_completed" });
+      await mkOrder(K, { status: "delivered", payment_status: "paid", placed: ist("2026-03-03", 10), delivered: ist("2026-03-03", 11), item_total: 400, payable: 280 });
+      await mkOrder(K, { status: "delivered", payment_status: "paid", placed: ist("2026-02-20", 10), delivered: ist("2026-02-20", 11), item_total: 600, payable: 420 });
+      await mkOrder(K, { status: "placed", payment_method: "upi", payment_status: "pending", placed: ist("2026-03-13", 10), item_total: 777 });
+      await mkOrder(K2, { status: "delivered", payment_status: "paid", placed: ist("2026-03-10", 10), delivered: ist("2026-03-10", 11), item_total: 9000, payable: 7000 });
+      await db("wallet_ledger").insert([
+        { owner_type: "customer", owner_id: cust, entry_type: "credit", amount: 50, reason: "order_refund", related_order_id: o3, notes: "Item(s) unavailable at accept time", balance_after: 50, created_at: ist("2026-03-11", 10) },
+        { owner_type: "customer", owner_id: cust, entry_type: "credit", amount: 250, reason: "order_refund", related_order_id: o5, notes: "Customer cancellation", balance_after: 300, created_at: ist("2026-03-12", 11) },
+      ]);
+      await db("restaurant_adjustments").insert([
+        { restaurant_id: K, amount: 100, reason: "Goodwill for a late payout", created_at: ist("2026-03-12", 15) },
+        { restaurant_id: K, amount: -40, reason: "Packaging deduction", created_at: ist("2026-03-14", 15) },
+        { restaurant_id: K, amount: -15, reason: "Replacement bags", created_at: ist("2026-03-04", 15) },
+        { restaurant_id: K2, amount: 5, reason: "Other kitchen only", created_at: ist("2026-03-12", 15) },
+      ]);
+      await db("restaurant_payments").insert([
+        { restaurant_id: K, amount: 250, paid_at: ist("2026-03-08", 12), reference: "UTR-ONE", method: "bank_transfer", notes: "First payout" },
+        { restaurant_id: K, amount: 400, paid_at: ist("2026-03-14", 12), reference: "UTR-TWO", method: "upi", notes: null },
+        { restaurant_id: K2, amount: 123, paid_at: ist("2026-03-14", 12), reference: "UTR-OTHER", method: "upi" },
+      ]);
+      const [p1, p2] = (await db("restaurant_payments").where({ restaurant_id: K }).orderBy("paid_at", "asc")).map((p) => p.id);
+      const [pOther] = (await db("restaurant_payments").where({ restaurant_id: K2 })).map((p) => p.id);
+      const kTok = signToken({ id: K, type: "restaurant" }), pendTok = signToken({ id: pendingK, type: "restaurant" }), custTok = signToken({ id: cust, type: "customer" });
+      const sales = (q, tok = kTok) => raw(tok, "GET", `/restaurants/me/sales?${q}`);
+
+      // ---- who may call
+      check("no token -> 401; a customer token -> 403; an unapproved kitchen is behind the verification gate (403 verification_required)",
+        (await sales("period=day", null)).status === 401 && (await sales("period=day", custTok)).status === 403 && (await sales("period=day", pendTok)).body.code === "verification_required"
+        && (await raw(pendTok, "GET", "/restaurants/me/payouts")).body.code === "verification_required" && (await raw(pendTok, "POST", "/restaurants/me/downloads", { kind: "sales", format: "csv" })).body.code === "verification_required");
+      check("a bad period or date is 400", (await sales("period=year")).status === 400 && (await sales("period=day&date=2026-02-30")).status === 400 && (await sales("period=day&date=junk")).status === 400);
+
+      // ---- a day (the IST bucketing is the point: 23:50 IST and 00:10 IST are different days although both are the same UTC day)
+      const day10 = (await sales("period=day&date=2026-03-10")).body;
+      check("response shape: period, date, range, previous_range, summary, previous, days (one row for a day)", day10.period === "day" && day10.date === "2026-03-10" && day10.range.from === "2026-03-10" && day10.range.to === "2026-03-10" && day10.previous_range.from === "2026-03-09" && day10.days.length === 1
+        && Object.keys(day10.summary).sort().join() === "adjustments,cancelled_value,earnings,gross_sales,net_payable,orders_cancelled,orders_completed,orders_received,refunded_value" && Object.keys(day10.days[0]).sort().join() === "adjustments,cancelled_value,date,earnings,gross_sales,net_payable,orders_cancelled,orders_completed,orders_received,refunded_value");
+      check("2026-03-10: 3 received (incl. the 23:55 one), 2 completed (the 23:50 one included, the 00:10 one is the next IST day), gross 400, earnings 270, net 270; the previous day is all zeros",
+        JSON.stringify(day10.summary) === JSON.stringify({ orders_received: 3, orders_completed: 2, orders_cancelled: 0, gross_sales: 400, cancelled_value: 0, refunded_value: 0, earnings: 270, adjustments: 0, net_payable: 270 })
+        && Object.values(day10.previous).every((v) => v === 0));
+      const day11 = (await sales("period=day&date=2026-03-11")).body.summary;
+      check("2026-03-11: the order delivered at 00:10 IST belongs here (1 completed, gross 500, earnings 350) with the 50 refunded for dropped items", day11.orders_completed === 1 && day11.gross_sales === 500 && day11.earnings === 350 && day11.refunded_value === 50 && day11.orders_received === 0);
+      const day12 = (await sales("period=day&date=2026-03-12")).body.summary;
+      check("2026-03-12: 2 received and 2 cancelled worth 400 — the abandoned unpaid order and the unpaid online one are not counted — a +100 adjustment, and the 'Customer cancellation' refund is NOT in refunded_value",
+        day12.orders_received === 2 && day12.orders_cancelled === 2 && day12.cancelled_value === 400 && day12.refunded_value === 0 && day12.adjustments === 100 && day12.net_payable === 100 && day12.earnings === 0);
+
+      // ---- a week and a month, with comparisons
+      const week = (await sales("period=week&date=2026-03-13")).body;
+      check("week = Monday 03-09 to Sunday 03-15 with one row per day, zeros included, oldest first", week.range.from === "2026-03-09" && week.range.to === "2026-03-15" && week.days.length === 7 && week.days.map((d) => d.date).join() === "2026-03-09,2026-03-10,2026-03-11,2026-03-12,2026-03-13,2026-03-14,2026-03-15" && week.days[0].orders_received === 0 && week.days[4].net_payable === 0);
+      check("week summary: 5 received, 3 completed, 2 cancelled, gross 900, cancelled 400, refunds 50, earnings 620, adjustments +60, net 680",
+        JSON.stringify(week.summary) === JSON.stringify({ orders_received: 5, orders_completed: 3, orders_cancelled: 2, gross_sales: 900, cancelled_value: 400, refunded_value: 50, earnings: 620, adjustments: 60, net_payable: 680 }));
+      check("the previous week (03-02 to 03-08) is computed the same way: 1 received, 1 completed, gross 400, earnings 280, adjustments −15, net 265",
+        week.previous_range.from === "2026-03-02" && week.previous_range.to === "2026-03-08" && week.previous.orders_completed === 1 && week.previous.orders_received === 1 && week.previous.gross_sales === 400 && week.previous.earnings === 280 && week.previous.adjustments === -15 && week.previous.net_payable === 265);
+      check("the day-level rows add up to the summary (the same numbers, two views)", reports.summarise(week.days).net_payable === week.summary.net_payable && week.days.reduce((s, d) => s + d.gross_sales, 0) === week.summary.gross_sales);
+      const month = (await sales("period=month&date=2026-03-20")).body;
+      check("month = the calendar month (31 day rows) vs the whole previous month (28 rows' worth): February's one delivered order is the comparison",
+        month.range.from === "2026-03-01" && month.range.to === "2026-03-31" && month.days.length === 31 && month.previous_range.from === "2026-02-01" && month.previous_range.to === "2026-02-28" && month.previous.orders_completed === 1 && month.previous.earnings === 420 && month.summary.orders_completed === 4 && month.summary.gross_sales === 1300);
+      const today = (await raw(kTok, "GET", "/restaurants/me/sales")).body;
+      check("with no params it is today (IST), period day", today.period === "day" && /^\d{4}-\d{2}-\d{2}$/.test(today.date) && today.days.length === 1);
+
+      // ---- privacy and isolation
+      const everything = JSON.stringify([day10, week, month]);
+      check("the other kitchen's orders / adjustments never leak in (no 9000, 7000, 'Other kitchen only')", !/9000|7000|Other kitchen only/.test(everything) && week.summary.gross_sales === 900);
+      check("no per-order, per-line or cost data in a sales response: no vendor_cost, restaurant_payable, margin, items or order ids", !/vendor_cost|restaurant_payable|margin|"items"|order_id|"orders":\[/.test(everything));
+
+      // ---- payouts
+      const pay = (await raw(kTok, "GET", "/restaurants/me/payouts")).body;
+      check("payouts summary: total_sales 1900, total_earned 1320, total_adjustments 45, total_payable 1365, total_paid 650, pending 715, status due, last_payment_at set",
+        pay.summary.total_sales === 1900 && pay.summary.total_earned === 1320 && pay.summary.total_adjustments === 45 && pay.summary.total_payable === 1365 && pay.summary.total_paid === 650 && pay.summary.pending === 715 && pay.summary.status === "due" && !!pay.summary.last_payment_at
+        && Object.keys(pay.summary).sort().join() === "last_payment_at,pending,status,total_adjustments,total_earned,total_paid,total_payable,total_sales");
+      check("payments newest first with date, amount, method, reference, notes and status 'paid'", pay.payments.length === 2 && pay.payments[0].id === p2 && pay.payments[0].amount === 400 && pay.payments[0].reference === "UTR-TWO" && pay.payments[0].method === "upi" && pay.payments[0].status === "paid" && pay.payments[1].reference === "UTR-ONE" && pay.payments[1].notes === "First payout" && !!pay.payments[0].paid_at
+        && Object.keys(pay.payments[0]).sort().join() === "amount,id,method,notes,paid_at,reference,status");
+      check("adjustments newest first (+ owed to the kitchen, − a deduction) with reason and order_id", pay.adjustments.map((a) => a.amount).join() === "-40,100,-15" && pay.adjustments[0].reason === "Packaging deduction" && "order_id" in pay.adjustments[0] && Object.keys(pay.adjustments[0]).sort().join() === "amount,created_at,id,order_id,reason");
+      check("page / limit / total: limit=1&page=2 gives the older payment; total counts payments", (await raw(kTok, "GET", "/restaurants/me/payouts?limit=1&page=2")).body.payments[0].reference === "UTR-ONE" && pay.total === 2 && pay.page === 1 && pay.limit === 20 && pay.adjustments_total === 3);
+      check("another kitchen's payment and adjustment are not in the list", !/UTR-OTHER|Other kitchen only/.test(JSON.stringify(pay)));
+      const fresh = (await raw(signToken({ id: K2, type: "restaurant" }), "GET", "/restaurants/me/payouts")).body.summary;
+      check("a different kitchen gets its own position (the other kitchen's own figures)", fresh.total_sales === 9000 && fresh.total_earned === 7000 && fresh.total_paid === 123 && fresh.total_adjustments === 5);
+
+      // ---- downloads
+      const dlReq = (body, tok = kTok) => raw(tok, "POST", "/restaurants/me/downloads", body);
+      const bads = await Promise.all([{ kind: "x", format: "pdf" }, { kind: "sales", format: "xls" }, { kind: "sales", format: "pdf", period: "year" }, { kind: "sales", format: "pdf", date: "2026-02-30" }, { kind: "ledger", format: "csv", from: "2026-03-10" }, { kind: "ledger", format: "csv", from: "2026-03-10", to: "2026-03-01" }, { kind: "ledger", format: "csv", from: "2024-01-01", to: "2026-03-01" }, { format: "pdf" }].map((b) => dlReq(b)));
+      check("bad kind / format / period / date, a ledger without or with a reversed or over-long range -> 400", bads.every((r) => r.status === 400 && typeof r.body.error === "string"));
+      check("a settlement for a payment that isn't theirs, or that doesn't exist, is 404", (await dlReq({ kind: "settlement", format: "pdf", payment_id: pOther })).status === 404 && (await dlReq({ kind: "settlement", format: "pdf", payment_id: 999999 })).status === 404 && (await dlReq({ kind: "settlement", format: "pdf" })).status === 404);
+      const salesCsvReq = await dlReq({ kind: "sales", format: "csv", period: "week", date: "2026-03-12" });
+      check("POST /restaurants/me/downloads -> { url, filename, expires_in_seconds: 300 } with an ABSOLUTE url on /api/v1/downloads?t=…",
+        salesCsvReq.status === 200 && /^https?:\/\/[^/]+\/api\/v1\/downloads\?t=/.test(salesCsvReq.body.url) && salesCsvReq.body.filename === "fengle-sales-week-2026-03-09-to-2026-03-15.csv" && salesCsvReq.body.expires_in_seconds === 300);
+      const csv = await raw(null, "GET", salesCsvReq.body.url.replace(/^https?:\/\/[^/]+/, base.replace(/\/api\/v1$/, "")));
+      check("the link opens with NO Authorization header and serves an attachment CSV: header, the 7 days, TOTAL and PREVIOUS rows",
+        csv.status === 200 && /text\/csv/.test(csv.headers.get("content-type")) && /attachment; filename="fengle-sales-week-2026-03-09-to-2026-03-15.csv"/.test(csv.headers.get("content-disposition"))
+        && csv.text.split("\r\n")[0] === "date,orders_received,orders_completed,orders_cancelled,gross_sales,cancelled_value,refunded_value,earnings,adjustments,net_payable"
+        && csv.text.includes("2026-03-10,3,2,0,400,0,0,270,0,270") && csv.text.includes("TOTAL,5,3,2,900,400,50,620,60,680") && /PREVIOUS 2026-03-02 to 2026-03-08,1,1,0,400/.test(csv.text) && !/vendor_cost|9000|7000/.test(csv.text));
+      const salesPdf = await dlReq({ kind: "sales", format: "pdf", period: "month", date: "2026-03-12" });
+      const pdf = await raw(null, "GET", salesPdf.body.url);
+      check("the sales PDF is a real PDF named for the period", pdf.status === 200 && /application\/pdf/.test(pdf.headers.get("content-type")) && pdf.buf.subarray(0, 5).toString() === "%PDF-" && salesPdf.body.filename === "fengle-sales-month-2026-03-01-to-2026-03-31.pdf" && pdf.buf.length > 1500);
+      const ledgerReq = await dlReq({ kind: "ledger", format: "csv", from: "2026-03-09", to: "2026-03-15" });
+      const ledgerCsv = await raw(null, "GET", ledgerReq.body.url);
+      const ledgerLines = ledgerCsv.text.trim().split("\r\n");
+      check("ledger CSV: opening balance 435, orders per delivery day (no per-order lines), adjustments, the payment with its reference, running balance, closing 715",
+        ledgerLines[0] === "date,type,description,credit,debit,balance" && ledgerLines[1] === ",opening,Opening balance,0,0,435" && ledgerCsv.text.includes("2026-03-10,orders,2 orders delivered,270,0,705") && ledgerCsv.text.includes("2026-03-11,orders,1 order delivered,350,0,1055")
+        && ledgerCsv.text.includes("2026-03-12,adjustment,Goodwill for a late payout,100,0,1155") && ledgerCsv.text.includes("2026-03-14,adjustment,Packaging deduction,0,40,1115") && /2026-03-14,payment,Payment · UTR-TWO \(upi\),0,400,715/.test(ledgerCsv.text) && ledgerLines[ledgerLines.length - 1] === ",closing,Closing balance,0,0,715" && !/vendor_cost/.test(ledgerCsv.text));
+      check("the ledger's closing balance equals the payouts 'pending'", pay.summary.pending === 715);
+      const stReq = await dlReq({ kind: "settlement", format: "csv", payment_id: p2 });
+      const stCsv = await raw(null, "GET", stReq.body.url);
+      check("settlement statement for payment 2: since payment 1 — opening 435, the 3 orders earned, the +100 adjustment (the −15 is older; the −40 was recorded AFTER this payment so it belongs to the next one), this payment with its reference/method, balance after it 755; file named by the reference",
+        stReq.body.filename === "fengle-settlement-UTR-TWO.csv" && stCsv.text.includes(",opening,Opening balance,0,0,435") && stCsv.text.includes("2026-03-10,orders,2 orders delivered,270,0,705") && stCsv.text.includes("2026-03-11,orders,1 order delivered,350,0,1055") && !/Replacement bags/.test(stCsv.text)
+        && /payment,Payment · UTR-TWO \(upi\),0,400,755/.test(stCsv.text) && !/Packaging deduction/.test(stCsv.text) && stCsv.text.trim().split("\r\n").pop() === ",closing,Closing balance,0,0,755");
+      const st1 = await raw(null, "GET", (await dlReq({ kind: "settlement", format: "csv", payment_id: p1 })).body.url);
+      check("the first payment's statement runs from the beginning: opening 0, earned 700, the −15 adjustment, paid 250, closing 435", st1.text.includes(",opening,Opening balance,0,0,0") && /Replacement bags,0,15/.test(st1.text) && /payment,Payment · UTR-ONE \(bank transfer\),0,250,435/.test(st1.text) && st1.text.trim().split("\r\n").pop() === ",closing,Closing balance,0,0,435");
+      const stPdf = await raw(null, "GET", (await dlReq({ kind: "settlement", format: "pdf", payment_id: p2 })).body.url);
+      const ledgerPdf = await raw(null, "GET", (await dlReq({ kind: "ledger", format: "pdf", from: "2026-03-01", to: "2026-03-31" })).body.url);
+      check("settlement and ledger PDFs render", stPdf.buf.subarray(0, 5).toString() === "%PDF-" && ledgerPdf.buf.subarray(0, 5).toString() === "%PDF-" && stPdf.buf.length > 1500);
+
+      // ---- the signed link is the only authorisation, so it must be tight
+      const goodUrl = new URL(salesCsvReq.body.url.replace(/^https?:\/\/[^/]+/, base.replace(/\/api\/v1$/, "")));
+      const good = goodUrl.searchParams.get("t");
+      const [body64, sig] = good.split(".");
+      const forged = JSON.parse(Buffer.from(body64, "base64url").toString()); forged.r = K2;
+      const forgedToken = `${Buffer.from(JSON.stringify(forged)).toString("base64url")}.${sig}`;
+      const dl = (t) => raw(null, "GET", `${base.replace(/\/api\/v1$/, "")}/api/v1/downloads${t === undefined ? "" : `?t=${encodeURIComponent(t)}`}`);
+      check("a link with no token, a junk token, a token edited to another kitchen (signature no longer matches), or an expired token is 403 with a readable error",
+        [await dl(), await dl("junk"), await dl(forgedToken), await dl(signedUrl.sign({ r: K, k: "sales", f: "csv", p: { period: "day", date: "2026-03-10" } }, -5))].every((r) => r.status === 403 && /invalid or has expired/.test(r.body.error)));
+      check("a validly signed token for a settlement payment of another kitchen yields nothing (404), never the other kitchen's statement", (await dl(signedUrl.sign({ r: K, k: "settlement", f: "csv", p: { payment_id: pOther } }, 60))).status === 404);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
     }
   }
 

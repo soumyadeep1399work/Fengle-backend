@@ -36,6 +36,7 @@ router.use("/favorites", favoriteRoutes);
 router.use("/notifications", notificationRoutes);
 router.use("/uploads", uploadRoutes);
 router.use("/coupons", couponRoutes);
+router.get("/downloads", require("../controllers/kitchenEarnings.controller").download); // public: the signed token in ?t= is the authorisation (kitchen report downloads opened in the phone browser)
 router.get("/support/contact", require("../controllers/partnerSupport.controller").getContact); // public (the login screen shows it); before /support, which needs a customer token
 router.use("/support", require("./support.routes")); // customer complaints with a reference number
 router.get("/onboarding-slides", require("../controllers/onboardingSlides.controller").listPublic); // public: the Customer app's intro slides, shown before login

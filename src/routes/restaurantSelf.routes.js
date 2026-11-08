@@ -3,6 +3,7 @@ const { requireAuth } = require("../middleware/auth.middleware");
 const { parseSelfie } = require("../middleware/selfieUpload.middleware");
 const { parseSupportAttachments } = require("../middleware/supportUpload.middleware");
 const restaurantController = require("../controllers/restaurant.controller");
+const kitchenEarnings = require("../controllers/kitchenEarnings.controller");
 const kitchenSupport = require("../controllers/partnerSupport.controller").forPartner("restaurant");
 
 const router = express.Router();
@@ -20,6 +21,10 @@ router.get("/me/support-tickets", supportAuth, kitchenSupport.listTickets);
 router.get("/me/support-tickets/:id", supportAuth, kitchenSupport.getTicket);
 router.post("/me/support-tickets/:id/messages", supportAuth, parseSupportAttachments, kitchenSupport.addMessage);
 router.get("/me/support-tickets/:id/attachments/:attachmentId", supportAuth, kitchenSupport.getAttachment);
+// Sales & Earnings (day-level aggregates of the kitchen's own data) and signed download links. Behind the verification gate.
+router.get("/me/sales", requireAuth(["restaurant"]), kitchenEarnings.sales);
+router.get("/me/payouts", requireAuth(["restaurant"]), kitchenEarnings.payouts);
+router.post("/me/downloads", requireAuth(["restaurant"]), kitchenEarnings.createDownload);
 router.put("/me/bank-account", requireAuth(["restaurant"]), restaurantController.putMyBankAccount);
 router.get("/me/menu", requireAuth(["restaurant"]), restaurantController.getMyMenu);
 router.get("/me/category-options", requireAuth(["restaurant"]), restaurantController.getCategoryOptions);

@@ -217,6 +217,14 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   go to the private bucket via `savePartnerDocument` and are only streamed by
   authenticated endpoints. A partner replying to a resolved ticket reopens it.
   `GET /support/contact` is public and returns only what `SUPPORT_*` env sets.
+- **Kitchens see their OWN payout aggregates, nothing finer** (2026-11-08, client
+  request — an exception to "payable is never in a kitchen response"): the Restaurant
+  app's Sales & Earnings (`/restaurants/me/sales`, `/payouts`, `/downloads`,
+  `services/kitchenReports.service.js`) returns day-level totals of sales, payable
+  (`earnings`), adjustments and payments for that kitchen only. A per-order payable,
+  a per-line vendor cost or a dish margin must still never reach a kitchen — keep any
+  new kitchen report at day level. Download links are HMAC-signed, 5 minutes, bound
+  to the kitchen and the exact request (`utils/signedUrl.js`).
 - **Never send raw server errors to a client** (2026-11-04): the central error
   handler in `app.js` returns a generic message + `ref` for any 5xx in production
   (the real error is logged under that ref); only deliberate 4xx messages are shown.

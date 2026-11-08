@@ -115,7 +115,12 @@ async function recordCustomerRefund(customerId, orderId, amount, notes, trx) {
   );
 }
 
+// The note on the refund a customer gets when a kitchen drops unavailable lines at accept time. The kitchen's sales report finds
+// those refunds by this text, so accept uses the constant rather than a copy of the string.
+const DROPPED_ITEMS_REFUND_NOTE = "Item(s) unavailable at accept time";
+
 module.exports = {
+  DROPPED_ITEMS_REFUND_NOTE,
   recordEntry,
   getBalance,
   getHistory,

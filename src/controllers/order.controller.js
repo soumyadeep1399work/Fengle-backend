@@ -540,7 +540,7 @@ async function acceptOrder(req, res) {
     }
 
     if (refundAmount > 0 && order.payment_status === "paid") {
-      await wallet.recordCustomerRefund(order.customer_id, order.id, refundAmount, "Item(s) unavailable at accept time", trx);
+      await wallet.recordCustomerRefund(order.customer_id, order.id, refundAmount, wallet.DROPPED_ITEMS_REFUND_NOTE, trx);
     }
   });
 
