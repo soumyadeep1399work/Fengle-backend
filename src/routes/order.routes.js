@@ -24,6 +24,7 @@ router.post("/:id/start-preparing", requireAuth(["restaurant"]), orders.startPre
 router.post("/:id/mark-ready", requireAuth(["restaurant"]), orders.markReady);
 
 // Rider
+router.post("/:id/rider-acknowledge", requireAuth(["rider"]), orders.acknowledgeAsRider); // "View assignment" on the new-delivery alert
 router.post("/:id/picked-up", requireAuth(["rider"]), orders.markPickedUp);
 router.post("/:id/on-the-way", requireAuth(["rider"]), orders.markOnTheWay);
 router.post("/:id/delivered", requireAuth(["rider"]), orders.markDelivered);

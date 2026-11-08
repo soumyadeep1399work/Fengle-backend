@@ -731,6 +731,23 @@ async function autoAssignRider(orderId) {
   return riderDispatch.assignOne(orderId);
 }
 
+/** Stamps the assigned rider's first reaction to a delivery (server clock). A no-op if they already reacted. */
+async function markRiderAcknowledged(orderId, conn = db) {
+  await conn("orders").where({ id: orderId }).whereNull("rider_acknowledged_at").update({ rider_acknowledged_at: new Date() });
+}
+
+/**
+ * POST /orders/:id/rider-acknowledge — the rider has seen the delivery alert ("View assignment") and the alarm can stop; picking the
+ * order up is what actually takes it. Only the order's CURRENT rider, else 404. Idempotent. 200 { message }.
+ */
+async function acknowledgeAsRider(req, res) {
+  const id = Number(req.params.id);
+  const order = Number.isInteger(id) ? await db("orders").where({ id, rider_id: req.auth.id }).first("id") : null;
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  await markRiderAcknowledged(id);
+  res.json({ message: "Acknowledged" });
+}
+
 async function markPickedUp(req, res) {
   const { id } = req.params;
   const order = await db("orders").where({ id }).first();
@@ -745,6 +762,7 @@ async function markPickedUp(req, res) {
   const etaMinutes = Math.max(5, Math.round((distanceKm / AVG_SPEED_KMPH) * 60));
 
   await db("orders").where({ id }).update({ status: "picked_up", picked_up_at: new Date(), eta_minutes: etaMinutes });
+  await markRiderAcknowledged(id); // picking it up is also a response
   notifyLater(() => orderPush.orderPickedUp(id));
   res.json({ message: "Marked picked up", eta_minutes: etaMinutes });
 }
@@ -1202,6 +1220,7 @@ module.exports = {
   cancelOrder,
   autoAssignRider,
   acknowledgeOrder,
+  acknowledgeAsRider,
   markPickedUp,
   markOnTheWay,
   markDelivered,

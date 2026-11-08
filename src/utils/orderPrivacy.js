@@ -1,10 +1,11 @@
 // What Fengle pays a kitchen, and what each dish costs it, is internal: customers, kitchens and riders
 // never see vendor costs or the payable. Admin controllers return their own shapes; every order row
 // or order line that can reach a customer/kitchen/rider app goes through these.
-// kitchen_* = how fast a kitchen reacted to the new-order alert (ops-only; admin controllers return the raw columns themselves).
+// kitchen_* / rider_* = how fast a kitchen / rider reacted to the new-order alert (ops-only; admin controllers return the raw columns themselves).
 const INTERNAL_ORDER_FIELDS = [
   "restaurant_payable", "payable_estimated", "delivery_fee_breakdown",
   "kitchen_notified_at", "kitchen_acknowledged_at", "kitchen_acknowledged_by", "kitchen_reminders_sent", "kitchen_last_reminder_at",
+  "rider_notified_at", "rider_acknowledged_at", "rider_reminders_sent", "rider_last_reminder_at",
 ];
 
 /** An order row without the internal settlement fields. */

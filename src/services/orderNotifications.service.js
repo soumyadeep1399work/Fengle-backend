@@ -5,6 +5,8 @@
 // never shown to the customer); rider pushes may, since riders need the pickup.
 const db = require("../config/db");
 const push = require("./push.service");
+const riderPay = require("./riderPay.service");
+const { haversineDistanceKm } = require("../utils/geo");
 const sendToOwner = (...args) => push.sendToOwner(...args); // looked up per call so a test can spy on the push
 
 const rupees = (amount) => `₹${Number(amount).toFixed(2).replace(/\.00$/, "")}`;
@@ -85,15 +87,42 @@ async function newOrderForRestaurant(orderId, { reminder = false } = {}) {
   });
 }
 
-async function riderAssigned(orderId) {
+/**
+ * The end of an address, at a word boundary: roughly "the area" the rider needs in a notification (the start of an Indian address is
+ * the house / flat, the end is the locality, city and pin).
+ */
+function shortArea(address, max = 40) {
+  const s = String(address || "").replace(/\s+/g, " ").trim();
+  if (s.length <= max) return s;
+  const tail = s.slice(-max);
+  const cut = tail.indexOf(" ");
+  return `…${(cut >= 0 && cut < max - 8 ? tail.slice(cut + 1) : tail).trim()}`;
+}
+
+/**
+ * An order was assigned to this rider (and ONLY this rider — never a broadcast). The loud "new-deliveries" alert with what the rider
+ * needs to decide at a glance: pickup kitchen (riders may see it, customers never), the drop area, the distance and the estimated pay.
+ * `reminder` re-sends the same alert (same tag, so it replaces the last one) while the rider hasn't reacted.
+ */
+async function riderAssigned(orderId, { reminder = false } = {}) {
   const order = await load(orderId);
-  if (!order.rider_id) return;
-  const restaurant = await db("restaurants").where({ id: order.restaurant_id }).select("name").first();
+  if (!order || !order.rider_id) return;
+  if (!reminder) {
+    // First push for the current rider (a different rider resets this where the assignment is made).
+    await db("orders").where({ id: orderId }).whereNull("rider_notified_at").update({ rider_notified_at: new Date() });
+  }
+  const restaurant = await db("restaurants").where({ id: order.restaurant_id }).select("name", "address", "lat", "lng", "radius_km", "commission_rate_percent").first();
+  const km = restaurant ? haversineDistanceKm(Number(restaurant.lat), Number(restaurant.lng), Number(order.delivery_lat), Number(order.delivery_lng)) : null;
+  const payout = restaurant ? await riderPay.estimatePayout({ order, restaurant }) : null;
+  const pickupArea = restaurant ? shortArea(restaurant.address) : "";
   const cod = order.payment_method === "cod" ? ` Collect ${rupees(order.grand_total)} cash.` : "";
+  const figures = [km != null && Number.isFinite(km) ? `${km.toFixed(1)} km` : null, payout != null ? rupees(payout) : null].filter(Boolean).join(" · ");
   await sendToOwner("rider", order.rider_id, {
-    title: `New delivery #${order.id}`,
-    body: `Pick up from ${restaurant ? restaurant.name : "the kitchen"}.${cod}`,
-    data: { type: "new_delivery", orderId: order.id },
+    title: reminder ? "Reminder: delivery waiting" : "New delivery request",
+    body: `Pickup: ${restaurant ? restaurant.name : "the kitchen"}${pickupArea ? `, ${pickupArea}` : ""}. Drop: ${shortArea(order.delivery_address) || "see the order"}.${figures ? ` ${figures}` : ""}${cod}`,
+    data: { type: reminder ? "new_delivery_reminder" : "new_delivery", orderId: order.id },
+    // The siren channel the Rider app creates; one notification per delivery (each reminder replaces the last and re-alerts).
+    alert: { channelId: "new-deliveries", tag: `delivery-${order.id}` },
   });
 }
 
@@ -110,5 +139,6 @@ module.exports = {
   orderCancelledBySystem,
   newOrderForRestaurant,
   riderAssigned,
+  shortArea,
   isVisibleToRestaurant,
 };

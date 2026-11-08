@@ -5079,6 +5079,148 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 65: Rider new-delivery alarm — loud push to the assigned rider only, reminders until acknowledged, rider-acknowledge, reassignment ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const push = require("./src/services/push.service");
+    const orderNotifs = require("./src/services/orderNotifications.service");
+    const alertSvc = require("./src/services/riderAlert.service");
+
+    const longAddr = "Flat 4B, Sunrise Apartments, Plot 12, Action Area 1, New Town, Kolkata 700156";
+    const sa = orderNotifs.shortArea(longAddr);
+    check("shortArea: short text unchanged; a long address keeps its END (locality, city, pin) at a word boundary, prefixed with an ellipsis",
+      orderNotifs.shortArea("Newtown A") === "Newtown A" && sa.startsWith("…") && sa.length <= 41 && sa.endsWith("Kolkata 700156") && !sa.includes("Flat 4B") && orderNotifs.shortArea("") === "" && orderNotifs.shortArea(null) === "");
+    check("reminder timing is env-configurable with the agreed defaults (30 s, 10 reminders, 15 s tick)", alertSvc.TICK_MS === 15000 && alertSvc.intervalSeconds() === 30 && alertSvc.maxReminders() === 10);
+
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) }, body: body !== undefined ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    const pushes = [];
+    const realSend = push.sendToOwner;
+    push.sendToOwner = async (type, id, n) => { pushes.push({ type, id, ...n }); };
+    const savedRiders = await db("riders").select("id", "status");
+    await db("riders").update({ status: "inactive" });
+    const savedEnv = { i: process.env.RIDER_REMINDER_INTERVAL_SECONDS, m: process.env.RIDER_MAX_REMINDERS };
+    try {
+      await db("orders").whereIn("status", ["placed", "accepted"]).update({ status: "cancelled" }); // earlier tests leave assigned orders behind; they'd be reminded too
+      const LAT = 23.55, LNG = 89.35;
+      const [cat] = await db("categories").insert({ name: "Rider Alarm Category" });
+      const [dish] = await db("items").insert({ category_id: cat, name: "Rider Alarm Dish", price: 200, created_by_type: "admin" });
+      const [kit] = await db("restaurants").insert({ name: "Rider Alert Kitchen", phone: "8600006501", address: "Plot 9, Sector 5, Salt Lake Electronics Complex, Kolkata 700091", lat: LAT + 0.005, lng: LNG, radius_km: 5, status: "active" });
+      await db("restaurant_categories").insert({ restaurant_id: kit, category_id: cat });
+      await db("restaurant_items").insert({ restaurant_id: kit, item_id: dish, is_available: true });
+      const mkRider = async (name, phone, dLat) => (await db("riders").insert({ name, phone, status: "active", wallet_balance: 0, last_known_lat: LAT + dLat, last_known_lng: LNG }))[0];
+      const r1 = await mkRider("Alarm Rider One", "8500006501", 0.006), r2 = await mkRider("Alarm Rider Two", "8500006502", 0.02);
+      const [cust] = await db("users").insert({ name: "Rider Alarm Customer", phone: "8000006501", wallet_balance: 0 });
+      const [adminId] = await db("admins").insert({ name: "ralarm-ops", email: "ralarm-ops@ralarm.test", password_hash: await bcrypt.hash("a-long-password-1", 4), role: "ops" });
+      const adminTok = signToken({ id: adminId, type: "admin" });
+      const custTok = signToken({ id: cust, type: "customer" }), kitTok = signToken({ id: kit, type: "restaurant" });
+      const r1Tok = signToken({ id: r1, type: "rider" }), r2Tok = signToken({ id: r2, type: "rider" });
+      const place = async (pm = "cod") => (await call(custTok, "POST", "/orders", { items: [{ item_id: dish, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG, delivery_address: longAddr, payment_method: pm })).body.order;
+      const accept = (id) => call(kitTok, "POST", `/orders/${id}/accept`, {});
+      const row = (id) => db("orders").where({ id }).first();
+      const settle = () => sleep(250);
+      const toRiders = (orderId) => pushes.filter((p) => p.type === "rider" && p.data.orderId === orderId);
+      const t = (sec) => new Date(Date.now() + sec * 1000);
+
+      // ---- the first push
+      const o1 = await place(); await accept(o1.id); await settle();
+      const first = toRiders(o1.id);
+      check("on assignment ONLY the assigned (nearest) rider is pushed — never the other online rider, never a broadcast", first.length === 1 && first[0].id === r1 && (await row(o1.id)).rider_id === r1 && pushes.filter((p) => p.type === "rider" && p.id === r2).length === 0);
+      check("title 'New delivery request'; body 'Pickup: <kitchen>, <short area>. Drop: <short area>. <km> km · ₹<pay>' (+ Collect ₹… cash for COD); data { type: new_delivery, orderId }",
+        first[0].title === "New delivery request" && first[0].body.startsWith("Pickup: Rider Alert Kitchen, …") && /Drop: …[^.]*Kolkata 700156\./.test(first[0].body) && /[0-9]+\.[0-9] km · ₹[0-9.]+/.test(first[0].body) && /Collect ₹[0-9.]+ cash\.$/.test(first[0].body) && first[0].data.type === "new_delivery" && first[0].data.orderId === o1.id);
+      check("the customer's house / flat is not in the notification (only the area), and the customer is never named", !/Flat 4B|Sunrise|Rider Alarm Customer|8000006501/.test(first[0].body));
+      check("it is the loud push: alert { channelId: new-deliveries, tag: delivery-<id> }", first[0].alert.channelId === "new-deliveries" && first[0].alert.tag === `delivery-${o1.id}`);
+      const a0 = await row(o1.id);
+      check("rider_notified_at is stamped (server clock); nothing acknowledged; no reminders", !!a0.rider_notified_at && a0.rider_acknowledged_at === null && a0.rider_reminders_sent === 0 && a0.rider_last_reminder_at === null);
+
+      // ---- reminders
+      check("nothing is due before 30 s have passed", (await alertSvc.remindDue()).length === 0);
+      const rem = await alertSvc.remindDue(t(31)); await settle();
+      const reminders = () => toRiders(o1.id).filter((p) => p.data.type === "new_delivery_reminder");
+      check("after 30 s the SAME loud push goes again: title 'Reminder: delivery waiting', data.type new_delivery_reminder, same channel and tag (it replaces the last notification), to the same rider",
+        rem.length === 1 && rem[0] === o1.id && reminders().length === 1 && reminders()[0].id === r1 && reminders()[0].title === "Reminder: delivery waiting" && reminders()[0].alert.tag === `delivery-${o1.id}` && reminders()[0].alert.channelId === "new-deliveries" && reminders()[0].body === first[0].body);
+      const a1 = await row(o1.id);
+      check("counted (rider_reminders_sent 1, rider_last_reminder_at set); rider_notified_at untouched", a1.rider_reminders_sent === 1 && !!a1.rider_last_reminder_at && String(a1.rider_notified_at) === String(a0.rider_notified_at));
+      check("not again until another 30 s", (await alertSvc.remindDue(t(31))).length === 0 && (await alertSvc.remindDue(t(55))).length === 0 && (await alertSvc.remindDue(t(62))).length === 1);
+      process.env.RIDER_MAX_REMINDERS = "2";
+      check("the cap (RIDER_MAX_REMINDERS, here 2) stops them", alertSvc.maxReminders() === 2 && (await alertSvc.remindDue(t(500))).length === 0);
+      delete process.env.RIDER_MAX_REMINDERS;
+      process.env.RIDER_REMINDER_INTERVAL_SECONDS = "5";
+      check("the interval is env-configurable (5 s)", alertSvc.intervalSeconds() === 5 && (await alertSvc.remindDue(t(500))).length === 1);
+      delete process.env.RIDER_REMINDER_INTERVAL_SECONDS;
+      await db("orders").where({ id: o1.id }).update({ rider_reminders_sent: 10 });
+      check("the default cap is 10", (await alertSvc.remindDue(t(900))).length === 0);
+      await db("orders").where({ id: o1.id }).update({ rider_reminders_sent: 3, rider_last_reminder_at: new Date(Date.now() - 3600 * 1000) });
+
+      // ---- rider-acknowledge
+      check("no token -> 401; a customer or kitchen token -> 403", (await call(null, "POST", `/orders/${o1.id}/rider-acknowledge`)).status === 401 && (await call(custTok, "POST", `/orders/${o1.id}/rider-acknowledge`)).status === 403 && (await call(kitTok, "POST", `/orders/${o1.id}/rider-acknowledge`)).status === 403);
+      check("another rider's order, a missing order and a non-numeric id are all 404", (await call(r2Tok, "POST", `/orders/${o1.id}/rider-acknowledge`)).status === 404 && (await call(r1Tok, "POST", "/orders/999999/rider-acknowledge")).status === 404 && (await call(r1Tok, "POST", "/orders/abc/rider-acknowledge")).status === 404);
+      const ack = await call(r1Tok, "POST", `/orders/${o1.id}/rider-acknowledge`);
+      check("POST /orders/:id/rider-acknowledge -> 200 { message }; rider_acknowledged_at is stamped", ack.status === 200 && typeof ack.body.message === "string" && !!(await row(o1.id)).rider_acknowledged_at);
+      const stamp = String((await row(o1.id)).rider_acknowledged_at);
+      check("idempotent: a second call is 200 and changes nothing; the reminders stop", (await call(r1Tok, "POST", `/orders/${o1.id}/rider-acknowledge`)).status === 200 && String((await row(o1.id)).rider_acknowledged_at) === stamp && (await alertSvc.remindDue(t(5000))).length === 0);
+
+      // ---- pickup is a response too, and ends the alarm
+      const o2 = await place(); await accept(o2.id); await settle();
+      const rid2 = (await row(o2.id)).rider_id; const ridTok2 = signToken({ id: rid2, type: "rider" });
+      await alertSvc.remindDue(t(31)); await settle();
+      check("(a second delivery is reminded too)", (await row(o2.id)).rider_reminders_sent === 1);
+      await call(ridTok2, "POST", `/orders/${o2.id}/picked-up`, {});
+      check("picking the order up stamps rider_acknowledged_at and the reminders stop", !!(await row(o2.id)).rider_acknowledged_at && (await alertSvc.remindDue(t(9000))).length === 0);
+
+      // ---- reassignment: the alarm clock restarts for the new rider and the old rider's alert ends
+      await db("orders").where({ id: o1.id }).update({ status: "cancelled" });
+      const o3 = await place(); await accept(o3.id); await settle();
+      const firstRider = (await row(o3.id)).rider_id, otherRider = firstRider === r1 ? r2 : r1;
+      await db("riders").where({ id: firstRider }).update({ status: "active" }); // (the first rider may have been picked up for o2: make sure both are eligible)
+      await alertSvc.remindDue(t(31)); await settle();
+      pushes.length = 0;
+      const reassign = await call(adminTok, "POST", `/admin/orders/${o3.id}/reassign-rider`, { rider_id: otherRider });
+      await settle();
+      const a3 = await row(o3.id);
+      check("an admin reassignment gives the NEW rider the loud alert (they were never told before) and restarts the clock: rider_id changed, notified_at stamped afresh, not acknowledged, 0 reminders",
+        reassign.status === 200 && a3.rider_id === otherRider && !!a3.rider_notified_at && a3.rider_acknowledged_at === null && a3.rider_reminders_sent === 0 && a3.rider_last_reminder_at === null
+        && pushes.filter((p) => p.type === "rider" && p.id === otherRider && p.data.type === "new_delivery" && p.data.orderId === o3.id).length === 1 && pushes.filter((p) => p.id === firstRider && p.type === "rider").length === 0);
+      pushes.length = 0;
+      await alertSvc.remindDue(t(31)); await settle();
+      check("the next reminder goes to the new rider only (the old rider's alert has ended)", pushes.filter((p) => p.type === "rider" && p.data.orderId === o3.id).length === 1 && pushes.filter((p) => p.type === "rider" && p.data.orderId === o3.id)[0].id === otherRider);
+
+      // ---- never reminded: cancelled, or accepted with nobody assigned
+      await db("orders").where({ id: o3.id }).update({ status: "cancelled" });
+      const o4 = await place(); await accept(o4.id); await settle();
+      await db("orders").where({ id: o4.id }).update({ rider_id: null });
+      check("a cancelled order, or an accepted order with no rider yet, is never reminded about", (await alertSvc.remindDue(t(9000))).length === 0);
+      await db("orders").where({ id: o4.id }).update({ status: "cancelled" });
+
+      // ---- the timestamps are ops-only
+      const adm = await call(adminTok, "GET", `/admin/orders/${o3.id}`);
+      check("GET /admin/orders/:id returns rider_notified_at, rider_acknowledged_at, rider_reminders_sent (and rider_last_reminder_at)", adm.status === 200 && "rider_notified_at" in adm.body.order && "rider_acknowledged_at" in adm.body.order && adm.body.order.rider_reminders_sent === 1 && "rider_last_reminder_at" in adm.body.order);
+      const admList = await call(adminTok, "GET", "/admin/orders?limit=100");
+      const listed = (admList.body.orders || []).find((o) => o.id === o3.id);
+      check("the admin order list rows carry them too", !!listed && "rider_notified_at" in listed && "rider_acknowledged_at" in listed && listed.rider_reminders_sent === 1);
+      const riderView = await call(signToken({ id: otherRider, type: "rider" }), "GET", `/orders/${o3.id}`);
+      const riderList = await call(signToken({ id: otherRider, type: "rider" }), "GET", "/orders");
+      const custView = await call(custTok, "GET", `/orders/${o3.id}`);
+      check("riders, customers and kitchens never see them (order read, order list)", riderView.status === 200 && custView.status === 200 && ![riderView.text, riderList.text, custView.text].some((x) => /rider_(notified|acknowledged|reminders|last)/.test(x)));
+    } finally {
+      push.sendToOwner = realSend;
+      for (const r of savedRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      if (savedEnv.i === undefined) delete process.env.RIDER_REMINDER_INTERVAL_SECONDS; else process.env.RIDER_REMINDER_INTERVAL_SECONDS = savedEnv.i;
+      if (savedEnv.m === undefined) delete process.env.RIDER_MAX_REMINDERS; else process.env.RIDER_MAX_REMINDERS = savedEnv.m;
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@ralarm.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

@@ -52,7 +52,9 @@ async function pickNearestFreeRider(restaurant, busyIds, alsoBusy = []) {
 
 /** Conditional write: only an accepted order that still has no rider takes it. Returns true if this call won. */
 async function claim(orderId, riderId) {
-  const n = await db("orders").where({ id: orderId, status: "accepted" }).whereNull("rider_id").update({ rider_id: riderId });
+  // A new rider: their alarm clock starts from zero (riderAssigned stamps rider_notified_at when it sends the first push).
+  const n = await db("orders").where({ id: orderId, status: "accepted" }).whereNull("rider_id")
+    .update({ rider_id: riderId, rider_notified_at: null, rider_acknowledged_at: null, rider_reminders_sent: 0, rider_last_reminder_at: null });
   if (n === 1) notifyLater(() => orderPush.riderAssigned(orderId));
   return n === 1;
 }

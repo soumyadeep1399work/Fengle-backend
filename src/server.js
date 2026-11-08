@@ -12,6 +12,8 @@ app.listen(PORT, () => {
   require("./services/riderDispatch.service").startTick();
   // Re-sends the kitchen's loud new-order alert until the order is acknowledged, accepted or rejected.
   require("./services/kitchenAlert.service").startTick();
+  // The same for riders: re-sends the loud new-delivery alert until the assigned rider acknowledges or picks the order up.
+  require("./services/riderAlert.service").startTick();
   // Cancels online-payment orders nobody paid for (PAYMENT_EXPIRY_MINUTES, default 5); also clears the backlog once at boot.
   require("./services/unpaidOrders.service").startTick();
 });

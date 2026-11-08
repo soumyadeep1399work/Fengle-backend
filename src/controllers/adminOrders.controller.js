@@ -6,6 +6,8 @@ const wallet = require("../services/wallet.service");
 const { paginationParams } = require("../utils/pagination");
 const { scrubDeliveryOtp } = require("./order.controller");
 const { partnerMeetsDocuments } = require("../services/partnerDocuments.service");
+const { notifyLater } = require("../services/push.service");
+const orderPush = require("../services/orderNotifications.service");
 
 const ORDER_STATUSES = ["placed", "accepted", "picked_up", "on_the_way", "delivered", "cancelled"];
 const PAYMENT_METHODS = ["upi", "card", "netbanking", "cod", "wallet"];
@@ -57,6 +59,7 @@ async function listOrders(req, res) {
       "orders.id", "orders.status", "orders.payment_method", "orders.payment_status", "orders.grand_total", "orders.created_at",
       "orders.rider_payout",
       "orders.kitchen_notified_at", "orders.kitchen_acknowledged_at", "orders.kitchen_acknowledged_by", "orders.kitchen_reminders_sent",
+      "orders.rider_notified_at", "orders.rider_acknowledged_at", "orders.rider_reminders_sent",
       "users.id as customer_id", "users.name as customer_name", "users.phone as customer_phone",
       "restaurants.id as restaurant_id", "restaurants.name as restaurant_name",
       "riders.id as rider_id", "riders.name as rider_name"
@@ -229,7 +232,9 @@ async function reassignRider(req, res) {
     return res.status(400).json({ error: "This rider's documents aren't approved yet (or have expired)", code: "documents_required" });
   }
 
-  await db("orders").where({ id }).update({ rider_id });
+  // A different rider: their alarm clock starts from zero, and they are told (the old rider's alert stops, since it follows rider_id).
+  await db("orders").where({ id }).update({ rider_id, rider_notified_at: null, rider_acknowledged_at: null, rider_reminders_sent: 0, rider_last_reminder_at: null });
+  notifyLater(() => orderPush.riderAssigned(Number(id)));
   res.json({ order: scrubDeliveryOtp(await db("orders").where({ id }).first(), "admin") });
 }
 

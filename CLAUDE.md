@@ -225,6 +225,13 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   a per-line vendor cost or a dish margin must still never reach a kitchen — keep any
   new kitchen report at day level. Download links are HMAC-signed, 5 minutes, bound
   to the kitchen and the exact request (`utils/signedUrl.js`).
+- **Rider new-delivery alarm** (2026-11-08): the same pattern for riders —
+  `orderNotifications.riderAssigned` (loud channel `new-deliveries`, tag per order, to the
+  assigned rider ONLY), `services/riderAlert.service.js` reminders every
+  `RIDER_REMINDER_INTERVAL_SECONDS` (30) up to `RIDER_MAX_REMINDERS` (10) while the order is
+  `accepted` and unacknowledged (`POST /orders/:id/rider-acknowledge` or pickup), `rider_*`
+  order columns reset on every reassignment (so any new code that changes `rider_id` must
+  reset them and call `riderAssigned`). There is no accept/decline for riders yet.
 - **Never send raw server errors to a client** (2026-11-04): the central error
   handler in `app.js` returns a generic message + `ref` for any 5xx in production
   (the real error is logged under that ref); only deliberate 4xx messages are shown.
