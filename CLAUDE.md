@@ -232,6 +232,11 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   `accepted` and unacknowledged (`POST /orders/:id/rider-acknowledge` or pickup), `rider_*`
   order columns reset on every reassignment (so any new code that changes `rider_id` must
   reset them and call `riderAssigned`). There is no accept/decline for riders yet.
+- **Rider arrival** (2026-11-08): `POST /orders/:id/reached-restaurant|reached-customer`
+  stamp the server's clock plus the rider's GPS and its distance to the place, once per
+  order and kind. They never block on distance (the client wants manual exceptions); a far
+  or missing fix just sets `manual`. The GPS detail is admin-only; riders see the two
+  times, kitchens `rider_arrived_at`, customers nothing. `services/riderArrival.service.js`.
 - **Never send raw server errors to a client** (2026-11-04): the central error
   handler in `app.js` returns a generic message + `ref` for any 5xx in production
   (the real error is logged under that ref); only deliberate 4xx messages are shown.

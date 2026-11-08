@@ -6,6 +6,8 @@ const INTERNAL_ORDER_FIELDS = [
   "restaurant_payable", "payable_estimated", "delivery_fee_breakdown",
   "kitchen_notified_at", "kitchen_acknowledged_at", "kitchen_acknowledged_by", "kitchen_reminders_sent", "kitchen_last_reminder_at",
   "rider_notified_at", "rider_acknowledged_at", "rider_reminders_sent", "rider_last_reminder_at",
+  // Arrival detail: admin-only. Riders get the two times and kitchens `rider_arrived_at` through riderArrival.visibleTo on the reads.
+  ...["reached_restaurant", "reached_customer"].flatMap((p) => ["at", "lat", "lng", "accuracy_m", "distance_m", "manual"].map((c) => `${p}_${c}`)),
 ];
 
 /** An order row without the internal settlement fields. */

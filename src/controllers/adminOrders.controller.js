@@ -60,6 +60,7 @@ async function listOrders(req, res) {
       "orders.rider_payout",
       "orders.kitchen_notified_at", "orders.kitchen_acknowledged_at", "orders.kitchen_acknowledged_by", "orders.kitchen_reminders_sent",
       "orders.rider_notified_at", "orders.rider_acknowledged_at", "orders.rider_reminders_sent",
+      "orders.reached_restaurant_at", "orders.reached_customer_at",
       "users.id as customer_id", "users.name as customer_name", "users.phone as customer_phone",
       "restaurants.id as restaurant_id", "restaurants.name as restaurant_name",
       "riders.id as rider_id", "riders.name as rider_name"
@@ -88,6 +89,8 @@ async function listOrders(req, res) {
       rider_payout: r.rider_payout == null ? null : Number(r.rider_payout),
       category_names: [...(categoryNamesByOrder[r.id] || [])],
       item_count: itemCountByOrder[r.id] || 0,
+      // Minutes from the rider being alerted (assignment) to reaching the kitchen: how long pickup took to start. null until both exist.
+      minutes_to_arrival: r.reached_restaurant_at && r.rider_notified_at ? Number(((new Date(r.reached_restaurant_at) - new Date(r.rider_notified_at)) / 60000).toFixed(1)) : null,
     })),
     page,
     limit,

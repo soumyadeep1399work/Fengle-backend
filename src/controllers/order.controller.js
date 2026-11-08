@@ -19,6 +19,7 @@ const { haversineDistanceKm } = require("../utils/geo");
 const { notifyLater } = require("../services/push.service");
 const orderPush = require("../services/orderNotifications.service");
 const riderDispatch = require("../services/riderDispatch.service");
+const riderArrival = require("../services/riderArrival.service");
 const { closedMessage } = require("../utils/serviceHours");
 
 const MIN_ORDER_VALUE = 50;
@@ -748,6 +749,30 @@ async function acknowledgeAsRider(req, res) {
   res.json({ message: "Acknowledged" });
 }
 
+/**
+ * POST /orders/:id/reached-restaurant and /reached-customer { lat?, lng?, accuracy_m?, manual? } - the rider's arrival button. See
+ * riderArrival.service.js: server clock, GPS kept with its distance, never blocked on distance, recorded once (a repeat returns the stored
+ * values). Only the order's assigned rider (404 otherwise). Reaching the restaurant also tells the kitchen.
+ */
+function reachedHandler(kind) {
+  return async (req, res) => {
+    const id = Number(req.params.id);
+    const order = Number.isInteger(id) ? await db("orders").where({ id, rider_id: req.auth.id }).first() : null;
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    const v = riderArrival.validate(req.body);
+    if (v.error) return res.status(400).json({ error: v.error });
+    const result = await riderArrival.record(order, kind, v.value);
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    if (!result.already_recorded && kind === "restaurant") {
+      await markRiderAcknowledged(id); // arriving is also a response: it ends the alarm
+      notifyLater(() => orderPush.riderArrived(id));
+    }
+    res.json({ arrival: result.arrival, already_recorded: result.already_recorded });
+  };
+}
+const reachedRestaurant = reachedHandler("restaurant");
+const reachedCustomer = reachedHandler("customer");
+
 async function markPickedUp(req, res) {
   const { id } = req.params;
   const order = await db("orders").where({ id }).first();
@@ -914,6 +939,7 @@ async function getOrder(req, res) {
         rider: rider ? { name: rider.name, phone: rider.phone } : null,
         ...restaurantContactFields(type, restaurant),
         ...customerContactFields(type, customer),
+        ...riderArrival.visibleTo(order, type),
       },
       type
     ), type),
@@ -1185,6 +1211,7 @@ async function listMyOrders(req, res) {
           ...(liveRiderPay ? { estimated_rider_payout: await riderPay.estimatePayout({ order: o, restaurant: restaurantById[o.restaurant_id], ruleSet: liveRiderPay }) } : {}),
           ...restaurantContactFields(type, restaurantById[o.restaurant_id]),
           ...customerContactFields(type, customerById[o.customer_id]),
+          ...riderArrival.visibleTo(o, type),
         },
         type
       ), type);
@@ -1221,6 +1248,8 @@ module.exports = {
   autoAssignRider,
   acknowledgeOrder,
   acknowledgeAsRider,
+  reachedRestaurant,
+  reachedCustomer,
   markPickedUp,
   markOnTheWay,
   markDelivered,

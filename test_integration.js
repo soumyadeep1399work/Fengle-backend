@@ -5381,6 +5381,126 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 68: Rider arrival buttons — Reached Restaurant / Reached Customer with GPS + time, manual allowed, never blocked ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const push = require("./src/services/push.service");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) }, body: body !== undefined ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    const pushes = [];
+    const realSend = push.sendToOwner;
+    push.sendToOwner = async (type, id, n) => { pushes.push({ type, id, ...n }); };
+    const savedRiders = await db("riders").select("id", "status");
+    await db("riders").update({ status: "inactive" });
+    try {
+      await db("orders").whereIn("status", ["placed", "accepted"]).update({ status: "cancelled" });
+      const LAT = 23.65, LNG = 89.45;
+      const [cat] = await db("categories").insert({ name: "Arrival Category" });
+      const [dish] = await db("items").insert({ category_id: cat, name: "Arrival Dish", price: 200, created_by_type: "admin" });
+      const [kit] = await db("restaurants").insert({ name: "Arrival Kitchen", phone: "8600006801", address: "Newtown", lat: LAT + 0.005, lng: LNG, radius_km: 5, status: "active" });
+      await db("restaurant_categories").insert({ restaurant_id: kit, category_id: cat });
+      await db("restaurant_items").insert({ restaurant_id: kit, item_id: dish, is_available: true });
+      const mkRider = async (name, phone, dLat) => (await db("riders").insert({ name, phone, status: "active", wallet_balance: 0, last_known_lat: LAT + dLat, last_known_lng: LNG }))[0];
+      const r1 = await mkRider("Arrival Rider One", "8500006801", 0.006), r2 = await mkRider("Arrival Rider Two", "8500006802", 0.02);
+      const [cust] = await db("users").insert({ name: "Arrival Customer", phone: "8000006801", wallet_balance: 0 });
+      const [adminId] = await db("admins").insert({ name: "arrival-support", email: "arrival-support@arrival.test", password_hash: await bcrypt.hash("a-long-password-1", 4), role: "support" });
+      const adminTok = signToken({ id: adminId, type: "admin" });
+      const custTok = signToken({ id: cust, type: "customer" }), kitTok = signToken({ id: kit, type: "restaurant" });
+      const r1Tok = signToken({ id: r1, type: "rider" }), r2Tok = signToken({ id: r2, type: "rider" });
+      const place = async () => (await call(custTok, "POST", "/orders", { items: [{ item_id: dish, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Arrival Address", payment_method: "cod" })).body.order;
+      const row = (id) => db("orders").where({ id }).first();
+      const settle = () => sleep(250);
+      const reachR = (tok, id, body) => call(tok, "POST", `/orders/${id}/reached-restaurant`, body);
+      const reachC = (tok, id, body) => call(tok, "POST", `/orders/${id}/reached-customer`, body);
+
+      const o1 = await place(); await call(kitTok, "POST", `/orders/${o1.id}/accept`, {}); await settle();
+      check("the order is assigned to the nearest rider (rider one)", (await row(o1.id)).rider_id === r1);
+
+      // ---- who may call / validation
+      check("no token -> 401; a customer or kitchen token -> 403; another rider's order, a missing order and a bad id -> 404",
+        (await reachR(null, o1.id, {})).status === 401 && (await reachR(custTok, o1.id, {})).status === 403 && (await reachR(kitTok, o1.id, {})).status === 403
+        && (await reachR(r2Tok, o1.id, {})).status === 404 && (await reachR(r1Tok, 999999, {})).status === 404 && (await reachR(r1Tok, "abc", {})).status === 404);
+      const bads = await Promise.all([{ lat: 23.6 }, { lng: 89.4 }, { lat: "x", lng: 89.4 }, { lat: 91, lng: 89.4 }, { lat: 23.6, lng: 181 }, { lat: 23.6, lng: 89.4, accuracy_m: -1 }, { lat: 23.6, lng: 89.4, manual: "yes" }].map((b) => reachR(r1Tok, o1.id, b)));
+      check("lat without lng, out-of-range or non-numeric coordinates, negative accuracy, a non-boolean manual -> 400 with a readable error, and nothing is recorded",
+        bads.every((r) => r.status === 400 && typeof r.body.error === "string") && (await row(o1.id)).reached_restaurant_at === null);
+      check("reached-customer before the order is picked up is refused: 409 with a readable error", (await reachC(r1Tok, o1.id, {})).status === 409 && (await row(o1.id)).reached_customer_at === null);
+
+      // ---- reached restaurant: close by (inside 300 m)
+      pushes.length = 0;
+      const near = await reachR(r1Tok, o1.id, { lat: LAT + 0.0052, lng: LNG, accuracy_m: 12.5 }); await settle();
+      const a1 = near.body.arrival;
+      check("reached-restaurant near the kitchen -> 200 { arrival, already_recorded: false }: server time, the GPS echoed, distance_m a few tens of metres, manual false",
+        near.status === 200 && near.body.already_recorded === false && a1.kind === "restaurant" && /^\d{4}-\d{2}-\d{2}T/.test(a1.reached_at) && Math.abs(a1.lat - (LAT + 0.0052)) < 1e-6 && Math.abs(a1.lng - LNG) < 1e-6 && a1.accuracy_m === 12.5 && a1.distance_m > 5 && a1.distance_m < 60 && a1.manual === false
+        && Object.keys(a1).sort().join() === "accuracy_m,distance_m,kind,lat,lng,manual,reached_at");
+      const s1 = await row(o1.id);
+      check("stored on the order with the server clock; arriving also ends the rider's alarm (acknowledged)", !!s1.reached_restaurant_at && Number(s1.reached_restaurant_distance_m) === a1.distance_m && s1.reached_restaurant_manual === 0 && !!s1.rider_acknowledged_at);
+      const toKitchen = pushes.filter((p) => p.type === "restaurant" && p.data.orderId === o1.id);
+      check("the KITCHEN is told: 'Rider has arrived for order #N', data { type: rider_arrived, orderId }, on the normal channel (no alert); nobody else is pushed", toKitchen.length === 1 && toKitchen[0].id === kit && toKitchen[0].title === `Rider has arrived for order #${o1.id}` && toKitchen[0].data.type === "rider_arrived" && toKitchen[0].alert === undefined && pushes.length === 1);
+      pushes.length = 0;
+      const again = await reachR(r1Tok, o1.id, { lat: 10, lng: 10, manual: true }); await settle();
+      check("idempotent: a repeat returns the stored values (200, already_recorded true), changes nothing and doesn't push the kitchen again", again.status === 200 && again.body.already_recorded === true && JSON.stringify(again.body.arrival) === JSON.stringify(a1) && pushes.length === 0);
+
+      // ---- reached customer needs the pickup first, then works in picked_up and on_the_way
+      await call(r1Tok, "POST", `/orders/${o1.id}/picked-up`, {});
+      check("reached-restaurant after pickup is still fine as a repeat (returns the stored arrival)", (await reachR(r1Tok, o1.id, {})).body.already_recorded === true);
+      const far = await reachC(r1Tok, o1.id, { lat: LAT + 0.05, lng: LNG, accuracy_m: 30 });
+      check("reached-customer while picked up: far from the drop-off (about 5.5 km) is NOT blocked, just flagged manual with the distance stored", far.status === 200 && far.body.arrival.kind === "customer" && far.body.arrival.distance_m > 5000 && far.body.arrival.manual === true && (await row(o1.id)).reached_customer_manual === 1);
+      check("a repeat of reached-customer returns the same stored arrival", JSON.stringify((await reachC(r1Tok, o1.id, { lat: LAT, lng: LNG })).body.arrival) === JSON.stringify(far.body.arrival));
+
+      // ---- manual / no GPS / far, on a fresh order
+      await db("orders").where({ id: o1.id }).update({ status: "delivered", restaurant_rating_skipped: true }); // (the rating gate would block the customer's next order otherwise)
+      const o2 = await place(); await call(kitTok, "POST", `/orders/${o2.id}/accept`, {}); await settle();
+      const o2rider = (await row(o2.id)).rider_id; const o2Tok = signToken({ id: o2rider, type: "rider" });
+      const noGps = await reachR(o2Tok, o2.id, {});
+      check("no GPS at all is accepted and recorded as manual with null coordinates and distance", noGps.status === 200 && noGps.body.arrival.manual === true && noGps.body.arrival.lat === null && noGps.body.arrival.lng === null && noGps.body.arrival.distance_m === null && noGps.body.arrival.accuracy_m === null);
+      const o3 = await place(); await call(kitTok, "POST", `/orders/${o3.id}/accept`, {}); await settle();
+      const o3Tok = signToken({ id: (await row(o3.id)).rider_id, type: "rider" });
+      const flagged = await reachR(o3Tok, o3.id, { lat: LAT + 0.0051, lng: LNG, manual: true });
+      check("the app saying manual:true makes it manual even when the GPS is right there", flagged.status === 200 && flagged.body.arrival.manual === true && flagged.body.arrival.distance_m < 60);
+      await db("orders").whereIn("id", [o2.id, o3.id]).update({ status: "delivered", restaurant_rating_skipped: true }); // free both riders so the next order is assigned
+      const o4 = await place(); await call(kitTok, "POST", `/orders/${o4.id}/accept`, {}); await settle();
+      const o4Tok = signToken({ id: (await row(o4.id)).rider_id, type: "rider" });
+      process.env.ARRIVAL_RADIUS_M = "20";
+      const tight = await reachR(o4Tok, o4.id, { lat: LAT + 0.0053, lng: LNG });
+      delete process.env.ARRIVAL_RADIUS_M;
+      check("ARRIVAL_RADIUS_M is configurable (20 m here): 30 m away is manual, still recorded", tight.status === 200 && tight.body.arrival.manual === true && tight.body.arrival.distance_m > 20 && tight.body.arrival.distance_m < 60);
+
+      // ---- who sees what
+      await db("orders").where({ id: o1.id }).update({ status: "on_the_way" });
+      const adm = await call(adminTok, "GET", `/admin/orders/${o1.id}`);
+      check("admin order detail shows every arrival field: times, GPS, accuracy, distance and the manual flag, for both arrivals",
+        adm.status === 200 && !!adm.body.order.reached_restaurant_at && Number(adm.body.order.reached_restaurant_lat) > 23 && Number(adm.body.order.reached_restaurant_accuracy_m) === 12.5 && adm.body.order.reached_restaurant_distance_m > 5 && adm.body.order.reached_restaurant_manual === 0
+        && !!adm.body.order.reached_customer_at && adm.body.order.reached_customer_manual === 1 && adm.body.order.reached_customer_distance_m > 5000);
+      const admList = await call(adminTok, "GET", "/admin/orders?limit=100");
+      const listed = (admList.body.orders || []).find((o) => o.id === o1.id);
+      check("admin list rows carry reached_restaurant_at, reached_customer_at and minutes_to_arrival (assignment alert to arrival)", !!listed && !!listed.reached_restaurant_at && !!listed.reached_customer_at && typeof listed.minutes_to_arrival === "number" && listed.minutes_to_arrival >= 0 && listed.minutes_to_arrival < 5);
+      const riderView = await call(r1Tok, "GET", `/orders/${o1.id}`);
+      const riderList = await call(r1Tok, "GET", "/orders");
+      check("the rider's reads carry only the two times (to restore the app state) — no GPS, distance or manual flag",
+        riderView.body.order.reached_restaurant_at && riderView.body.order.reached_customer_at && !/reached_(restaurant|customer)_(lat|lng|accuracy_m|distance_m|manual)/.test(riderView.text + riderList.text) && (riderList.body.orders.find((o) => o.id === o1.id) || {}).reached_restaurant_at);
+      const kitView = await call(kitTok, "GET", `/orders/${o1.id}`);
+      const kitList = await call(kitTok, "GET", "/orders");
+      check("the kitchen sees rider_arrived_at (and nothing else about the arrival)", !!kitView.body.order.rider_arrived_at && !/reached_/.test(kitView.text + kitList.text) && !!(kitList.body.orders.find((o) => o.id === o1.id) || {}).rider_arrived_at);
+      const custView = await call(custTok, "GET", `/orders/${o1.id}`);
+      check("the customer sees nothing about arrival", !/reached_|rider_arrived_at/.test(custView.text));
+    } finally {
+      push.sendToOwner = realSend;
+      delete process.env.ARRIVAL_RADIUS_M;
+      for (const r of savedRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@arrival.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

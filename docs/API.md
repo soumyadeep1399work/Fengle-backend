@@ -707,6 +707,16 @@ The twin of the kitchen alarm: when an order is assigned, ONLY that rider's phon
 - **Timestamps** on `orders` (server clock, ops-only — never in a customer / kitchen / rider response): `rider_notified_at`, `rider_acknowledged_at`, `rider_reminders_sent`, `rider_last_reminder_at`. They reset to zero whenever the order gets a different rider (auto-assign, admin reassignment). `GET /admin/orders/:id` returns them on the order; the admin order list rows carry `rider_notified_at`, `rider_acknowledged_at`, `rider_reminders_sent`.
 - Not built (waiting on the client): an offer / accept / reject / timeout / re-offer flow. Today auto-assignment picks one rider and a rider cannot decline.
 
+## Rider arrival buttons (added 2026-11-08)
+
+"Reached Restaurant" and "Reached Customer": the rider taps on arrival, with GPS and the time; a manual exception is allowed and **nothing ever blocks on distance**.
+
+- `POST /orders/:id/reached-restaurant` (allowed while the order is `accepted`) and `POST /orders/:id/reached-customer` (while `picked_up` or `on_the_way`) — rider token, behind the verification gate, only the order's **assigned** rider (404 otherwise). Body `{ lat?, lng?, accuracy_m?, manual? }`: `lat` and `lng` together or neither, real coordinates; `accuracy_m` >= 0; `manual` a boolean (400 otherwise). Any other status is 409.
+- **200 `{ arrival: { kind, reached_at (ISO, the server's clock), lat, lng, accuracy_m, distance_m, manual }, already_recorded }`**. `distance_m` is computed server-side from the GPS to the kitchen / the drop-off (null without GPS). `manual` is true when the app says so, when there was no GPS, or when `distance_m` is above `ARRIVAL_RADIUS_M` (env, default 300). **Idempotent**: a repeat returns the stored values with `already_recorded: true`, whatever the status by then, and writes nothing.
+- Picking up (`/picked-up`) does not depend on it, so older apps keep working. Reaching the restaurant also counts as the rider's acknowledgement of the delivery alarm and **pushes the kitchen**: "Rider has arrived for order #N", `data { type: "rider_arrived", orderId }`, the normal channel (no alarm). No customer push.
+- Columns on `orders`: `reached_restaurant_*` and `reached_customer_*` (`at`, `lat`, `lng`, `accuracy_m`, `distance_m`, `manual`).
+- **Who sees what**: riders' order reads carry only `reached_restaurant_at` and `reached_customer_at` (to restore the app's state); kitchens' carry `rider_arrived_at`; customers' carry nothing; the GPS, distance and manual flag are admin-only. `GET /admin/orders/:id` returns every field; the admin order list rows carry `reached_restaurant_at`, `reached_customer_at` and `minutes_to_arrival` (from the rider's assignment alert to arrival at the kitchen).
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**

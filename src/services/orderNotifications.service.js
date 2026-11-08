@@ -126,6 +126,16 @@ async function riderAssigned(orderId, { reminder = false } = {}) {
   });
 }
 
+/** The assigned rider reached the kitchen: tell the kitchen (a normal push, not the alarm). */
+async function riderArrived(orderId) {
+  const order = await load(orderId);
+  if (!order) return;
+  await sendToOwner("restaurant", order.restaurant_id, {
+    title: `Rider has arrived for order #${order.id}`, body: "The delivery partner is at your kitchen to pick it up.",
+    data: { type: "rider_arrived", orderId: order.id },
+  });
+}
+
 /** Restaurants only see paid or COD orders, so only then is it "new" to them. */
 function isVisibleToRestaurant(order) {
   return order.payment_method === "cod" || order.payment_status === "paid";
@@ -139,6 +149,7 @@ module.exports = {
   orderCancelledBySystem,
   newOrderForRestaurant,
   riderAssigned,
+  riderArrived,
   shortArea,
   isVisibleToRestaurant,
 };
