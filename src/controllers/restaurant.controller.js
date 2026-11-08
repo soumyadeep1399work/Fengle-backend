@@ -10,12 +10,13 @@ const { reviewPartner } = require("../services/partnerVerification.service");
 const partnerDocuments = require("../services/partnerDocuments.service");
 const restaurantBank = require("../services/restaurantBank.service");
 const { validateHoursPatch, presentHours } = require("../utils/serviceHours");
+const availability = require("../services/restaurantAvailability.service");
 
 // Never password_hash — every admin-facing restaurant read goes through this
 // column list rather than select("*")/first() on the raw table.
 const RESTAURANT_PUBLIC_COLUMNS = [
   "id", "name", "owner_name", "phone", "email", "address", "lat", "lng",
-  "radius_km", "commission_rate_percent", "status", "onboarded_by", "created_at", "updated_at", "opens_at", "closes_at",
+  "radius_km", "commission_rate_percent", "status", "onboarded_by", "created_at", "updated_at", "opens_at", "closes_at", "is_online",
 ];
 
 /**
@@ -107,6 +108,9 @@ async function updateRestaurant(req, res) {
   const hours = validateHoursPatch(req.body, current); // opens_at / closes_at: "HH:MM" or null; both or neither
   if (hours.error) return res.status(400).json({ error: hours.error });
 
+  const { is_online } = req.body;
+  if (is_online !== undefined && typeof is_online !== "boolean") return res.status(400).json({ error: "is_online must be true or false" });
+
   const updates = {};
   if (hours.value) Object.assign(updates, hours.value);
   if (radius_km != null) updates.radius_km = radius_km;
@@ -117,11 +121,12 @@ async function updateRestaurant(req, res) {
   if (lat != null) updates.lat = lat;
   if (lng != null) updates.lng = lng;
 
-  if (Object.keys(updates).length === 0) {
+  if (Object.keys(updates).length === 0 && is_online === undefined) {
     return res.status(400).json({ error: "No valid fields to update" });
   }
 
-  await db("restaurants").where({ id }).update(updates);
+  if (Object.keys(updates).length > 0) await db("restaurants").where({ id }).update(updates);
+  if (is_online !== undefined) await availability.setOnline(Number(id), is_online, { changedBy: "admin", adminId: req.auth.id }); // an ops/super_admin override of the kitchen's own switch
 
   // Keep a history row for commission changes so past orders' commission_amount
   // can always be explained by the rate that applied at the time (schema note).
@@ -194,6 +199,7 @@ async function getRestaurantDetail(req, res) {
   const bankRow = await restaurantBank.getRow(db, id);
   const bank_account = req.auth && req.auth.role === "support" ? restaurantBank.presentMasked(bankRow) : restaurantBank.presentFull(bankRow);
   const bank_account_history = await restaurantBank.historyFor(db, id);
+  const availability_history = await availability.historyFor(db, id);
 
   res.json({
     restaurant,
@@ -203,6 +209,7 @@ async function getRestaurantDetail(req, res) {
     commission_config_history: commissionHistory,
     bank_account,
     bank_account_history,
+    availability_history,
   });
 }
 
@@ -238,8 +245,21 @@ async function getMyRestaurant(req, res) {
       documents: (await partnerDocuments.summariesFor("restaurant", [restaurant.id])).get(restaurant.id),
       documentsPortalUrl: partnerDocuments.PORTAL_URL,
       bank_account: restaurantBank.presentMasked(await restaurantBank.getRow(db, restaurant.id)),
+      ...availability.presentForKitchen(restaurant),
     },
   });
+}
+
+/**
+ * PATCH /restaurants/me/availability { online: boolean } — the kitchen's own Online / Offline switch. Responds with the
+ * GET /restaurants/me shape. Idempotent (no history row when nothing changes). Behind the verification gate. Orders already placed
+ * can still be accepted; nothing is cancelled. Logging out does not change it.
+ */
+async function setMyAvailability(req, res) {
+  const { online } = req.body || {};
+  if (typeof online !== "boolean") return res.status(400).json({ error: "online must be true or false" });
+  await availability.setOnline(req.auth.id, online, { changedBy: "restaurant" });
+  return getMyRestaurant(req, res);
 }
 
 /**
@@ -524,6 +544,6 @@ async function addMyCategory(req, res) {
 
 module.exports = {
   onboardRestaurant, listRestaurants, updateRestaurant, addRestaurantCategory, removeRestaurantCategory, getRestaurantDetail,
-  getMyRestaurant, putMyBankAccount, getMyMenu, getCategoryOptions, addMyCategory,
+  getMyRestaurant, setMyAvailability, putMyBankAccount, getMyMenu, getCategoryOptions, addMyCategory,
   acceptRestaurantAgreement, getRestaurantAgreementSelfie, reviewRestaurantVerification,
 };

@@ -4366,6 +4366,140 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 60: Kitchen Online / Offline switch — an offline kitchen is treated like a closed one everywhere ---");
+  {
+    const hours = require("./src/utils/serviceHours");
+    check("isOpenNow = online AND within hours; a row without is_online counts as online; offline beats open hours",
+      hours.isOpenNow({ opens_at: null, closes_at: null }) === true && hours.isOpenNow({ is_online: 1, opens_at: null, closes_at: null }) === true && hours.isOpenNow({ is_online: 0, opens_at: null, closes_at: null }) === false
+      && hours.isOnline({ is_online: false }) === false && hours.isWithinHours({ is_online: 0, opens_at: null, closes_at: null }) === true);
+    const at = (hh, mm) => new Date(Date.UTC(2026, 9, 30, hh, mm) - 330 * 60000);
+    const st = hours.openStatus([{ is_online: 0, opens_at: "09:00", closes_at: "22:00" }], at(23, 0));
+    check("openStatus: the only kitchen is offline -> closed with opens_at null (no known reopening)", st.closed === true && st.opens_at === null);
+    const mixed = hours.openStatus([{ is_online: 0, opens_at: "06:00", closes_at: "22:00" }, { is_online: 1, opens_at: "09:00", closes_at: "22:00" }], at(7, 0));
+    check("openStatus: offline kitchens are ignored for opens_at (the earliest ONLINE kitchen's opening wins)", mixed.closed === true && mixed.opens_at === "09:00");
+    check("a kitchen's text when only the switch is the reason: 'isn't taking orders right now'", hours.closedMessage(null) === "This kitchen isn't taking orders right now." && /It opens at 9:00 AM/.test(hours.closedMessage("09:00")));
+
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) }, body: body !== undefined ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    const savedRiders = await db("riders").select("id", "status");
+    await db("riders").update({ status: "inactive" });
+    try {
+      const LAT = 23.05, LNG = 88.95;
+      const [cat] = await db("categories").insert({ name: "Switch Category" });
+      const [dish] = await db("items").insert({ category_id: cat, name: "Switch Dish", price: 200, created_by_type: "admin" });
+      const mkKitchen = async (name, phone, dLat, extra = {}) => {
+        const [id] = await db("restaurants").insert({ name, phone, address: "Newtown", lat: LAT + dLat, lng: LNG, radius_km: 5, status: "active", ...extra });
+        await db("restaurant_categories").insert({ restaurant_id: id, category_id: cat });
+        await db("restaurant_items").insert({ restaurant_id: id, item_id: dish, is_available: true });
+        return id;
+      };
+      const kNear = await mkKitchen("Switch Near", "8600006001", 0.005);
+      const kFar = await mkKitchen("Switch Far", "8600006002", 0.03);
+      const [pendingK] = await db("restaurants").insert({ name: "Switch Pending", phone: "8600006003", address: "Newtown", lat: LAT, lng: LNG, radius_km: 5, status: "active", verification_status: "pending" });
+      const [cust] = await db("users").insert({ name: "Switch Customer", phone: "8000006001", wallet_balance: 0 });
+      await db("riders").insert({ name: "Switch Rider", phone: "8500006001", status: "active", wallet_balance: 0, last_known_lat: LAT, last_known_lng: LNG });
+      const custTok = signToken({ id: cust, type: "customer" });
+      const nearTok = signToken({ id: kNear, type: "restaurant" }), farTok = signToken({ id: kFar, type: "restaurant" });
+      const mkAdmin = async (name, role) => { const [id] = await db("admins").insert({ name, email: `${name}@avail.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role }); return { id, token: signToken({ id, type: "admin" }) }; };
+      const opsA = await mkAdmin("avail-ops", "ops"), supA = await mkAdmin("avail-support", "support");
+      const setOnline = (tok, online) => call(tok, "PATCH", "/restaurants/me/availability", { online });
+      const histCount = async (id) => Number((await db("restaurant_availability_history").where({ restaurant_id: id }).count({ n: "*" }).first()).n);
+      const orderBody = { items: [{ item_id: dish, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Switch Address", payment_method: "cod" };
+      const quote = () => call(custTok, "POST", "/cart/quote", { items: orderBody.items, delivery_lat: LAT, delivery_lng: LNG });
+      const hhmm = (min) => { const m = ((min % 1440) + 1440) % 1440; return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`; };
+      const nowMin = hours.nowMinutesIst();
+
+      // ---- the endpoint
+      check("a kitchen created before the switch (every existing one) is online by default", (await db("restaurants").where({ id: kNear }).first()).is_online === 1);
+      check("no token -> 401, a customer token -> 403, an unapproved kitchen is behind the verification gate (403 verification_required)", (await call(null, "PATCH", "/restaurants/me/availability", { online: false })).status === 401 && (await call(custTok, "PATCH", "/restaurants/me/availability", { online: false })).status === 403 && (await setOnline(signToken({ id: pendingK, type: "restaurant" }), false)).body.code === "verification_required");
+      const bads = await Promise.all([call(nearTok, "PATCH", "/restaurants/me/availability", {}), setOnline(nearTok, "false"), setOnline(nearTok, 0), setOnline(nearTok, null)]);
+      check("online must be a boolean: missing / 'false' / 0 / null -> 400, and nothing changes", bads.every((r) => r.status === 400 && typeof r.body.error === "string") && (await db("restaurants").where({ id: kNear }).first()).is_online === 1);
+      const me0 = await call(nearTok, "GET", "/restaurants/me");
+      check("GET /restaurants/me gains online, opens_at, closes_at, is_open_now, accepting_orders (online, no hours, so all on)", me0.body.restaurant.online === true && me0.body.restaurant.opens_at === null && me0.body.restaurant.closes_at === null && me0.body.restaurant.is_open_now === true && me0.body.restaurant.accepting_orders === true);
+
+      // ---- an order placed while online can still be accepted after the kitchen goes offline
+      const placed = await call(custTok, "POST", "/orders", orderBody);
+      check("with the kitchen online an order is placed to the nearest one", placed.status === 201 && placed.body.order.restaurant_id === kNear);
+      const off = await setOnline(nearTok, false);
+      check("PATCH availability { online: false } -> 200 { restaurant } in the GET /restaurants/me shape with online false and accepting_orders false (hours untouched: is_open_now stays true)",
+        off.status === 200 && off.body.restaurant.id === kNear && off.body.restaurant.online === false && off.body.restaurant.accepting_orders === false && off.body.restaurant.is_open_now === true && "categories" in off.body.restaurant);
+      check("GET /restaurants/me agrees, and it persists", (await call(nearTok, "GET", "/restaurants/me")).body.restaurant.online === false && (await db("restaurants").where({ id: kNear }).first()).is_online === 0);
+      check("one history row (offline); repeating the same state is idempotent (200, no new row)", (await histCount(kNear)) === 1 && (await setOnline(nearTok, false)).status === 200 && (await histCount(kNear)) === 1);
+      const acc = await call(nearTok, "POST", `/orders/${placed.body.order.id}/accept`, {});
+      check("an order placed before going offline can still be accepted (nothing is cancelled automatically)", acc.status === 200 && acc.body.order.status === "accepted");
+      const lo = await call(nearTok, "POST", "/auth/logout", {});
+      check("logging out does not change the switch (unlike riders)", (await db("restaurants").where({ id: kNear }).first()).is_online === 0 && lo.status < 500);
+
+      // ---- routing skips the offline kitchen (cascade goes to the next ONLINE one)
+      const candDefault = await routing.findCandidates({ items: [{ itemId: dish, categoryId: cat }], customerLat: LAT, customerLng: LNG });
+      const candAll = await routing.findCandidates({ items: [{ itemId: dish, categoryId: cat }], customerLat: LAT, customerLng: LNG, includeClosed: true });
+      check("routing skips the offline nearest kitchen by default (it is listed with includeClosed)", candDefault.length === 1 && candDefault[0].restaurant.id === kFar && candAll.length === 2 && candAll[0].restaurant.id === kNear);
+      const q1 = await quote();
+      check("quote with the nearest offline but another online: still valid (priced from the online one)", q1.body.valid === true && q1.body.unavailable_reason === null);
+      const p2 = await call(custTok, "POST", "/orders", orderBody);
+      check("a new order goes to the online kitchen", p2.status === 201 && p2.body.order.restaurant_id === kFar);
+      const rej = await call(farTok, "POST", `/orders/${p2.body.order.id}/reject`, {});
+      const afterRej = await db("orders").where({ id: p2.body.order.id }).first();
+      check("reject cascade never lands on the offline kitchen (nobody else can take it -> cancelled)", rej.status === 200 && afterRej.restaurant_id !== kNear && afterRej.status === "cancelled");
+
+      // ---- every kitchen for the category offline
+      await setOnline(farTok, false);
+      const cats = await call(null, "GET", `/categories?lat=${LAT}&lng=${LNG}`);
+      const c1 = cats.body.categories.find((c) => c.id === cat);
+      check("catalog: a category whose only kitchens are offline shows closed:true with opens_at null (and is not hidden)", !!c1 && c1.closed === true && c1.opens_at === null);
+      const items1 = await call(null, "GET", `/categories/${cat}/items?lat=${LAT}&lng=${LNG}`);
+      check("items endpoint likewise: items still listed, closed:true, opens_at null", items1.body.items.length === 1 && items1.body.closed === true && items1.body.opens_at === null);
+      const detail1 = await call(null, "GET", `/categories/${cat}?lat=${LAT}&lng=${LNG}`);
+      check("category detail carries closed:true, opens_at null", detail1.body.category.closed === true && detail1.body.category.opens_at === null);
+      const qc = await quote();
+      check("quote: valid:false, delivery_available:false, unavailable_reason kitchen_closed, opens_at null, reason \"This kitchen isn't taking orders right now.\" (still priced, clubbable)",
+        qc.body.valid === false && qc.body.delivery_available === false && qc.body.unavailable_reason === "kitchen_closed" && qc.body.opens_at === null && qc.body.reason === "This kitchen isn't taking orders right now." && qc.body.clubbable === true && qc.body.grandTotal > 0);
+      const before = Number((await db("orders").where({ customer_id: cust }).count({ n: "*" }).first()).n);
+      const pc = await call(custTok, "POST", "/orders", orderBody);
+      check("POST /orders -> 409 { code: kitchen_closed, opens_at: null, error } and nothing is created", pc.status === 409 && pc.body.code === "kitchen_closed" && pc.body.opens_at === null && pc.body.error === "This kitchen isn't taking orders right now." && Number((await db("orders").where({ customer_id: cust }).count({ n: "*" }).first()).n) === before);
+      const rc = await call(custTok, "POST", `/orders/${placed.body.order.id}/reorder`, { delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Switch Address", payment_method: "cod" });
+      check("reorder is refused the same way", rc.status === 409 && rc.body.code === "kitchen_closed" && rc.body.opens_at === null);
+
+      // ---- offline + hours-closed mix: opens_at comes from the kitchen that is merely outside its hours
+      await db("restaurants").where({ id: kFar }).update({ opens_at: hhmm(nowMin + 120), closes_at: hhmm(nowMin + 240) });
+      await setOnline(farTok, true); // online again, but closed by its hours
+      const cats2 = await call(null, "GET", `/categories?lat=${LAT}&lng=${LNG}`);
+      const c2 = cats2.body.categories.find((c) => c.id === cat);
+      check("the online kitchen is outside its hours and the other is offline: closed, opens_at = the hours kitchen's opening", c2.closed === true && c2.opens_at === hhmm(nowMin + 120));
+      const qm = await quote();
+      check("quote then names that opening time", qm.body.unavailable_reason === "kitchen_closed" && qm.body.opens_at === hhmm(nowMin + 120) && /It opens at/.test(qm.body.reason));
+      const me2 = await call(farTok, "GET", "/restaurants/me");
+      check("GET /restaurants/me for that kitchen: online true, is_open_now false (hours), accepting_orders false, hours as HH:MM", me2.body.restaurant.online === true && me2.body.restaurant.is_open_now === false && me2.body.restaurant.accepting_orders === false && me2.body.restaurant.opens_at === hhmm(nowMin + 120) && me2.body.restaurant.closes_at === hhmm(nowMin + 240));
+      await db("restaurants").where({ id: kFar }).update({ opens_at: null, closes_at: null });
+      check("an online kitchen with no hours is open again: the category reopens and the order goes through", (await call(null, "GET", `/categories?lat=${LAT}&lng=${LNG}`)).body.categories.find((c) => c.id === cat).closed === false && (await call(custTok, "POST", "/orders", orderBody)).status === 201);
+
+      // ---- admin view + override
+      const detail = await call(supA.token, "GET", `/admin/restaurants/${kNear}`);
+      check("admin detail returns is_online (and accepting_orders) plus availability_history with when it changed", detail.status === 200 && detail.body.restaurant.is_online === false && detail.body.restaurant.accepting_orders === false && detail.body.availability_history.length === 1 && detail.body.availability_history[0].is_online === false && detail.body.availability_history[0].changed_by === "restaurant");
+      const list = await call(supA.token, "GET", "/admin/restaurants?limit=200");
+      check("admin list rows carry is_online / accepting_orders per kitchen", list.body.restaurants.find((r) => r.id === kNear).is_online === false && list.body.restaurants.find((r) => r.id === kFar).is_online === true && list.body.restaurants.find((r) => r.id === kFar).accepting_orders === true);
+      check("support can't force it (403); a non-boolean is 400", (await call(supA.token, "PATCH", `/admin/restaurants/${kNear}`, { is_online: true })).status === 403 && (await call(opsA.token, "PATCH", `/admin/restaurants/${kNear}`, { is_online: "yes" })).status === 400);
+      const forced = await call(opsA.token, "PATCH", `/admin/restaurants/${kNear}`, { is_online: true });
+      check("ops can force a kitchen online: 200, the response shows it, and the history records the admin", forced.status === 200 && forced.body.restaurant.is_online === true && forced.body.restaurant.accepting_orders === true && (await db("restaurant_availability_history").where({ restaurant_id: kNear }).orderBy("id", "desc").first()).admin_id === opsA.id && (await db("restaurant_availability_history").where({ restaurant_id: kNear }).orderBy("id", "desc").first()).changed_by === "admin");
+      check("forcing the state it already has changes nothing and writes no row", (await call(opsA.token, "PATCH", `/admin/restaurants/${kNear}`, { is_online: true })).status === 200 && (await histCount(kNear)) === 2);
+      check("the kitchen sees it back online", (await call(nearTok, "GET", "/restaurants/me")).body.restaurant.online === true);
+    } finally {
+      for (const r of savedRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@avail.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

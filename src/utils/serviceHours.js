@@ -1,6 +1,10 @@
 const { OFFSET_MIN } = require("./reportRange");
 
 /**
+ * A kitchen takes orders when it is ONLINE (its own manual switch, restaurants.is_online, default on) AND inside its service hours.
+ * isOpenNow is that combination — the one test routing, the catalog, the quote and order placement use. isWithinHours is the
+ * admin-set window alone; a row that doesn't carry is_online counts as online.
+ *
  * Kitchen service hours: ONE daily window per kitchen (same every day), in IST (REPORT_TZ_OFFSET_MINUTES).
  * restaurants.opens_at / closes_at are TIME columns; both NULL = always open. closes_at earlier than opens_at is an overnight
  * window (e.g. 18:00 -> 02:00). opens_at === closes_at is rejected on write (it would mean "never" or "always" depending on taste).
@@ -39,7 +43,13 @@ function hasHours(restaurant) {
   return toMinutes(restaurant.opens_at) !== null && toMinutes(restaurant.closes_at) !== null;
 }
 
-function isOpenNow(restaurant, now = new Date()) {
+/** The kitchen's own Online/Offline switch. */
+function isOnline(restaurant) {
+  return restaurant.is_online === undefined || restaurant.is_online === null ? true : Boolean(restaurant.is_online);
+}
+
+/** Inside the admin-set daily window (no window = always). Says nothing about the manual switch. */
+function isWithinHours(restaurant, now = new Date()) {
   const opens = toMinutes(restaurant.opens_at);
   const closes = toMinutes(restaurant.closes_at);
   if (opens === null || closes === null) return true; // no hours = always open
@@ -49,21 +59,28 @@ function isOpenNow(restaurant, now = new Date()) {
   return true; // equal can't be stored; treat a stray one as always open rather than never
 }
 
+/** Taking orders right now: switched online AND inside its hours. */
+function isOpenNow(restaurant, now = new Date()) {
+  return isOnline(restaurant) && isWithinHours(restaurant, now);
+}
+
 /** Minutes until the kitchen next opens (0 if open now, null if it has no hours). */
 function minutesUntilOpen(restaurant, now = new Date()) {
   if (!hasHours(restaurant)) return null;
-  if (isOpenNow(restaurant, now)) return 0;
+  if (isWithinHours(restaurant, now)) return 0;
   return (toMinutes(restaurant.opens_at) - nowMinutesIst(now) + DAY_MIN) % DAY_MIN;
 }
 
 /**
  * Of these kitchens, "closed" is true when none is open right now (and there is at least one); opens_at is the earliest
- * next opening ("HH:MM") among them. closed:false -> opens_at null.
+ * next opening ("HH:MM") among the ones that are online but outside their hours. A kitchen switched offline has no known
+ * reopening, so when that is the only reason opens_at is null. closed:false -> opens_at null.
  */
 function openStatus(restaurants, now = new Date()) {
   if (restaurants.length === 0 || restaurants.some((r) => isOpenNow(r, now))) return { closed: false, opens_at: null };
   let best = null;
   for (const r of restaurants) {
+    if (!isOnline(r)) continue;
     const wait = minutesUntilOpen(r, now);
     if (best === null || wait < best.wait) best = { wait, opens_at: normaliseTime(r.opens_at) };
   }
@@ -80,7 +97,7 @@ function friendlyTime(hhmm) {
 }
 
 function closedMessage(opensAt) {
-  return opensAt ? `This kitchen is closed right now. It opens at ${friendlyTime(opensAt)}.` : "This kitchen is closed right now.";
+  return opensAt ? `This kitchen is closed right now. It opens at ${friendlyTime(opensAt)}.` : "This kitchen isn't taking orders right now.";
 }
 
 /**
@@ -106,9 +123,15 @@ function validateHoursPatch(body, current) {
   return { value: { opens_at: o.value, closes_at: c.value } };
 }
 
-/** Adds opens_at/closes_at ("HH:MM") and is_open_now to a restaurant row for admin responses. */
+/**
+ * Adds the availability fields to a restaurant row: opens_at / closes_at ("HH:MM" or null), is_online (the kitchen's own switch),
+ * is_open_now (inside the admin-set hours — the hours rule alone) and accepting_orders (both: what customers actually get).
+ */
 function presentHours(restaurant, now = new Date()) {
-  return { ...restaurant, opens_at: normaliseTime(restaurant.opens_at), closes_at: normaliseTime(restaurant.closes_at), is_open_now: isOpenNow(restaurant, now) };
+  return {
+    ...restaurant, opens_at: normaliseTime(restaurant.opens_at), closes_at: normaliseTime(restaurant.closes_at),
+    is_online: isOnline(restaurant), is_open_now: isWithinHours(restaurant, now), accepting_orders: isOpenNow(restaurant, now),
+  };
 }
 
-module.exports = { toMinutes, normaliseTime, nowMinutesIst, hasHours, isOpenNow, minutesUntilOpen, openStatus, friendlyTime, closedMessage, validateHoursPatch, presentHours };
+module.exports = { toMinutes, normaliseTime, nowMinutesIst, hasHours, isOnline, isWithinHours, isOpenNow, minutesUntilOpen, openStatus, friendlyTime, closedMessage, validateHoursPatch, presentHours };

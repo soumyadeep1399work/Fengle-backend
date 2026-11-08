@@ -31,7 +31,7 @@ async function getInRangeRestaurants(lat, lng, categoryId) {
       .join("restaurant_categories", "restaurants.id", "restaurant_categories.restaurant_id")
       .andWhere("restaurant_categories.category_id", categoryId);
   }
-  const restaurants = await query.select("restaurants.id", "restaurants.lat", "restaurants.lng", "restaurants.opens_at", "restaurants.closes_at");
+  const restaurants = await query.select("restaurants.id", "restaurants.lat", "restaurants.lng", "restaurants.opens_at", "restaurants.closes_at", "restaurants.is_online");
   return restaurants.filter((r) => haversineDistanceKm(Number(lat), Number(lng), Number(r.lat), Number(r.lng)) <= CATALOG_RANGE_KM);
 }
 
