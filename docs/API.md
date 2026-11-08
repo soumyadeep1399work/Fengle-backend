@@ -613,6 +613,21 @@ One **daily window** per kitchen (the same every day), in **IST** (`REPORT_TZ_OF
 
 Deliberate errors (validation, business rules — anything with a 4xx status) return `{ error: "<readable message>", code? }`. An **unexpected server fault** (a database error, a bug) returns **500** `{ error: "Something went wrong on our side. Please try again in a moment.", ref: "a1b2c3d4" }` in production — the SQL, table/column/constraint names and values are never sent; the full error is logged server-side under the same `ref` (`[error a1b2c3d4] METHOD /path`). Outside production the detail is still returned (plus `ref`) for developers. A **customer token whose user row no longer exists** (deleted account, or a token from another database) is refused with **401** `Invalid or expired token`, like any bad token, rather than failing later on a foreign key.
 
+## Customer support tickets (added 2026-11-08)
+
+Customers file complaints that get a reference number; any admin role works them from the panel. Table `support_tickets` (`reference` "FSP-000123" derived from the id, `category` order_issue | missing_item | payment_failed | refund | delivery_delay | general, `message`, `status` open | in_progress | resolved, `resolution_note`, `resolved_by` admin id, `resolved_at`).
+
+**Customer** (customer token)
+- `POST /support/tickets { category, order_id?, message }` → **201 `{ ticket }`**. 400 `{ error }` on a bad category, a message under 10 or over 1000 characters (after trimming), a non-numeric `order_id`, or an `order_id` that isn't the customer's own order. Abuse limits → **429** `{ error, code }`: `too_many_open_tickets` (5 open/in-progress at once), `too_many_tickets_today` (10 filed in 24 h, resolved ones included).
+- `GET /support/tickets` → `{ tickets }` newest first, the customer's own, at most 50. `GET /support/tickets/:id` → `{ ticket }` (404 if it isn't theirs).
+- `ticket = { id, reference, category, order_id, message, status, resolution_note, created_at, updated_at, resolved_at }`.
+
+**Admin** (all three roles — `super_admin`, `ops`, `support` — may read **and** resolve)
+- `GET /admin/support-tickets?status=&category=&q=&limit=&offset=` → `{ tickets: [ticket + customer_id, resolved_by, resolved_by_name, customer: { id, name, phone }], total }`. `q` matches the reference, the customer's phone or name. Order is chosen server-side: `status=open` or `in_progress` → **oldest first** (a work queue); `resolved` or no status → **newest first**. `limit` default 25, max 100. A bad `status`/`category` is 400.
+- `GET /admin/support-tickets/summary` → `{ open, in_progress }` (for a nav badge).
+- `GET /admin/support-tickets/:id` → `{ ticket, customer: { id, name, phone }, order: { id, status, total, payment_method, payment_status, restaurant: { id, name }, categories: [name], placed_at } | null }`. The order block never carries the kitchen payable or vendor cost.
+- `PATCH /admin/support-tickets/:id { status?, resolution_note? }` → `{ ticket }`. `resolution_note` (≤ 1000 chars) is **required to resolve** (400 otherwise; a note already stored counts). Becoming `resolved` stamps `resolved_by` / `resolved_at` and **pushes the customer once** ("Your complaint FSP-000123 is resolved", `data: { type: "support", ticket_id }`, honouring the customer's order-updates toggle). Editing the note of an already-resolved ticket doesn't push again; moving back to `open` / `in_progress` clears the stamp.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**

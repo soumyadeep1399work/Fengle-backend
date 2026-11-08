@@ -3871,7 +3871,7 @@ async function main() {
   console.log("\n--- Test 54: ONLINE_PAYMENTS_ENABLED=false hides UPI/Card and refuses online orders (COD and credits untouched) ---");
   {
     const payCtl = require("./src/controllers/payment.controller");
-    const [custId] = await db("users").insert({ name: "Switch Customer", phone: "8000005401", wallet_balance: 0 });
+    const [custId] = await db("users").insert({ name: "Switch Customer", phone: "8000005411", wallet_balance: 0 });
     const auth = { id: custId, type: "customer" };
     const savedSwitch = process.env.ONLINE_PAYMENTS_ENABLED;
     const methods = async () => { const r = fakeRes(); await payCtl.getPaymentMethods(fakeReq({}, {}, auth), r); return Object.fromEntries(r.body.methods.map((m) => [m.id, m])); };
@@ -4005,7 +4005,7 @@ async function main() {
     await db("app_notices").delete();
   }
 
-  console.log("\n--- Test 53: Coupon terms — admin-written, one per line, shown on GET /coupons/mine ---");
+  console.log("\n--- Test 56: Coupon terms — admin-written, one per line, shown on GET /coupons/mine ---");
   {
     const http = require("http");
     const bcrypt = require("bcrypt");
@@ -4051,6 +4051,134 @@ async function main() {
     } finally {
       await new Promise((resolve) => server.close(resolve));
       await db("admins").where("email", "like", "%@terms.test").delete();
+    }
+  }
+
+  console.log("\n--- Test 57: Customer support tickets — filing, limits, admin queue, resolve + push ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const push = require("./src/services/push.service");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    const pushes = [];
+    const realSend = push.sendToOwner;
+    push.sendToOwner = async (type, id, n) => { pushes.push({ type, id, ...n }); };
+    try {
+      const mkAdmin = async (name, role) => { const [id] = await db("admins").insert({ name, email: `${name}@support.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role }); return { id, token: signToken({ id, type: "admin" }) }; };
+      const superA = await mkAdmin("sup-super", "super_admin"), opsA = await mkAdmin("sup-ops", "ops"), supA = await mkAdmin("sup-support", "support");
+      const [cA] = await db("users").insert({ name: "Asha Support", phone: "8000005701", wallet_balance: 0 });
+      const [cB] = await db("users").insert({ name: "Bela Other", phone: "8000005702", wallet_balance: 0 });
+      const [cC] = await db("users").insert({ name: "Chitra Daily", phone: "8000005703", wallet_balance: 0 });
+      const tokA = signToken({ id: cA, type: "customer" }), tokB = signToken({ id: cB, type: "customer" }), tokC = signToken({ id: cC, type: "customer" });
+      const [orderRow] = await db("orders").where({ id: orderId }).select("customer_id");
+      await db("orders").where({ id: orderId }).update({ customer_id: cA }); // give customer A a real order to complain about (restored below)
+      const file = (tok, body) => call(tok, "POST", "/support/tickets", body);
+      const msg = "The rider never arrived and the food was cold";
+
+      // ---- validation
+      const bad = await Promise.all([
+        file(tokA, { category: "nope", message: msg }), file(tokA, { message: msg }),
+        file(tokA, { category: "general", message: "too short" }), file(tokA, { category: "general", message: "x".repeat(1001) }), file(tokA, { category: "general" }),
+        file(tokA, { category: "order_issue", order_id: "abc", message: msg })
+      ]);
+      check("bad category / missing category / message under 10 or over 1000 chars / missing message / non-numeric order_id -> 400 with a readable error",
+        bad.every((r) => r.status === 400 && typeof r.body.error === "string" && r.body.error.length > 5));
+      const notMine = await file(tokB, { category: "order_issue", order_id: orderId, message: msg });
+      check("an order_id that isn't the customer's own is 400", notMine.status === 400 && /order/i.test(notMine.body.error) && (await db("support_tickets").where({ customer_id: cB }).count({ n: "*" }).first()).n === 0);
+      check("no token -> 401, an admin/restaurant token -> 403 on the customer routes", (await call(null, "POST", "/support/tickets", {})).status === 401 && (await call(superA.token, "GET", "/support/tickets")).status === 403 && (await call(signToken({ id: 1, type: "restaurant" }), "GET", "/support/tickets")).status === 403);
+
+      // ---- filing
+      const t1 = await file(tokA, { category: "order_issue", order_id: orderId, message: `  ${msg}  ` });
+      const tk1 = t1.body.ticket;
+      check("201 { ticket } with the agreed shape; reference FSP-000123 style derived from the id; status open; message trimmed",
+        t1.status === 201 && tk1.reference === `FSP-${String(tk1.id).padStart(6, "0")}` && tk1.category === "order_issue" && tk1.order_id === orderId && tk1.message === msg && tk1.status === "open" && tk1.resolution_note === null && tk1.resolved_at === null && !!tk1.created_at && !!tk1.updated_at
+        && Object.keys(tk1).sort().join() === "category,created_at,id,message,order_id,reference,resolution_note,resolved_at,status,updated_at");
+      const t2 = await file(tokA, { category: "general", message: "Please add more payment options" });
+      check("an order_id is optional (null); each ticket gets its own reference", t2.status === 201 && t2.body.ticket.order_id === null && t2.body.ticket.reference !== tk1.reference);
+      const mineList = await call(tokA, "GET", "/support/tickets");
+      check("GET /support/tickets: only my tickets, newest first", mineList.status === 200 && mineList.body.tickets.length === 2 && mineList.body.tickets[0].id === t2.body.ticket.id && mineList.body.tickets[1].id === tk1.id);
+      check("GET /support/tickets/:id returns it; another customer's, a missing and a non-numeric id are 404",
+        (await call(tokA, "GET", `/support/tickets/${tk1.id}`)).body.ticket.reference === tk1.reference && (await call(tokB, "GET", `/support/tickets/${tk1.id}`)).status === 404 && (await call(tokA, "GET", "/support/tickets/999999")).status === 404 && (await call(tokA, "GET", "/support/tickets/abc")).status === 404);
+      check("a customer with no tickets gets an empty list", (await call(tokB, "GET", "/support/tickets")).body.tickets.length === 0);
+
+      // ---- abuse limits
+      for (let i = 0; i < 3; i++) await file(tokA, { category: "general", message: `Another open complaint number ${i + 1} here` });
+      const sixth = await file(tokA, { category: "general", message: "One more complaint than allowed at once" });
+      check("a 6th open complaint is refused: 429 code too_many_open_tickets with a clear message", sixth.status === 429 && sixth.body.code === "too_many_open_tickets" && /5 open complaints/.test(sixth.body.error));
+      await call(superA.token, "PATCH", `/admin/support-tickets/${t2.body.ticket.id}`, { status: "resolved", resolution_note: "Noted, thank you" });
+      check("resolving one frees a slot (a new complaint is accepted again)", (await file(tokA, { category: "general", message: "Filing again after one was resolved" })).status === 201);
+      await db("support_tickets").insert(Array.from({ length: 10 }, (_, i) => ({ customer_id: cC, category: "general", message: `old resolved complaint ${i} text`, status: "resolved", resolution_note: "done", reference: `FSP-9${String(i).padStart(5, "0")}` })));
+      const daily = await file(tokC, { category: "general", message: "An eleventh complaint within one day" });
+      check("10 complaints in 24 h is the daily cap (429 too_many_tickets_today), even when they are all resolved", daily.status === 429 && daily.body.code === "too_many_tickets_today");
+
+      // ---- admin queue
+      const asRole = async (who) => call(who.token, "GET", "/admin/support-tickets?limit=100");
+      const [rs, ro, rsup] = [await asRole(superA), await asRole(opsA), await asRole(supA)];
+      check("super_admin, ops and support can all read the queue", [rs, ro, rsup].every((r) => r.status === 200 && Array.isArray(r.body.tickets) && typeof r.body.total === "number"));
+      const first = rs.body.tickets.find((t) => t.id === tk1.id);
+      check("a queue row is the ticket plus customer {id,name,phone}", !!first && first.customer.id === cA && first.customer.name === "Asha Support" && first.customer.phone === "8000005701" && first.reference === tk1.reference);
+      const openQ = await call(opsA.token, "GET", "/admin/support-tickets?status=open&limit=100");
+      const openIds = openQ.body.tickets.map((t) => t.id);
+      check("status=open lists only open ones, OLDEST first (a work queue)", openQ.body.tickets.every((t) => t.status === "open") && openIds.every((id, i) => i === 0 || id > openIds[i - 1]) && openIds[0] === tk1.id);
+      const allIds = rs.body.tickets.map((t) => t.id);
+      check("with no status filter it's newest first", allIds.every((id, i) => i === 0 || id < allIds[i - 1]));
+      const resolvedQ = await call(opsA.token, "GET", "/admin/support-tickets?status=resolved&limit=100");
+      const resIds = resolvedQ.body.tickets.map((t) => t.id);
+      check("status=resolved is newest first", resolvedQ.body.tickets.length >= 11 && resolvedQ.body.tickets.every((t) => t.status === "resolved") && resIds.every((id, i) => i === 0 || id < resIds[i - 1]));
+      check("category filter", (await call(opsA.token, "GET", "/admin/support-tickets?category=order_issue&limit=100")).body.tickets.every((t) => t.category === "order_issue") && (await call(opsA.token, "GET", "/admin/support-tickets?category=order_issue&limit=100")).body.tickets.some((t) => t.id === tk1.id));
+      const byRef = await call(opsA.token, "GET", `/admin/support-tickets?q=${tk1.reference}`);
+      const byPhone = await call(opsA.token, "GET", "/admin/support-tickets?q=8000005701&limit=100");
+      const byName = await call(opsA.token, "GET", "/admin/support-tickets?q=asha&limit=100");
+      check("q matches the reference, the customer's phone and the customer's name", byRef.body.tickets.length === 1 && byRef.body.tickets[0].id === tk1.id && byPhone.body.tickets.length >= 1 && byPhone.body.tickets.every((t) => t.customer.id === cA) && byName.body.tickets.length === byPhone.body.tickets.length);
+      const paged = await call(opsA.token, "GET", "/admin/support-tickets?limit=2&offset=1");
+      check("limit/offset page the results and total is the full count", paged.body.tickets.length === 2 && paged.body.total === rs.body.total && paged.body.tickets[0].id === allIds[1]);
+      check("a bad status or category filter is 400", (await call(opsA.token, "GET", "/admin/support-tickets?status=weird")).status === 400 && (await call(opsA.token, "GET", "/admin/support-tickets?category=weird")).status === 400);
+      const sum = await call(supA.token, "GET", "/admin/support-tickets/summary");
+      const openNow = (await db("support_tickets").where({ status: "open" }).count({ n: "*" }).first()).n;
+      check("GET /admin/support-tickets/summary -> { open, in_progress } counts", sum.status === 200 && sum.body.open === Number(openNow) && sum.body.in_progress === 0);
+
+      // ---- detail
+      const det = await call(supA.token, "GET", `/admin/support-tickets/${tk1.id}`);
+      check("detail: ticket + customer + the order (id, status, total, restaurant name, categories, placed_at) and no kitchen payable / vendor cost",
+        det.status === 200 && det.body.ticket.id === tk1.id && det.body.customer.phone === "8000005701" && det.body.order.id === orderId && typeof det.body.order.total === "number" && typeof det.body.order.restaurant.name === "string" && Array.isArray(det.body.order.categories) && !!det.body.order.placed_at && !/payable|vendor_cost|commission/i.test(det.text));
+      check("a ticket with no order has order: null; a missing ticket is 404", (await call(supA.token, "GET", `/admin/support-tickets/${t2.body.ticket.id}`)).body.order === null && (await call(supA.token, "GET", "/admin/support-tickets/999999")).status === 404);
+      check("a customer token can't use the admin routes (403)", (await call(tokA, "GET", "/admin/support-tickets")).status === 403 && (await call(tokA, "PATCH", `/admin/support-tickets/${tk1.id}`, { status: "resolved", resolution_note: "x" })).status === 403);
+
+      // ---- resolving
+      const upd = (who, id, body) => call(who.token, "PATCH", `/admin/support-tickets/${id}`, body);
+      check("empty body, bad status, over-long or non-text note -> 400", (await upd(supA, tk1.id, {})).status === 400 && (await upd(supA, tk1.id, { status: "weird" })).status === 400 && (await upd(supA, tk1.id, { resolution_note: "x".repeat(1001) })).status === 400 && (await upd(supA, tk1.id, { resolution_note: 5 })).status === 400);
+      check("resolving needs a resolution note (400 without, or with a blank one)", (await upd(supA, tk1.id, { status: "resolved" })).status === 400 && (await upd(supA, tk1.id, { status: "resolved", resolution_note: "   " })).status === 400 && (await db("support_tickets").where({ id: tk1.id }).first()).status === "open");
+      const inProg = await upd(opsA, tk1.id, { status: "in_progress" });
+      check("in_progress needs no note and counts in the summary", inProg.status === 200 && inProg.body.ticket.status === "in_progress" && (await call(supA.token, "GET", "/admin/support-tickets/summary")).body.in_progress === 1 && pushes.length === 1 /* the earlier resolve of ticket 2 */);
+      const pushesBefore = pushes.length;
+      const resolved = await upd(supA, tk1.id, { status: "resolved", resolution_note: "  Refunded Rs 120 to your wallet  " });
+      check("resolving: 200, note trimmed and stored, resolved_by = the admin, resolved_at set (support may resolve)", resolved.status === 200 && resolved.body.ticket.status === "resolved" && resolved.body.ticket.resolution_note === "Refunded Rs 120 to your wallet" && resolved.body.ticket.resolved_by === supA.id && resolved.body.ticket.resolved_by_name === "sup-support" && !!resolved.body.ticket.resolved_at);
+      await sleep(150);
+      const sent = pushes.slice(pushesBefore);
+      check("the customer is pushed once: 'Your complaint FSP-… is resolved', data { type: support, ticket_id }", sent.length === 1 && sent[0].type === "customer" && sent[0].id === cA && sent[0].title === `Your complaint ${tk1.reference} is resolved` && sent[0].data.type === "support" && sent[0].data.ticket_id === tk1.id && /Refunded/.test(sent[0].body));
+      check("the customer sees the resolution on their own ticket", (await call(tokA, "GET", `/support/tickets/${tk1.id}`)).body.ticket.status === "resolved" && (await call(tokA, "GET", `/support/tickets/${tk1.id}`)).body.ticket.resolution_note === "Refunded Rs 120 to your wallet");
+      await upd(opsA, tk1.id, { resolution_note: "Refunded Rs 120 to your wallet (updated)" });
+      await sleep(100);
+      check("editing the note of an already-resolved ticket doesn't push again and keeps who/when resolved it", pushes.length === pushesBefore + 1 && (await db("support_tickets").where({ id: tk1.id }).first()).resolved_by === supA.id);
+      const reopened = await upd(opsA, tk1.id, { status: "open" });
+      check("reopening clears resolved_by / resolved_at", reopened.status === 200 && reopened.body.ticket.status === "open" && reopened.body.ticket.resolved_by === null && reopened.body.ticket.resolved_at === null);
+      await upd(superA, tk1.id, { status: "resolved" }); // the stored note is reused: no new note needed after a reopen
+      await sleep(150);
+      check("resolving again (stored note kept) pushes again", pushes.length === pushesBefore + 2 && (await db("support_tickets").where({ id: tk1.id }).first()).resolved_by === superA.id);
+      await db("orders").where({ id: orderId }).update({ customer_id: orderRow.customer_id });
+    } finally {
+      push.sendToOwner = realSend;
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@support.test").delete();
     }
   }
 

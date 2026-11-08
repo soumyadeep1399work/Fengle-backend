@@ -5,6 +5,7 @@ const adminOrders = require("../controllers/adminOrders.controller");
 const adminCustomers = require("../controllers/adminCustomers.controller");
 const adminCategories = require("../controllers/adminCategories.controller");
 const adminCoupons = require("../controllers/adminCoupons.controller");
+const adminSupport = require("../controllers/adminSupport.controller");
 const onboardingSlides = require("../controllers/onboardingSlides.controller");
 const appNotices = require("../controllers/appNotices.controller");
 const adminAdmins = require("../controllers/adminAdmins.controller");
@@ -58,6 +59,13 @@ router.get("/categories", adminCategories.listCategories);
 router.patch("/categories/:id", staff, adminCategories.updateCategory);
 router.post("/categories/:id/merge", staff, adminCategories.mergeCategories);
 router.get("/items", adminCategories.listItems);
+
+// Customer complaints: every role may read AND resolve (support works this queue), so the guard is explicit rather than omitted.
+const everyRole = requireRole("super_admin", "ops", "support");
+router.get("/support-tickets", everyRole, adminSupport.listTickets);
+router.get("/support-tickets/summary", everyRole, adminSupport.summary); // before /:id
+router.get("/support-tickets/:id", everyRole, adminSupport.getTicket);
+router.patch("/support-tickets/:id", everyRole, adminSupport.updateTicket);
 
 // Coupons
 router.post("/coupons", superOnly, adminCoupons.createCoupon);

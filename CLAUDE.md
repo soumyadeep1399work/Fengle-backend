@@ -202,6 +202,11 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   Don't write `res.status(500).json({ error: err.message })` in a controller — throw
   and let the handler decide. `requireAuth` also 401s a customer token whose `users`
   row is gone.
+- **Customer support tickets** (2026-11-08): complaints with a reference
+  (`FSP-000123`), filed by customers (`/support/tickets`, 5 open at a time, 10 a
+  day) and worked by **every admin role** including `support` (`/admin/support-tickets`;
+  the `requireRole` is explicit on purpose). Resolving needs a note and pushes the
+  customer once. The admin order block never includes payable / vendor cost.
 - **Wallet** is shared infrastructure for both customer refunds/credits and
   rider COD reconciliation — see `wallet_ledger` table (owner_type/owner_id
   polymorphic pattern).
