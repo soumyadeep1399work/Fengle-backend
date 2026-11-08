@@ -36,6 +36,7 @@ router.use("/favorites", favoriteRoutes);
 router.use("/notifications", notificationRoutes);
 router.use("/uploads", uploadRoutes);
 router.use("/coupons", couponRoutes);
+router.get("/support/contact", require("../controllers/partnerSupport.controller").getContact); // public (the login screen shows it); before /support, which needs a customer token
 router.use("/support", require("./support.routes")); // customer complaints with a reference number
 router.get("/onboarding-slides", require("../controllers/onboardingSlides.controller").listPublic); // public: the Customer app's intro slides, shown before login
 router.get("/app-notice", require("../controllers/appNotices.controller").getLive); // public: the Customer app's popup notice (newest live one or null)

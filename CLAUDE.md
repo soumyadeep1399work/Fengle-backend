@@ -210,6 +210,13 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   (10) until the kitchen acknowledges (`POST /orders/:id/acknowledge`), accepts or
   rejects; the `kitchen_*` order columns record when it was notified and reacted.
   Never call `sendToOwner("restaurant", …)` for a new order any other way.
+- **Partner support tickets** (2026-11-08): kitchens (riders next — routes not
+  mounted yet, the service is generic via `partner_type`) raise tickets with a reply
+  thread and up to 3 attachments (`/restaurants/me/support-tickets`, `allowUnverified`
+  on purpose); every admin role replies (`/admin/partner-support-tickets`). Attachments
+  go to the private bucket via `savePartnerDocument` and are only streamed by
+  authenticated endpoints. A partner replying to a resolved ticket reopens it.
+  `GET /support/contact` is public and returns only what `SUPPORT_*` env sets.
 - **Never send raw server errors to a client** (2026-11-04): the central error
   handler in `app.js` returns a generic message + `ref` for any 5xx in production
   (the real error is logged under that ref); only deliberate 4xx messages are shown.

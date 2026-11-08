@@ -6,6 +6,8 @@ const adminCustomers = require("../controllers/adminCustomers.controller");
 const adminCategories = require("../controllers/adminCategories.controller");
 const adminCoupons = require("../controllers/adminCoupons.controller");
 const adminSupport = require("../controllers/adminSupport.controller");
+const adminPartnerSupport = require("../controllers/adminPartnerSupport.controller");
+const { parseSupportAttachments } = require("../middleware/supportUpload.middleware");
 const onboardingSlides = require("../controllers/onboardingSlides.controller");
 const appNotices = require("../controllers/appNotices.controller");
 const adminAdmins = require("../controllers/adminAdmins.controller");
@@ -66,6 +68,14 @@ router.get("/support-tickets", everyRole, adminSupport.listTickets);
 router.get("/support-tickets/summary", everyRole, adminSupport.summary); // before /:id
 router.get("/support-tickets/:id", everyRole, adminSupport.getTicket);
 router.patch("/support-tickets/:id", everyRole, adminSupport.updateTicket);
+
+// Partner (kitchen / rider) support tickets with a reply thread: same rule, every role reads and replies.
+router.get("/partner-support-tickets", everyRole, adminPartnerSupport.listTickets);
+router.get("/partner-support-tickets/summary", everyRole, adminPartnerSupport.summary); // before /:id
+router.get("/partner-support-tickets/:id", everyRole, adminPartnerSupport.getTicket);
+router.post("/partner-support-tickets/:id/messages", everyRole, parseSupportAttachments, adminPartnerSupport.reply);
+router.patch("/partner-support-tickets/:id", everyRole, adminPartnerSupport.updateStatus);
+router.get("/partner-support-tickets/:id/attachments/:attachmentId", everyRole, adminPartnerSupport.getAttachment);
 
 // Coupons
 router.post("/coupons", superOnly, adminCoupons.createCoupon);

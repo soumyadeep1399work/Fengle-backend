@@ -4656,6 +4656,194 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 62: Partner support — kitchen tickets with a reply thread + screenshots, admin queue and replies, public contact ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const push = require("./src/services/push.service");
+    const supportSvc = require("./src/services/partnerSupport.service");
+    const savedRl = process.env.RATE_LIMIT_DISABLED;
+    process.env.RATE_LIMIT_DISABLED = "1"; // ~150 requests here; the general limiter isn't what this test is about
+    const savedEnv = { p: process.env.SUPPORT_PHONE, w: process.env.SUPPORT_WHATSAPP, e: process.env.SUPPORT_EMAIL, h: process.env.SUPPORT_HOURS };
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const PNG = (tag = 0) => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from(`fake-png-body-${tag}-0123456789`)]);
+    const PDF = Buffer.from("%PDF-1.4 fake pdf body 0123456789");
+    const form = (fields, files = []) => {
+      const f = new FormData();
+      for (const [k, v] of Object.entries(fields)) if (v !== undefined) f.append(k, String(v));
+      for (const x of files) f.append(x.field || "attachments", new Blob([x.buffer], { type: x.type || "image/png" }), x.name || "shot.png");
+      return f;
+    };
+    const raw = async (token, method, p, bodyInit, isJson) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(isJson ? { "Content-Type": "application/json" } : {}) }, body: bodyInit });
+      const buf = Buffer.from(await r.arrayBuffer());
+      const text = buf.toString("utf8");
+      let json = null; try { json = JSON.parse(text); } catch { /* binary or empty */ }
+      return { status: r.status, body: json, text, buf, headers: r.headers };
+    };
+    const jsonCall = (token, method, p, body) => raw(token, method, p, body !== undefined ? JSON.stringify(body) : undefined, body !== undefined);
+    const pushes = [];
+    const realSend = push.sendToOwner;
+    push.sendToOwner = async (type, id, n) => { pushes.push({ type, id, ...n }); };
+    try {
+      const mkAdmin = async (name, role) => { const [id] = await db("admins").insert({ name, email: `${name}@psupport.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role }); return { id, token: signToken({ id, type: "admin" }) }; };
+      const superA = await mkAdmin("ps-super", "super_admin"), supA = await mkAdmin("ps-support", "support");
+      const [pendingK] = await db("restaurants").insert({ name: "Support Pending Kitchen", phone: "8600006201", address: "Newtown", lat: 22.5, lng: 88.4, radius_km: 5, status: "active", verification_status: "pending" });
+      const kTok = signToken({ id: restA, type: "restaurant" }), kBTok = signToken({ id: restB, type: "restaurant" }), pendTok = signToken({ id: pendingK, type: "restaurant" });
+      const custTok = signToken({ id: customerId, type: "customer" });
+      const create = (tok, fields, files) => raw(tok, "POST", "/restaurants/me/support-tickets", form(fields, files));
+      const good = { category: "payment_settlement", message: "Our settlement for last week has not arrived yet" };
+      const settle = () => sleep(200);
+
+      // ---- public contact
+      for (const k of ["SUPPORT_PHONE", "SUPPORT_WHATSAPP", "SUPPORT_EMAIL", "SUPPORT_HOURS"]) delete process.env[k];
+      const none = await jsonCall(null, "GET", "/support/contact");
+      check("GET /support/contact is public and returns null for everything that isn't configured (nothing invented)", none.status === 200 && JSON.stringify(none.body) === JSON.stringify({ phone: null, whatsapp: null, email: null, hours: null }));
+      process.env.SUPPORT_PHONE = " +91 90000 00000 "; process.env.SUPPORT_EMAIL = "help@example.test"; process.env.SUPPORT_WHATSAPP = ""; process.env.SUPPORT_HOURS = "10 AM - 8 PM";
+      const some = await jsonCall(null, "GET", "/support/contact");
+      check("it returns what the env sets (trimmed), and an empty value is null", some.body.phone === "+91 90000 00000" && some.body.email === "help@example.test" && some.body.hours === "10 AM - 8 PM" && some.body.whatsapp === null);
+
+      // ---- who may use the kitchen routes
+      check("no token -> 401; a customer token -> 403; a token for a deleted kitchen -> 401", (await create(null, good)).status === 401 && (await create(custTok, good)).status === 403 && (await create(signToken({ id: 987654, type: "restaurant" }), good)).status === 401);
+
+      // ---- validation
+      const big = Buffer.concat([PNG(), Buffer.alloc(5 * 1024 * 1024 + 10)]);
+      const bad = await Promise.all([
+        create(kTok, { ...good, category: "nope" }), create(kTok, { message: good.message }), create(kTok, { ...good, message: "too short" }), create(kTok, { ...good, message: "x".repeat(1001) }), create(kTok, { category: good.category }),
+        create(kTok, { ...good, order_id: "abc" }), create(kTok, { ...good, order_id: 999999 }),
+        create(kTok, good, [1, 2, 3, 4].map((i) => ({ buffer: PNG(i) }))),
+        create(kTok, good, [{ buffer: Buffer.from("just some text, not an image at all") }]),
+      ]);
+      check("bad category / missing / short / long message, bad or someone else's order_id, 4 files, a non-image file -> 400 with a readable error", bad.every((r) => r.status === 400 && typeof r.body.error === "string" && r.body.error.length > 5));
+      check("a file over 5 MB is 413", (await create(kTok, good, [{ buffer: big }])).status === 413);
+      check("nothing was stored by the refused attempts", (await db("partner_support_tickets").where({ partner_type: "restaurant", partner_id: restA }).count({ n: "*" }).first()).n === 0);
+      const ordersOfB = await db("orders").where({ restaurant_id: restB }).first("id");
+
+      // ---- create (with screenshots), list, detail
+      const created = await create(kTok, { ...good, order_id: orderId }, [{ buffer: PNG(1), name: "settlement.png" }, { buffer: PDF, type: "application/pdf", name: "statement.pdf" }]);
+      const t1 = created.body.ticket;
+      check("201 { ticket } with the agreed shape: reference FPS-000123 style, status open, the message text, message_count 1, last_message_by partner",
+        created.status === 201 && t1.reference === `FPS-${String(t1.id).padStart(6, "0")}` && t1.category === "payment_settlement" && t1.order_id === orderId && t1.status === "open" && t1.message === good.message && t1.message_count === 1 && t1.last_message_by === "partner" && t1.resolved_at === null
+        && Object.keys(t1).sort().join() === "category,created_at,id,last_message_at,last_message_by,message,message_count,order_id,reference,resolved_at,status,updated_at");
+      const detail = await jsonCall(kTok, "GET", `/restaurants/me/support-tickets/${t1.id}`);
+      const m1 = detail.body.messages[0];
+      check("detail: { ticket, messages } oldest first; the first message is the complaint with its 2 attachments { id, name, content_type, size } — and no storage path anywhere",
+        detail.status === 200 && detail.body.ticket.id === t1.id && detail.body.messages.length === 1 && m1.author === "partner" && m1.body === good.message && m1.attachments.length === 2
+        && m1.attachments[0].name === "settlement.png" && m1.attachments[0].content_type === "image/png" && m1.attachments[0].size === PNG(1).length && m1.attachments[1].content_type === "application/pdf" && Object.keys(m1.attachments[0]).sort().join() === "content_type,id,name,size"
+        && !/storage_path|partner-documents/.test(detail.text) && !/admin_id/.test(detail.text));
+      const t2 = (await create(kTok, { category: "technical", message: "The app closes when I open the menu screen" })).body.ticket;
+      const list = await jsonCall(kTok, "GET", "/restaurants/me/support-tickets");
+      check("GET list: only my tickets, newest first, with the same row shape", list.status === 200 && list.body.tickets.length === 2 && list.body.tickets[0].id === t2.id && list.body.tickets[1].id === t1.id && list.body.tickets[1].message_count === 1);
+      check("another kitchen sees none of it: empty list, 404 on the ticket and on its attachment", (await jsonCall(kBTok, "GET", "/restaurants/me/support-tickets")).body.tickets.length === 0 && (await jsonCall(kBTok, "GET", `/restaurants/me/support-tickets/${t1.id}`)).status === 404 && (await raw(kBTok, "GET", `/restaurants/me/support-tickets/${t1.id}/attachments/${m1.attachments[0].id}`)).status === 404);
+      check("a missing or non-numeric ticket id is 404", (await jsonCall(kTok, "GET", "/restaurants/me/support-tickets/999999")).status === 404 && (await jsonCall(kTok, "GET", "/restaurants/me/support-tickets/abc")).status === 404);
+      const verifOrders = ordersOfB; void verifOrders;
+      check("an order_id that belongs to another kitchen is refused (400)", !ordersOfB || (await create(kTok, { ...good, order_id: ordersOfB.id })).status === 400);
+
+      // ---- attachments stream, private
+      const dl = await raw(kTok, "GET", `/restaurants/me/support-tickets/${t1.id}/attachments/${m1.attachments[0].id}`);
+      check("GET attachment streams the exact bytes with the right Content-Type, private / no-store / nosniff", dl.status === 200 && dl.buf.equals(PNG(1)) && /image\/png/.test(dl.headers.get("content-type")) && /private/.test(dl.headers.get("cache-control")) && dl.headers.get("x-content-type-options") === "nosniff");
+      const dlPdf = await raw(kTok, "GET", `/restaurants/me/support-tickets/${t1.id}/attachments/${m1.attachments[1].id}`);
+      check("the PDF streams as application/pdf", dlPdf.status === 200 && /application\/pdf/.test(dlPdf.headers.get("content-type")) && dlPdf.buf.equals(PDF));
+      check("no token -> 401; an attachment id from a different ticket, a missing or non-numeric one -> 404",
+        (await raw(null, "GET", `/restaurants/me/support-tickets/${t1.id}/attachments/${m1.attachments[0].id}`)).status === 401 && (await raw(kTok, "GET", `/restaurants/me/support-tickets/${t2.id}/attachments/${m1.attachments[0].id}`)).status === 404 && (await raw(kTok, "GET", `/restaurants/me/support-tickets/${t1.id}/attachments/999999`)).status === 404 && (await raw(kTok, "GET", `/restaurants/me/support-tickets/${t1.id}/attachments/abc`)).status === 404);
+      const stored = await db("partner_support_attachments").first("storage_path");
+      check("attachments are stored privately: the path is never a URL (a private key or a bare file name)", !!stored && !/^https?:/.test(stored.storage_path));
+
+      // ---- allowUnverified: a kitchen under review can still ask for help
+      const pend = await create(pendTok, { category: "login_problem", message: "I cannot log in to see my approval status" });
+      check("a kitchen whose verification is still pending can raise a ticket (allowUnverified), and read it back", pend.status === 201 && (await jsonCall(pendTok, "GET", "/restaurants/me/support-tickets")).body.tickets.length === 1);
+
+      // ---- partner replies
+      const rep1 = await raw(kTok, "POST", `/restaurants/me/support-tickets/${t1.id}/messages`, form({ message: "Adding a second screenshot of the statement" }, [{ buffer: PNG(2), name: "second.png" }]));
+      check("POST …/messages -> 201 { ticket, message }: count 2, last_message_by partner, the message carries its attachment",
+        rep1.status === 201 && rep1.body.ticket.message_count === 2 && rep1.body.ticket.last_message_by === "partner" && rep1.body.message.author === "partner" && rep1.body.message.body === "Adding a second screenshot of the statement" && rep1.body.message.attachments.length === 1 && rep1.body.message.attachments[0].name === "second.png");
+      check("a blank reply, a reply to someone else's ticket, bad files are refused (400 / 404 / 400)",
+        (await raw(kTok, "POST", `/restaurants/me/support-tickets/${t1.id}/messages`, form({ message: "   " }))).status === 400 && (await raw(kBTok, "POST", `/restaurants/me/support-tickets/${t1.id}/messages`, form({ message: "Not my ticket at all" }))).status === 404 && (await raw(kTok, "POST", `/restaurants/me/support-tickets/${t1.id}/messages`, form({ message: "bad file" }, [{ buffer: Buffer.from("not an image file at all!") }]))).status === 400);
+      check("the thread now has both messages, oldest first", (await jsonCall(kTok, "GET", `/restaurants/me/support-tickets/${t1.id}`)).body.messages.map((m) => m.body).join("|") === `${good.message}|Adding a second screenshot of the statement`);
+      pushes.length = 0;
+
+      // ---- admin queue
+      const asSupport = await jsonCall(supA.token, "GET", "/admin/partner-support-tickets?limit=100");
+      check("every admin role (support included) can read the queue; rows carry partner { type, id, name, phone }",
+        asSupport.status === 200 && asSupport.body.tickets.find((t) => t.id === t1.id).partner.name === "Restaurant A" && asSupport.body.tickets.find((t) => t.id === t1.id).partner.type === "restaurant" && asSupport.body.tickets.find((t) => t.id === t1.id).partner.phone === "9000000001" && typeof asSupport.body.total === "number");
+      const openQ = await jsonCall(superA.token, "GET", "/admin/partner-support-tickets?status=open&limit=100");
+      const ids = openQ.body.tickets.map((t) => t.id);
+      check("status=open lists only open ones, oldest first; no status filter is newest first", openQ.body.tickets.every((t) => t.status === "open") && ids.every((id, i) => i === 0 || id > ids[i - 1]) && asSupport.body.tickets.map((t) => t.id).every((id, i, a) => i === 0 || id < a[i - 1]));
+      check("filters: category, partner_type, q on the reference and on the partner's name / phone",
+        (await jsonCall(superA.token, "GET", "/admin/partner-support-tickets?category=technical&limit=100")).body.tickets.every((t) => t.category === "technical")
+        && (await jsonCall(superA.token, "GET", "/admin/partner-support-tickets?partner_type=rider")).body.tickets.length === 0
+        && (await jsonCall(superA.token, "GET", `/admin/partner-support-tickets?q=${t1.reference}`)).body.tickets.length === 1
+        && (await jsonCall(superA.token, "GET", "/admin/partner-support-tickets?q=Support%20Pending")).body.tickets.length === 1
+        && (await jsonCall(superA.token, "GET", "/admin/partner-support-tickets?q=8600006201")).body.tickets.length === 1);
+      check("a bad status / category / partner_type filter is 400", (await jsonCall(superA.token, "GET", "/admin/partner-support-tickets?status=x")).status === 400 && (await jsonCall(superA.token, "GET", "/admin/partner-support-tickets?category=x")).status === 400 && (await jsonCall(superA.token, "GET", "/admin/partner-support-tickets?partner_type=x")).status === 400);
+      const sum = await jsonCall(supA.token, "GET", "/admin/partner-support-tickets/summary");
+      check("summary: open / in_progress totals with a per-partner-type breakdown", sum.status === 200 && sum.body.open === 3 && sum.body.in_progress === 0 && sum.body.restaurant.open === 3 && sum.body.rider.open === 0);
+      const adetail = await jsonCall(supA.token, "GET", `/admin/partner-support-tickets/${t1.id}`);
+      check("admin detail: ticket + partner + the order (no kitchen payable / vendor cost) + the whole thread with attachments",
+        adetail.status === 200 && adetail.body.partner.name === "Restaurant A" && adetail.body.order.id === orderId && typeof adetail.body.order.total === "number" && adetail.body.messages.length === 2 && adetail.body.messages[0].attachments.length === 2 && !/payable|vendor_cost|commission|storage_path/i.test(adetail.text));
+      check("the admin can open the partner's screenshot; a customer token can't use the admin routes",
+        (await raw(supA.token, "GET", `/admin/partner-support-tickets/${t1.id}/attachments/${m1.attachments[0].id}`)).buf.equals(PNG(1)) && (await jsonCall(custTok, "GET", "/admin/partner-support-tickets")).status === 403 && (await jsonCall(supA.token, "GET", "/admin/partner-support-tickets/999999")).status === 404);
+
+      // ---- Fengle replies
+      const noPushYet = pushes.length;
+      const reply1 = await raw(supA.token, "POST", `/admin/partner-support-tickets/${t1.id}/messages`, form({ message: "We have raised this with accounts; it will be paid tomorrow." }, [{ buffer: PNG(3), name: "receipt.png" }]));
+      await settle();
+      check("POST …/messages: 201 { ticket, message }, the reply moves an open ticket to in_progress, last_message_by admin, attachments allowed",
+        reply1.status === 201 && reply1.body.ticket.status === "in_progress" && reply1.body.ticket.last_message_by === "admin" && reply1.body.ticket.message_count === 3 && reply1.body.message.author === "admin" && reply1.body.message.attachments.length === 1);
+      const toKitchen = pushes.slice(noPushYet).filter((p) => p.type === "restaurant" && p.id === restA);
+      check("the kitchen is pushed: 'Fengle replied to FPS-…', data { type: support, ticket_id } (the app's normal channel: no alert option)", toKitchen.length === 1 && toKitchen[0].title === `Fengle replied to ${t1.reference}` && toKitchen[0].data.type === "support" && toKitchen[0].data.ticket_id === t1.id && toKitchen[0].alert === undefined);
+      const kDetail = await jsonCall(kTok, "GET", `/restaurants/me/support-tickets/${t1.id}`);
+      check("the kitchen sees the reply (author admin) and the status, with no admin identity", kDetail.body.ticket.status === "in_progress" && kDetail.body.ticket.last_message_by === "admin" && kDetail.body.messages[2].author === "admin" && !/admin_id|ps-support|ps-super/.test(kDetail.text));
+      pushes.length = 0;
+      await raw(kTok, "POST", `/restaurants/me/support-tickets/${t1.id}/messages`, form({ message: "Thank you, we will wait for tomorrow" })); await settle();
+      check("no push for the kitchen's own message (nobody to tell)", pushes.length === 0);
+      check("empty reply / bad status are 400 for the admin", (await raw(supA.token, "POST", `/admin/partner-support-tickets/${t1.id}/messages`, form({ message: "" }))).status === 400 && (await raw(supA.token, "POST", `/admin/partner-support-tickets/${t1.id}/messages`, form({ message: "ok", status: "weird" }))).status === 400);
+
+      // ---- resolving
+      const t3 = (await create(kTok, { category: "other", message: "Please change our registered email address" })).body.ticket;
+      const resolveNoReply = await jsonCall(superA.token, "PATCH", `/admin/partner-support-tickets/${t3.id}`, { status: "resolved" });
+      check("PATCH status resolved with no reply from Fengle on the ticket is 400 (a reply is needed to resolve); a bad status is 400", resolveNoReply.status === 400 && /Reply/.test(resolveNoReply.body.error) && (await jsonCall(superA.token, "PATCH", `/admin/partner-support-tickets/${t3.id}`, { status: "bogus" })).status === 400);
+      pushes.length = 0;
+      const resolveWith = await jsonCall(superA.token, "PATCH", `/admin/partner-support-tickets/${t3.id}`, { status: "resolved", message: "Done — the email is updated." });
+      await settle();
+      check("PATCH with a message adds the reply and resolves: resolved_by / resolved_at stamped, and the kitchen gets 'Your ticket … is resolved'",
+        resolveWith.status === 200 && resolveWith.body.ticket.status === "resolved" && resolveWith.body.ticket.resolved_by === superA.id && !!resolveWith.body.ticket.resolved_at && resolveWith.body.ticket.message_count === 2
+        && pushes.length === 1 && pushes[0].title === `Your ticket ${t3.reference} is resolved` && pushes[0].data.ticket_id === t3.id);
+      const viaReply = await raw(supA.token, "POST", `/admin/partner-support-tickets/${t1.id}/messages`, form({ message: "Payment released today.", status: "resolved" }));
+      check("a reply with status=resolved resolves it in one go", viaReply.status === 201 && viaReply.body.ticket.status === "resolved" && viaReply.body.ticket.resolved_by === supA.id);
+      const reopened = await raw(kTok, "POST", `/restaurants/me/support-tickets/${t1.id}/messages`, form({ message: "It still has not reached our account" }));
+      check("the kitchen replying to a resolved ticket reopens it (status open, resolved_at cleared)", reopened.status === 201 && reopened.body.ticket.status === "open" && reopened.body.ticket.resolved_at === null && (await db("partner_support_tickets").where({ id: t1.id }).first()).resolved_by === null);
+      const back = await jsonCall(superA.token, "PATCH", `/admin/partner-support-tickets/${t3.id}`, { status: "open" });
+      check("the admin can reopen via PATCH; it clears who/when resolved", back.status === 200 && back.body.ticket.status === "open" && back.body.ticket.resolved_at === null && back.body.ticket.resolved_by === null);
+
+      // ---- limits
+      check("the 5-open-tickets cap: a 6th is 429 too_many_open_tickets", await (async () => {
+        for (let i = 0; i < 5; i++) { const r = await create(kTok, { category: "other", message: `Filling up the open ticket quota number ${i}` }); if (r.status === 429) break; }
+        const six = await create(kTok, { category: "other", message: "One more ticket than is allowed at once" });
+        return six.status === 429 && six.body.code === "too_many_open_tickets" && /5 open tickets/.test(six.body.error);
+      })());
+      await db("partner_support_tickets").where({ partner_type: "restaurant", partner_id: restB }).delete();
+      await db("partner_support_tickets").insert(Array.from({ length: 10 }, (_, i) => ({ reference: `FPS-9${String(i).padStart(5, "0")}`, partner_type: "restaurant", partner_id: restB, category: "other", status: "resolved" })));
+      const daily = await create(kBTok, { category: "other", message: "An eleventh ticket within one single day" });
+      check("10 tickets in 24 h is the daily cap (429 too_many_tickets_today), even when they are all resolved", daily.status === 429 && daily.body.code === "too_many_tickets_today");
+      const capTicket = (await db("partner_support_tickets").where({ partner_type: "restaurant", partner_id: restA }).orderBy("id", "asc").first());
+      await db("partner_support_messages").insert(Array.from({ length: 20 }, (_, i) => ({ ticket_id: capTicket.id, author: "partner", body: `spam ${i}` })));
+      const spam = await raw(kTok, "POST", `/restaurants/me/support-tickets/${capTicket.id}/messages`, form({ message: "the twenty-first message today" }));
+      check("20 partner messages per ticket per day is the cap (429 too_many_messages)", spam.status === 429 && spam.body.code === "too_many_messages");
+      check("a different ticket of the same kitchen is unaffected", (await raw(kTok, "POST", `/restaurants/me/support-tickets/${t2.id}/messages`, form({ message: "A normal reply on another ticket" }))).status === 201);
+      check("the service constants are the agreed ones", supportSvc.MAX_OPEN_TICKETS === 5 && supportSvc.MAX_TICKETS_PER_DAY === 10 && supportSvc.MAX_PARTNER_MESSAGES_PER_TICKET_PER_DAY === 20 && supportSvc.MAX_ATTACHMENTS === 3 && supportSvc.CATEGORIES.length === 8);
+    } finally {
+      push.sendToOwner = realSend;
+      if (savedRl === undefined) delete process.env.RATE_LIMIT_DISABLED; else process.env.RATE_LIMIT_DISABLED = savedRl;
+      for (const [k, v] of [["SUPPORT_PHONE", savedEnv.p], ["SUPPORT_WHATSAPP", savedEnv.w], ["SUPPORT_EMAIL", savedEnv.e], ["SUPPORT_HOURS", savedEnv.h]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@psupport.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }
