@@ -11,6 +11,7 @@ function serializeCoupon(row) {
     code: row.code,
     title: row.title,
     description: row.description,
+    terms: row.terms || null,
     discount_type: row.discount_type,
     discount_value: Number(row.discount_value),
     max_discount_amount: row.max_discount_amount != null ? Number(row.max_discount_amount) : null,
@@ -25,6 +26,23 @@ function serializeCoupon(row) {
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
+}
+
+const TERMS_MAX_LINES = 12;
+const TERMS_MAX_LINE_LENGTH = 200;
+
+/**
+ * Cleans the admin's terms text: one term per line, blank lines dropped, each line trimmed. null / "" / whitespace = no terms.
+ * Returns { error } or { value } (a newline-joined string, or null).
+ */
+function normalizeTerms(raw) {
+  if (raw === null || raw === undefined) return { value: null };
+  if (typeof raw !== "string") return { error: "terms must be text, one term per line" };
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return { value: null };
+  if (lines.length > TERMS_MAX_LINES) return { error: `terms can have at most ${TERMS_MAX_LINES} lines` };
+  if (lines.some((l) => l.length > TERMS_MAX_LINE_LENGTH)) return { error: `each term must be at most ${TERMS_MAX_LINE_LENGTH} characters` };
+  return { value: lines.join("\n") };
 }
 
 function validateTargetMeta(targetType, targetMeta) {
@@ -43,10 +61,13 @@ function validateTargetMeta(targetType, targetMeta) {
  */
 async function createCoupon(req, res) {
   const {
-    code, title, description, discount_type, discount_value, max_discount_amount,
+    code, title, description, terms, discount_type, discount_value, max_discount_amount,
     min_order_value, target_type, target_meta, usage_limit_per_user, total_usage_limit,
     valid_from, valid_until, is_active,
   } = req.body || {};
+
+  const termsResult = normalizeTerms(terms);
+  if (termsResult.error) return res.status(400).json({ error: termsResult.error });
 
   if (!code || !String(code).trim()) return res.status(400).json({ error: "code is required" });
   if (!title || !String(title).trim()) return res.status(400).json({ error: "title is required" });
@@ -72,6 +93,7 @@ async function createCoupon(req, res) {
     code: normalizedCode,
     title: String(title).trim(),
     description: description || null,
+    terms: termsResult.value,
     discount_type,
     discount_value: Number(discount_value),
     max_discount_amount: max_discount_amount != null ? Number(max_discount_amount) : null,
@@ -132,12 +154,17 @@ async function updateCoupon(req, res) {
   if (!existing) return res.status(404).json({ error: "Coupon not found" });
 
   const {
-    code, title, description, discount_type, discount_value, max_discount_amount,
+    code, title, description, terms, discount_type, discount_value, max_discount_amount,
     min_order_value, target_type, target_meta, usage_limit_per_user, total_usage_limit,
     valid_from, valid_until, is_active,
   } = req.body || {};
 
   const updates = {};
+  if (terms !== undefined) {
+    const termsResult = normalizeTerms(terms);
+    if (termsResult.error) return res.status(400).json({ error: termsResult.error });
+    updates.terms = termsResult.value;
+  }
 
   if (code !== undefined) {
     const normalizedCode = couponService.normalizeCode(code);

@@ -34,6 +34,7 @@ async function listMyCoupons(req, res) {
       code: coupon.code,
       title: coupon.title,
       description: coupon.description,
+      terms: coupon.terms || null, // admin-written, one term per line (the app adds its own derived lines)
       discount_type: coupon.discount_type,
       discount_value: Number(coupon.discount_value),
       max_discount_amount: coupon.max_discount_amount != null ? Number(coupon.max_discount_amount) : null,

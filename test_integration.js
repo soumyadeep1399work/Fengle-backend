@@ -4005,6 +4005,55 @@ async function main() {
     await db("app_notices").delete();
   }
 
+  console.log("\n--- Test 53: Coupon terms — admin-written, one per line, shown on GET /coupons/mine ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { Authorization: `Bearer ${token}`, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    try {
+      const [adminId] = await db("admins").insert({ name: "terms-super", email: "terms-super@terms.test", password_hash: await bcrypt.hash("a-long-password-1", 4), role: "super_admin" });
+      const adminTok = signToken({ id: adminId, type: "admin" });
+      const [cust] = await db("users").insert({ name: "Terms Customer", phone: "8000005301", wallet_balance: 0 });
+      const custTok = signToken({ id: cust, type: "customer" });
+      const mk = (code, extra = {}) => call(adminTok, "POST", "/admin/coupons", { code, title: `Terms ${code}`, discount_type: "flat", discount_value: 20, target_type: "all", ...extra });
+
+      const none = await mk("TERMSNONE");
+      check("a coupon created without terms has terms: null", none.status === 201 && none.body.coupon.terms === null);
+      const withTerms = await mk("TERMSYES", { terms: "  Valid on first order only  \r\n\n  Not valid with other offers\nCannot be exchanged for cash  " });
+      check("terms are cleaned: lines trimmed, blank lines dropped, joined with \n", withTerms.status === 201 && withTerms.body.coupon.terms === "Valid on first order only\nNot valid with other offers\nCannot be exchanged for cash");
+      check("whitespace-only / empty terms mean no terms", (await mk("TERMSBLANK", { terms: "  \n \n" })).body.coupon.terms === null && (await mk("TERMSEMPTY", { terms: "" })).body.coupon.terms === null);
+      const bad = await Promise.all([mk("TERMSX1", { terms: 42 }), mk("TERMSX2", { terms: Array.from({ length: 13 }, (_, i) => `term ${i}`).join("\n") }), mk("TERMSX3", { terms: "x".repeat(201) })]);
+      check("terms that aren't text, have more than 12 lines, or a line over 200 chars are 400 with a readable error", bad.every((r) => r.status === 400 && typeof r.body.error === "string" && /terms|term/.test(r.body.error)));
+      check("nothing was created by the refused ones", (await db("coupons").where("code", "like", "TERMSX%").count({ n: "*" }).first()).n === 0);
+
+      const id = withTerms.body.coupon.id;
+      const patched = await call(adminTok, "PATCH", `/admin/coupons/${id}`, { terms: "Only one term now" });
+      check("PATCH updates the terms", patched.status === 200 && patched.body.coupon.terms === "Only one term now");
+      check("a PATCH without terms leaves them alone", (await call(adminTok, "PATCH", `/admin/coupons/${id}`, { title: "Renamed" })).body.coupon.terms === "Only one term now");
+      check("a PATCH with bad terms is 400 and changes nothing", (await call(adminTok, "PATCH", `/admin/coupons/${id}`, { terms: 7 })).status === 400 && (await db("coupons").where({ id }).first()).terms === "Only one term now");
+      const list = await call(adminTok, "GET", "/admin/coupons?limit=200");
+      const row = (list.body.coupons || []).find((c) => c.id === id);
+      check("the admin coupon list returns terms", !!row && row.terms === "Only one term now");
+      const mine = await call(custTok, "GET", "/coupons/mine");
+      const mineRow = mine.body.coupons.find((c) => c.id === id);
+      const mineNone = mine.body.coupons.find((c) => c.id === none.body.coupon.id);
+      check("GET /coupons/mine returns terms (the text, or null when there are none)", mine.status === 200 && mineRow.terms === "Only one term now" && mineNone.terms === null);
+      check("clearing terms with null/'' works", (await call(adminTok, "PATCH", `/admin/coupons/${id}`, { terms: null })).body.coupon.terms === null);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@terms.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }
