@@ -4980,6 +4980,14 @@ async function main() {
         csv.status === 200 && /text\/csv/.test(csv.headers.get("content-type")) && /attachment; filename="fengle-sales-week-2026-03-09-to-2026-03-15.csv"/.test(csv.headers.get("content-disposition"))
         && csv.text.split("\r\n")[0] === "date,orders_received,orders_completed,orders_cancelled,gross_sales,cancelled_value,refunded_value,earnings,adjustments,net_payable"
         && csv.text.includes("2026-03-10,3,2,0,400,0,0,270,0,270") && csv.text.includes("TOTAL,5,3,2,900,400,50,620,60,680") && /PREVIOUS 2026-03-02 to 2026-03-08,1,1,0,400/.test(csv.text) && !/vendor_cost|9000|7000/.test(csv.text));
+      const savedNodeEnv = process.env.NODE_ENV, savedPublic = process.env.PUBLIC_API_URL;
+      process.env.NODE_ENV = "production";
+      const prodLink = await dlReq({ kind: "sales", format: "csv", period: "day", date: "2026-03-10" });
+      process.env.PUBLIC_API_URL = "https://api.example.test/api/v1/";
+      const overridden = await dlReq({ kind: "sales", format: "csv", period: "day", date: "2026-03-10" });
+      if (savedNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = savedNodeEnv;
+      if (savedPublic === undefined) delete process.env.PUBLIC_API_URL; else process.env.PUBLIC_API_URL = savedPublic;
+      check("in production the link is https (behind Apache the request itself reads http); PUBLIC_API_URL overrides the host", /^https:\/\/127\.0\.0\.1:\d+\/api\/v1\/downloads\?t=/.test(prodLink.body.url) && overridden.body.url.startsWith("https://api.example.test/api/v1/downloads?t="));
       const salesPdf = await dlReq({ kind: "sales", format: "pdf", period: "month", date: "2026-03-12" });
       const pdf = await raw(null, "GET", salesPdf.body.url);
       check("the sales PDF is a real PDF named for the period", pdf.status === 200 && /application\/pdf/.test(pdf.headers.get("content-type")) && pdf.buf.subarray(0, 5).toString() === "%PDF-" && salesPdf.body.filename === "fengle-sales-month-2026-03-01-to-2026-03-31.pdf" && pdf.buf.length > 1500);

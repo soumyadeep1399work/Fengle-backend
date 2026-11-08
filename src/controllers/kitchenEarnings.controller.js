@@ -65,7 +65,9 @@ async function createDownload(req, res) {
   if (!built) return res.status(404).json({ error: "Nothing to download" });
   const token = signedUrl.sign({ r: req.auth.id, k: kind, f: format, p: v.params }, DOWNLOAD_TTL_SECONDS);
   // PUBLIC_API_URL ("https://api.fengle.in", with or without /api/v1) wins; otherwise the host this request came in on (trust proxy is on).
-  const origin = (process.env.PUBLIC_API_URL || `${req.protocol}://${req.get("host")}`).replace(/\/+$/, "").replace(/\/api\/v1$/, "");
+  // In production the API is only reachable over https, but behind Apache req.protocol reads "http" (no X-Forwarded-Proto), so don't trust it there.
+  const protocol = process.env.NODE_ENV === "production" ? "https" : req.protocol;
+  const origin = (process.env.PUBLIC_API_URL || `${protocol}://${req.get("host")}`).replace(/\/+$/, "").replace(/\/api\/v1$/, "");
   res.json({ url: `${origin}/api/v1/downloads?t=${encodeURIComponent(token)}`, filename: built.filename, expires_in_seconds: DOWNLOAD_TTL_SECONDS });
 }
 
