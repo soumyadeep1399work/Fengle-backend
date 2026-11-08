@@ -4293,6 +4293,79 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 59: GET /items/deals (running offers, biggest saving first) + offer_savings on a customer's orders ---");
+  {
+    const http = require("http");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    const savedRiders = await db("riders").select("id", "status");
+    await db("riders").update({ status: "inactive" });
+    try {
+      const LAT = 22.95, LNG = 88.85; // far from every kitchen the earlier tests created
+      const [cat] = await db("categories").insert({ name: "Deals Category" });
+      const mkItem = async (name, price, extra = {}) => (await db("items").insert({ category_id: cat, name, price, created_by_type: "admin", ...extra }))[0];
+      const past = new Date(Date.now() - 3600 * 1000), future = new Date(Date.now() + 7 * 24 * 3600 * 1000);
+      const iBig = await mkItem("Deal Big", 200, { offer_price: 150 });                       // saves 50
+      const iSmall = await mkItem("Deal Small", 100, { offer_price: 70, offer_ends_at: future }); // saves 30, still running
+      const iExpired = await mkItem("Deal Expired", 300, { offer_price: 100, offer_ends_at: past });
+      const iPlain = await mkItem("Deal Plain", 100);
+      const iGone = await mkItem("Deal Unavailable", 400, { offer_price: 100 });
+      const iFar = await mkItem("Deal Out Of Range", 500, { offer_price: 100 });
+      const mkKitchen = async (name, phone, lat, lng) => { const [id] = await db("restaurants").insert({ name, phone, address: "Newtown", lat, lng, radius_km: 5, status: "active" }); await db("restaurant_categories").insert({ restaurant_id: id, category_id: cat }); return id; };
+      const kit = await mkKitchen("Deals Kitchen", "8600005901", LAT + 0.005, LNG);
+      const kitFar = await mkKitchen("Deals Far Kitchen", "8600005902", LAT + 0.5, LNG); // ~55 km away
+      await db("restaurant_items").insert([
+        { restaurant_id: kit, item_id: iBig, is_available: true }, { restaurant_id: kit, item_id: iSmall, is_available: true }, { restaurant_id: kit, item_id: iExpired, is_available: true },
+        { restaurant_id: kit, item_id: iPlain, is_available: true }, { restaurant_id: kit, item_id: iGone, is_available: false }, { restaurant_id: kitFar, item_id: iFar, is_available: true },
+      ]);
+
+      const deals = await call(null, "GET", `/items/deals?lat=${LAT}&lng=${LNG}`);
+      const ids = (deals.body.items || []).map((i) => i.id);
+      check("public (no token): only dishes whose offer is running, in range and available — expired, plain, unavailable and out-of-range ones are left out",
+        deals.status === 200 && JSON.stringify(ids) === JSON.stringify([iBig, iSmall]));
+      check("biggest saving first (₹50 before ₹30), same item shape as /items/popular (price, offer_price, effective_price, ratings)",
+        deals.body.items[0].id === iBig && deals.body.items[0].price === 200 && deals.body.items[0].offer_price === 150 && deals.body.items[0].effective_price === 150 && "avgRating" in deals.body.items[0] && "ratingCount" in deals.body.items[0] && deals.body.items[1].offer_ends_at !== null);
+      check("limit trims the list; a bad lat/lng is 400", (await call(null, "GET", `/items/deals?lat=${LAT}&lng=${LNG}&limit=1`)).body.items.length === 1 && (await call(null, "GET", "/items/deals")).status === 400);
+      check("nowhere near a kitchen: an empty list", (await call(null, "GET", "/items/deals?lat=10&lng=10")).body.items.length === 0);
+      await db("items").where({ id: iBig }).update({ offer_ends_at: past });
+      check("an offer that ends drops out of the deals at once", JSON.stringify((await call(null, "GET", `/items/deals?lat=${LAT}&lng=${LNG}`)).body.items.map((i) => i.id)) === JSON.stringify([iSmall]));
+      await db("items").where({ id: iBig }).update({ offer_ends_at: null });
+
+      // ---- offer_savings on a customer's orders
+      const [cust] = await db("users").insert({ name: "Savings Customer", phone: "8000005901", wallet_balance: 0 });
+      await db("riders").insert({ name: "Savings Rider", phone: "8500005901", status: "active", wallet_balance: 0, last_known_lat: LAT, last_known_lng: LNG });
+      const custTok = signToken({ id: cust, type: "customer" });
+      const placed = await call(custTok, "POST", "/orders", { items: [{ item_id: iBig, quantity: 2 }, { item_id: iPlain, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Savings Address", payment_method: "cod" });
+      const oid = placed.body.order && placed.body.order.id;
+      check("an order with an offer dish is placed at the offer price", placed.status === 201 && Number(placed.body.order.item_total) === 400); // 2 x 150 + 100
+      const one = await call(custTok, "GET", `/orders/${oid}`);
+      check("GET /orders/:id carries offer_savings = Σ (list price − price charged) × qty (2 x ₹50 = ₹100) and coupon_discount_amount",
+        one.status === 200 && one.body.order.offer_savings === 100 && "coupon_discount_amount" in one.body.order && Number(one.body.order.coupon_discount_amount) === 0);
+      const list = await call(custTok, "GET", "/orders");
+      const row = list.body.orders.find((o) => o.id === oid);
+      check("GET /orders rows carry the same offer_savings and coupon_discount_amount", row.offer_savings === 100 && "coupon_discount_amount" in row);
+      await db("order_items").where({ order_id: oid, item_id: iBig }).update({ status: "dropped_unavailable" });
+      check("a dropped line no longer counts (offer_savings 0 once the offer dish is dropped)", (await call(custTok, "GET", `/orders/${oid}`)).body.order.offer_savings === 0 && (await call(custTok, "GET", "/orders")).body.orders.find((o) => o.id === oid).offer_savings === 0);
+      await db("order_items").where({ order_id: oid, item_id: iBig }).update({ status: "confirmed", list_price: null });
+      check("lines from before list prices were recorded (null) count as 0", (await call(custTok, "GET", `/orders/${oid}`)).body.order.offer_savings === 0);
+      await db("order_items").where({ order_id: oid, item_id: iBig }).update({ list_price: 200 });
+      const kitTok = signToken({ id: kit, type: "restaurant" });
+      const kitView = await call(kitTok, "GET", `/orders/${oid}`);
+      check("kitchens never see offer_savings (customer-only)", kitView.status === 200 && !("offer_savings" in kitView.body.order) && !/offer_savings/.test((await call(kitTok, "GET", "/orders")).text));
+    } finally {
+      for (const r of savedRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

@@ -3,7 +3,7 @@ const { haversineDistanceKm } = require("../utils/geo");
 const { normalizeCategoryName } = require("../utils/categoryName");
 const categoryService = require("../services/category.service");
 const { parsePortionInput, presentPortion } = require("../utils/portion");
-const { presentPricing, presentAdminPricing } = require("../utils/pricing");
+const { presentPricing, presentAdminPricing, offerIsActive } = require("../utils/pricing");
 const { openStatus } = require("../utils/serviceHours");
 
 // What customers see for an item: portion label + price/offer/effective_price.
@@ -367,6 +367,33 @@ async function getPopularItems(req, res) {
 }
 
 /**
+ * GET /items/deals?lat=&lng=&limit= — dishes with an offer running right now (offer price set and inside its window), available
+ * at an in-range kitchen, biggest saving (price minus offer price, in rupees) first. Public like /items/popular, same location
+ * filter and the same item shape. Default limit 20, max 50.
+ */
+async function getDeals(req, res) {
+  const { lat, lng } = req.query;
+  if (!lat || !lng) return res.status(400).json({ error: "lat and lng query params are required" });
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 50);
+
+  const inRangeRestaurantIds = await getInRangeRestaurantIds(lat, lng);
+  if (inRangeRestaurantIds.length === 0) return res.json({ items: [] });
+
+  const rows = await db("items")
+    .join("restaurant_items", "items.id", "restaurant_items.item_id")
+    .whereIn("restaurant_items.restaurant_id", inRangeRestaurantIds)
+    .andWhere("restaurant_items.is_available", true)
+    .andWhere("items.is_active", true)
+    .whereNotNull("items.offer_price")
+    .groupBy(...ITEM_COLUMNS)
+    .select(ITEM_COLUMNS);
+
+  const now = new Date();
+  const live = rows.filter((r) => offerIsActive(r, now)).sort((a, b) => ((Number(b.price) - Number(b.offer_price)) - (Number(a.price) - Number(a.offer_price))) || (a.id - b.id));
+  res.json({ items: (await attachRatings(live.slice(0, limit))).map(presentCatalogItem) });
+}
+
+/**
  * Admin-only per-dish offer: offer_price (> 0 and below the price it will apply to) and an
  * optional offer_ends_at (a future date; null = no end). Returns {} when neither key is in
  * the body, { error }, or { fields: { offer_price, offer_ends_at } } (null/"" offer_price
@@ -676,6 +703,7 @@ module.exports = {
   listItemsForCategory,
   searchItems,
   getPopularItems,
+  getDeals,
   createItem,
   updateItem,
   setItemAvailability,

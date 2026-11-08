@@ -864,6 +864,7 @@ async function getOrder(req, res) {
         ...(estimatedRiderPayout !== undefined ? { estimated_rider_payout: estimatedRiderPayout } : {}),
         categories,
         category_name: categories.map((c) => c.name).join(" + "),
+        ...(type === "customer" ? { offer_savings: offerSavingsOf(items) } : {}),
         cancelled: order.status === "cancelled",
         riderRating: order.rider_rating,
         riderRatingComment: order.rider_rating_comment,
@@ -1102,6 +1103,11 @@ async function listMyOrders(req, res) {
           db.raw("COALESCE(order_items.item_name, items.name) as name"), "categories.name as category_name"
         )
     : [];
+  // Offer savings per order (customers only): one grouped query, same formula as offerSavingsOf().
+  const savingsByOrderId = type === "customer" && orderIds.length
+    ? Object.fromEntries((await db("order_items").whereIn("order_id", orderIds).andWhere("status", "confirmed").whereNotNull("list_price")
+        .select("order_id", db.raw("SUM(GREATEST(list_price - unit_price, 0) * quantity) as s")).groupBy("order_id")).map((r) => [r.order_id, Number(Number(r.s).toFixed(2))]))
+    : {};
   const itemsByOrderId = {};
   for (const row of orderItemRows) {
     (itemsByOrderId[row.order_id] ||= []).push({
@@ -1135,6 +1141,7 @@ async function listMyOrders(req, res) {
       return scrubRiderPay(scrubDeliveryOtp(
         {
           ...withCancelInfo(o), items, categories, category_name: categories.map((c) => c.name).join(" + "),
+          ...(type === "customer" ? { offer_savings: savingsByOrderId[o.id] || 0 } : {}),
           ...(liveRiderPay ? { estimated_rider_payout: await riderPay.estimatePayout({ order: o, restaurant: restaurantById[o.restaurant_id], ruleSet: liveRiderPay }) } : {}),
           ...restaurantContactFields(type, restaurantById[o.restaurant_id]),
           ...customerContactFields(type, customerById[o.customer_id]),
@@ -1146,6 +1153,15 @@ async function listMyOrders(req, res) {
 }
 
 /** Distinct categories in an order's items, in first-seen order — a clubbed order has two. */
+/**
+ * What a customer saved through dish offers on one order: Σ (list price − price charged) × quantity over the confirmed lines that
+ * recorded a list price (older orders recorded none: 0). Coupon savings are separate (coupon_discount_amount).
+ */
+function offerSavingsOf(lines) {
+  const total = lines.reduce((sum, l) => (l.status === "confirmed" && l.list_price != null ? sum + Math.max(Number(l.list_price) - Number(l.unit_price), 0) * Number(l.quantity) : sum), 0);
+  return Number(total.toFixed(2));
+}
+
 function distinctCategories(items) {
   const seen = new Map();
   for (const i of items) {

@@ -14,6 +14,7 @@ router.get("/categories/:id", catalog.getCategoryDetail);
 router.get("/categories/:categoryId/items", catalog.listItemsForCategory);
 router.get("/items/search", catalog.searchItems);
 router.get("/items/popular", catalog.getPopularItems);
+router.get("/items/deals", catalog.getDeals); // dishes with an offer running now, biggest saving first
 router.post("/items", requireAuth(["admin", "restaurant"]), staff, catalog.createItem);
 router.patch("/items/:id", requireAuth(["admin", "restaurant"]), staff, catalog.updateItem);
 

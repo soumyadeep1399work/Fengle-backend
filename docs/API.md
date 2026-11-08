@@ -638,6 +638,11 @@ The phone is the customer's login identity, so a new number is proved with an OT
 - Trace: every change writes `phone_change_history` (old → new). `GET /admin/customers/:id` returns `phone_changes: [{ old_phone, new_phone, created_at }]` newest first, to every admin role.
 - Implementation: OTP issuing/checking is shared with login in `services/otpDelivery.service.js`.
 
+## Deals and savings (added 2026-11-08)
+
+- `GET /items/deals?lat=&lng=&limit=` — **public** (no token), like `/items/popular`: dishes whose offer is running **right now** (`offer_price` set, below the price, not past `offer_ends_at`), available at an in-range kitchen, **biggest saving first** (price − offer price in rupees, then id). Same item shape as `/items/popular` (`price`, `offer_price`, `offer_ends_at`, `effective_price`, `avgRating`, `ratingCount`, …). Default `limit` 20, max 50. 400 without `lat`/`lng`; an empty list when no kitchen is in range. An offer that ends drops out immediately.
+- **Customer order rows** — `GET /orders` rows and `GET /orders/:id` (customer token only; kitchens, riders and admins don't get it) carry `offer_savings`: Σ (`list_price` − `unit_price`) × `quantity` over the order's **confirmed** lines that recorded a list price (dropped lines and orders from before list prices were recorded count 0). The raw `coupon_discount_amount` is already on the same rows, so *saved on Fengle* = Σ `coupon_discount_amount` + Σ `offer_savings` over non-cancelled orders.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**
