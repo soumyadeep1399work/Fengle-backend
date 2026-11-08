@@ -11,6 +11,8 @@ const partnerDocuments = require("../services/partnerDocuments.service");
 const restaurantBank = require("../services/restaurantBank.service");
 const { validateHoursPatch, presentHours } = require("../utils/serviceHours");
 const availability = require("../services/restaurantAvailability.service");
+const { parseRange, dayKey } = require("../utils/reportRange");
+const kitchenReports = require("../services/kitchenReports.service");
 
 // Never password_hash — every admin-facing restaurant read goes through this
 // column list rather than select("*")/first() on the raw table.
@@ -247,6 +249,39 @@ async function getMyRestaurant(req, res) {
       bank_account: restaurantBank.presentMasked(await restaurantBank.getRow(db, restaurant.id)),
       ...availability.presentForKitchen(restaurant),
     },
+  });
+}
+
+/**
+ * GET /restaurants/me/ratings?limit=&offset= — how customers rated THIS kitchen (the stars and comment on delivered orders; an order the
+ * customer skipped or hasn't rated isn't counted). Only the order number, the stars, the comment and the delivery date are returned:
+ * never the customer, the address, the items or any amount. Newest delivery first (default 25, max 100). last_30_days covers the 30 IST
+ * days ending today.
+ */
+async function getMyRatings(req, res) {
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+  const rated = () => db("orders").where({ restaurant_id: req.auth.id, status: "delivered" }).whereNotNull("restaurant_rating");
+
+  const since = parseRange({ from: kitchenReports.addDays(dayKey(new Date()), -29) }).from; // the start of the IST day 29 days ago: 30 IST days incl. today
+  const stats = (row) => ({ average: row && Number(row.n) > 0 ? Number(Number(row.avg).toFixed(1)) : null, count: row ? Number(row.n) : 0 });
+  const [overall, dist, recentRow, rows] = await Promise.all([
+    rated().select(db.raw("AVG(restaurant_rating) as avg"), db.raw("COUNT(*) as n")).first(),
+    rated().select("restaurant_rating as stars").count({ n: "*" }).groupBy("restaurant_rating"),
+    rated().where("delivered_at", ">=", since).select(db.raw("AVG(restaurant_rating) as avg"), db.raw("COUNT(*) as n")).first(),
+    rated().orderBy("delivered_at", "desc").orderBy("id", "desc").limit(limit).offset(offset).select("id", "restaurant_rating", "restaurant_rating_comment", "delivered_at"),
+  ]);
+  const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  for (const d of dist) if (distribution[d.stars] !== undefined) distribution[d.stars] = Number(d.n);
+
+  res.json({
+    summary: { ...stats(overall), distribution, last_30_days: stats(recentRow) },
+    ratings: rows.map((r) => ({
+      order_id: r.id, rating: Number(r.restaurant_rating),
+      comment: r.restaurant_rating_comment && String(r.restaurant_rating_comment).trim() ? r.restaurant_rating_comment : null,
+      date: new Date(r.delivered_at).toISOString(),
+    })),
+    limit, offset, total: overall ? Number(overall.n) : 0,
   });
 }
 
@@ -544,6 +579,6 @@ async function addMyCategory(req, res) {
 
 module.exports = {
   onboardRestaurant, listRestaurants, updateRestaurant, addRestaurantCategory, removeRestaurantCategory, getRestaurantDetail,
-  getMyRestaurant, setMyAvailability, putMyBankAccount, getMyMenu, getCategoryOptions, addMyCategory,
+  getMyRestaurant, getMyRatings, setMyAvailability, putMyBankAccount, getMyMenu, getCategoryOptions, addMyCategory,
   acceptRestaurantAgreement, getRestaurantAgreementSelfie, reviewRestaurantVerification,
 };

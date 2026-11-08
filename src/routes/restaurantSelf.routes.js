@@ -22,6 +22,7 @@ router.get("/me/support-tickets/:id", supportAuth, kitchenSupport.getTicket);
 router.post("/me/support-tickets/:id/messages", supportAuth, parseSupportAttachments, kitchenSupport.addMessage);
 router.get("/me/support-tickets/:id/attachments/:attachmentId", supportAuth, kitchenSupport.getAttachment);
 // Sales & Earnings (day-level aggregates of the kitchen's own data) and signed download links. Behind the verification gate.
+router.get("/me/ratings", requireAuth(["restaurant"], { allowUnverified: true }), restaurantController.getMyRatings); // read-only, own data: no gate needed
 router.get("/me/sales", requireAuth(["restaurant"]), kitchenEarnings.sales);
 router.get("/me/payouts", requireAuth(["restaurant"]), kitchenEarnings.payouts);
 router.post("/me/downloads", requireAuth(["restaurant"]), kitchenEarnings.createDownload);

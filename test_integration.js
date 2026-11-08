@@ -5024,6 +5024,61 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 64: Kitchen 'My ratings' — summary, distribution, last 30 days, newest first, no customer data ---");
+  {
+    const http = require("http");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, p) => {
+      const r = await fetch(base + p, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    try {
+      const daysAgo = (n, hh = 12) => new Date(Date.now() - n * 24 * 3600 * 1000 - (12 - hh) * 3600 * 1000);
+      const mkKitchen = async (name, phone, extra = {}) => (await db("restaurants").insert({ name, phone, address: "Newtown", lat: 23.5, lng: 89.3, radius_km: 5, status: "active", ...extra }))[0];
+      const K = await mkKitchen("Rated Kitchen", "8600006401"), Kempty = await mkKitchen("Unrated Kitchen", "8600006402"), K2 = await mkKitchen("Other Rated Kitchen", "8600006403"), pendK = await mkKitchen("Rated Pending", "8600006404", { verification_status: "pending" });
+      const [cust] = await db("users").insert({ name: "Secret Customer Name", phone: "8000006401", wallet_balance: 0 });
+      const mk = async (restaurantId, { status = "delivered", rating = null, comment = null, skipped = false, delivered = daysAgo(1) }) => (await db("orders").insert({
+        customer_id: cust, restaurant_id: restaurantId, status, payment_method: "cod", payment_status: "paid", delivery_lat: 23.5, delivery_lng: 89.3, delivery_address: "12 Secret Street Private Lane",
+        item_total: 321, delivery_fee: 0, cgst_amount: 0, sgst_amount: 0, grand_total: 321, commission_amount: 0, restaurant_payable: 200,
+        restaurant_rating: rating, restaurant_rating_comment: comment, restaurant_rating_skipped: skipped, delivered_at: status === "delivered" ? delivered : null,
+      }))[0];
+      const a = await mk(K, { rating: 5, comment: "Lovely food!", delivered: daysAgo(1) });
+      const b = await mk(K, { rating: 4, comment: "   ", delivered: daysAgo(2) });
+      const c = await mk(K, { rating: 4, comment: "Good, a bit late", delivered: daysAgo(5) });
+      const d = await mk(K, { rating: 1, comment: "Cold on arrival", delivered: daysAgo(40) }); // older than 30 days
+      await mk(K, { rating: null, delivered: daysAgo(3) });                       // delivered, never rated
+      await mk(K, { rating: null, skipped: true, delivered: daysAgo(4) });         // delivered, rating skipped
+      await mk(K, { status: "cancelled", rating: 2, comment: "never counts" });    // not delivered
+      await mk(K2, { rating: 3, comment: "other kitchen only", delivered: daysAgo(1) });
+      const kTok = signToken({ id: K, type: "restaurant" }), emptyTok = signToken({ id: Kempty, type: "restaurant" }), pendTok = signToken({ id: pendK, type: "restaurant" });
+      const custTok = signToken({ id: cust, type: "customer" });
+
+      check("no token -> 401; a customer token -> 403", (await call(null, "/restaurants/me/ratings")).status === 401 && (await call(custTok, "/restaurants/me/ratings")).status === 403);
+      check("a kitchen still under verification can read its (own, read-only) ratings: allowUnverified", (await call(pendTok, "/restaurants/me/ratings")).status === 200);
+      const r = await call(kTok, "/restaurants/me/ratings");
+      check("summary: average (1 decimal) and count over delivered + rated orders only; the distribution counts every star; unrated, skipped and cancelled orders aren't in it",
+        r.status === 200 && r.body.summary.count === 4 && r.body.summary.average === 3.5 && JSON.stringify(r.body.summary.distribution) === JSON.stringify({ 1: 1, 2: 0, 3: 0, 4: 2, 5: 1 }) && Object.keys(r.body.summary).sort().join() === "average,count,distribution,last_30_days");
+      check("last_30_days: only the ratings delivered in the last 30 IST days (the 40-day-old 1-star is excluded): average 4.3 over 3", r.body.summary.last_30_days.count === 3 && r.body.summary.last_30_days.average === 4.3);
+      check("ratings newest first by delivered_at, each { order_id, rating, comment, date (ISO) } — a blank comment reads null",
+        r.body.ratings.map((x) => x.order_id).join() === [a, b, c, d].join() && r.body.ratings[0].rating === 5 && r.body.ratings[0].comment === "Lovely food!" && r.body.ratings[1].comment === null && Object.keys(r.body.ratings[0]).sort().join() === "comment,date,order_id,rating"
+        && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(r.body.ratings[0].date) && r.body.total === 4 && r.body.limit === 25 && r.body.offset === 0);
+      const page = await call(kTok, "/restaurants/me/ratings?limit=2&offset=1");
+      check("limit / offset page the list (total stays the full count)", page.body.ratings.map((x) => x.order_id).join() === [b, c].join() && page.body.total === 4 && page.body.limit === 2 && page.body.offset === 1 && (await call(kTok, "/restaurants/me/ratings?limit=500")).body.limit === 100);
+      check("PRIVACY: no customer name, phone, id, address, no item or amount fields anywhere in the response",
+        !/Secret|8000006401|Private Lane|customer|address|item_total|grand_total|payable|delivery|phone/i.test(r.text));
+      check("the other kitchen's rating and comment never appear", !/other kitchen only/.test(r.text) && !/never counts/.test(r.text));
+      const none = await call(emptyTok, "/restaurants/me/ratings");
+      check("a kitchen with no ratings: average null, count 0, zeros everywhere, an empty list", none.body.summary.average === null && none.body.summary.count === 0 && none.body.summary.last_30_days.average === null && none.body.summary.last_30_days.count === 0 && JSON.stringify(none.body.summary.distribution) === JSON.stringify({ 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 }) && none.body.ratings.length === 0 && none.body.total === 0);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }
