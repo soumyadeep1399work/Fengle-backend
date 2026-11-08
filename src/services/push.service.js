@@ -69,30 +69,41 @@ function isDeadTokenError(status, error) {
   return status === 400 && /registration token/i.test((error && error.message) || "");
 }
 
-async function sendFcm(tokens, { title, body, data }) {
+/** The FCM HTTP v1 message for one token. FCM data values must be strings. Exported so the payload shape can be tested. */
+function buildFcmMessage(token, { title, body, data = {}, alert }) {
+  return {
+    token,
+    notification: { title, body },
+    data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
+    android: {
+      priority: "HIGH",
+      notification: alert
+        ? { channel_id: alert.channelId, sound: "default", tag: alert.tag, notification_priority: "PRIORITY_MAX", visibility: "PUBLIC" }
+        : { channel_id: CHANNEL_ID, sound: "default" },
+    },
+  };
+}
+
+/**
+ * `alert` ({ channelId, tag }) marks a LOUD push (the kitchen's new-order alarm): it goes to that Android channel (which the app creates
+ * with a siren sound and max importance) at maximum priority, shown on the lock screen, and a later push with the same `tag`
+ * REPLACES the earlier one instead of stacking (so each reminder re-alerts). An old app build without that channel falls back to
+ * its default channel, so nothing breaks.
+ */
+async function sendFcm(tokens, { title, body, data, alert }) {
   const sa = getServiceAccount();
   if (!tokens.length) return { sent: 0, failed: 0 };
   if (!sa) return { sent: 0, failed: tokens.length }; // FCM isn't configured on this server
   let sent = 0;
   const accessToken = await getAccessToken(sa);
   const url = `https://fcm.googleapis.com/v1/projects/${sa.project_id}/messages:send`;
-  // FCM data values must be strings.
-  const stringData = Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)]));
-
   const dead = [];
   await Promise.all(
     tokens.map(async (token) => {
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
-        body: JSON.stringify({
-          message: {
-            token,
-            notification: { title, body },
-            data: stringData,
-            android: { priority: "HIGH", notification: { channel_id: CHANNEL_ID, sound: "default" } },
-          },
-        }),
+        body: JSON.stringify({ message: buildFcmMessage(token, { title, body, data, alert }) }),
       });
       if (res.ok) { sent += 1; return; }
       const { error } = await res.json().catch(() => ({}));
@@ -108,9 +119,9 @@ async function sendFcm(tokens, { title, body, data }) {
 // Expo Push Service (for Expo-format tokens)
 // ---------------------------------------------------------------------------
 
-async function sendExpo(tokens, { title, body, data }) {
+async function sendExpo(tokens, { title, body, data, alert }) {
   let sent = 0;
-  const messages = tokens.map((to) => ({ to, title, body, data, channelId: CHANNEL_ID, sound: "default", priority: "high" }));
+  const messages = tokens.map((to) => ({ to, title, body, data, channelId: alert ? alert.channelId : CHANNEL_ID, sound: "default", priority: "high" }));
   for (let i = 0; i < messages.length; i += EXPO_MAX_BATCH) {
     const batch = messages.slice(i, i + EXPO_MAX_BATCH);
     const headers = { "Content-Type": "application/json", Accept: "application/json" };
@@ -208,7 +219,7 @@ async function sendToCustomerDevices(customerIds, { title, body, data = {} }) {
  * @param {number} ownerId
  * @param {{ title: string, body: string, data?: object }} notification
  */
-async function sendToOwner(ownerType, ownerId, { title, body, data = {} }) {
+async function sendToOwner(ownerType, ownerId, { title, body, data = {}, alert }) {
   if (!ownerId) return;
   if (ownerType === "customer" && !(await customerWantsOrderUpdates(ownerId))) return;
 
@@ -216,7 +227,7 @@ async function sendToOwner(ownerType, ownerId, { title, body, data = {} }) {
   const tokens = rows.map((r) => r.token);
   if (!tokens.length) return;
 
-  const notification = { title, body, data };
+  const notification = { title, body, data, alert };
   await Promise.all([
     sendFcm(tokens.filter((t) => !isExpoToken(t)), notification),
     sendExpo(tokens.filter(isExpoToken), notification),
@@ -232,4 +243,4 @@ function notifyLater(job) {
   });
 }
 
-module.exports = { sendToOwner, notifyLater, CHANNEL_ID, promoOptIn, sendPromoBroadcast, sendToCustomerDevices };
+module.exports = { buildFcmMessage, sendToOwner, notifyLater, CHANNEL_ID, promoOptIn, sendPromoBroadcast, sendToCustomerDevices };

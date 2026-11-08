@@ -56,6 +56,7 @@ async function listOrders(req, res) {
     .select(
       "orders.id", "orders.status", "orders.payment_method", "orders.payment_status", "orders.grand_total", "orders.created_at",
       "orders.rider_payout",
+      "orders.kitchen_notified_at", "orders.kitchen_acknowledged_at", "orders.kitchen_acknowledged_by", "orders.kitchen_reminders_sent",
       "users.id as customer_id", "users.name as customer_name", "users.phone as customer_phone",
       "restaurants.id as restaurant_id", "restaurants.name as restaurant_name",
       "riders.id as rider_id", "riders.name as rider_name"

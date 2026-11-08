@@ -19,6 +19,7 @@ router.post("/:id/reorder", requireAuth(["customer"]), orders.reorder);
 // Restaurant
 router.post("/:id/accept", requireAuth(["restaurant"]), orders.acceptOrder);
 router.post("/:id/reject", requireAuth(["restaurant"]), orders.rejectOrder);
+router.post("/:id/acknowledge", requireAuth(["restaurant"]), orders.acknowledgeOrder); // Stop alarm: seen, not yet decided
 router.post("/:id/start-preparing", requireAuth(["restaurant"]), orders.startPreparing);
 router.post("/:id/mark-ready", requireAuth(["restaurant"]), orders.markReady);
 

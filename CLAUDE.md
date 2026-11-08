@@ -203,6 +203,13 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   offline kitchen is simply "closed" (with `opens_at` null when the switch is the only
   reason). Logout doesn't change it; admins can force it; changes are in
   `restaurant_availability_history`.
+- **Kitchen new-order alarm** (2026-11-08): every new-order push to a kitchen
+  goes through `orderNotifications.newOrderForRestaurant` (loud Android channel
+  `new-orders`, one notification per order via a tag). `services/kitchenAlert.service.js`
+  re-sends it every `KITCHEN_REMINDER_INTERVAL_SECONDS` (30) up to `KITCHEN_MAX_REMINDERS`
+  (10) until the kitchen acknowledges (`POST /orders/:id/acknowledge`), accepts or
+  rejects; the `kitchen_*` order columns record when it was notified and reacted.
+  Never call `sendToOwner("restaurant", …)` for a new order any other way.
 - **Never send raw server errors to a client** (2026-11-04): the central error
   handler in `app.js` returns a generic message + `ref` for any 5xx in production
   (the real error is logged under that ref); only deliberate 4xx messages are shown.

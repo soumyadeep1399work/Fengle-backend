@@ -4500,6 +4500,162 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 61: Kitchen new-order alarm — loud push, reminders until acknowledged, acknowledge endpoint, reaction times ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const push = require("./src/services/push.service");
+    const alertSvc = require("./src/services/kitchenAlert.service");
+
+    // ---- the FCM payload (pure)
+    const loud = push.buildFcmMessage("tok", { title: "T", body: "B", data: { type: "new_order", orderId: 5 }, alert: { channelId: "new-orders", tag: "order-5" } });
+    check("loud FCM message: android.priority HIGH, channel new-orders, tag order-5, PRIORITY_MAX, PUBLIC; data values are strings",
+      loud.android.priority === "HIGH" && loud.android.notification.channel_id === "new-orders" && loud.android.notification.tag === "order-5" && loud.android.notification.notification_priority === "PRIORITY_MAX" && loud.android.notification.visibility === "PUBLIC" && loud.data.orderId === "5" && loud.token === "tok");
+    const quiet = push.buildFcmMessage("tok", { title: "T", body: "B", data: { type: "order_update", orderId: 5 } });
+    check("every other push keeps channel 'orders' with no tag / max priority", quiet.android.notification.channel_id === "orders" && quiet.android.notification.tag === undefined && quiet.android.notification.notification_priority === undefined);
+    check("reminder tick is 15 s; defaults are 30 s between reminders and 10 reminders, both overridable by env",
+      alertSvc.TICK_MS === 15000 && alertSvc.intervalSeconds() === 30 && alertSvc.maxReminders() === 10);
+
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) }, body: body !== undefined ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    const pushes = [];
+    const realSend = push.sendToOwner;
+    push.sendToOwner = async (type, id, n) => { pushes.push({ type, id, ...n }); };
+    const savedRiders = await db("riders").select("id", "status");
+    await db("riders").update({ status: "inactive" });
+    const savedEnv = { i: process.env.KITCHEN_REMINDER_INTERVAL_SECONDS, m: process.env.KITCHEN_MAX_REMINDERS };
+    try {
+      const LAT = 23.25, LNG = 89.05;
+      const [cat] = await db("categories").insert({ name: "Alarm Category" });
+      const [dish] = await db("items").insert({ category_id: cat, name: "Alarm Dish", price: 200, created_by_type: "admin" });
+      const mkKitchen = async (name, phone, dLat) => {
+        const [id] = await db("restaurants").insert({ name, phone, address: "Newtown", lat: LAT + dLat, lng: LNG, radius_km: 5, status: "active" });
+        await db("restaurant_categories").insert({ restaurant_id: id, category_id: cat });
+        await db("restaurant_items").insert({ restaurant_id: id, item_id: dish, is_available: true });
+        return id;
+      };
+      const k1 = await mkKitchen("Alarm One", "8600006101", 0.005);
+      const k2 = await mkKitchen("Alarm Two", "8600006102", 0.03);
+      const [pendingK] = await db("restaurants").insert({ name: "Alarm Pending", phone: "8600006103", address: "Newtown", lat: LAT, lng: LNG, radius_km: 5, status: "active", verification_status: "pending" });
+      const [cust] = await db("users").insert({ name: "Alarm Customer", phone: "8000006101", wallet_balance: 0 });
+      await db("riders").insert({ name: "Alarm Rider", phone: "8500006101", status: "active", wallet_balance: 0, last_known_lat: LAT, last_known_lng: LNG });
+      const custTok = signToken({ id: cust, type: "customer" });
+      const k1Tok = signToken({ id: k1, type: "restaurant" }), k2Tok = signToken({ id: k2, type: "restaurant" });
+      const [adminId] = await db("admins").insert({ name: "alarm-support", email: "alarm-support@alarm.test", password_hash: await bcrypt.hash("a-long-password-1", 4), role: "support" });
+      const adminTok = signToken({ id: adminId, type: "admin" });
+      await db("orders").where({ status: "placed" }).update({ status: "cancelled" }); // earlier tests leave placed orders behind; they would be reminded too
+      const place = async () => (await call(custTok, "POST", "/orders", { items: [{ item_id: dish, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Alarm Address", payment_method: "cod" })).body.order;
+      const row = (id) => db("orders").where({ id }).first();
+      const toKitchen = (id) => pushes.filter((p) => p.type === "restaurant" && p.data.orderId === id);
+      const settle = () => sleep(250); // notifyLater runs on setImmediate
+
+      // ---- the first push
+      const o1 = await place(); await settle();
+      const first = toKitchen(o1.id);
+      check("a new COD order pushes its kitchen once: 'New order received!', 'Fengle Order #N · 1 item · ₹<total> (Cash on delivery). Tap to view and accept.', data { type: new_order, orderId }",
+        first.length === 1 && first[0].id === k1 && first[0].title === "New order received!" && first[0].body.startsWith(`Fengle Order #${o1.id} · 1 item · ₹`) && first[0].body.endsWith(" (Cash on delivery). Tap to view and accept.") && first[0].data.type === "new_order" && first[0].data.orderId === o1.id);
+      check("the push is the loud one: alert { channelId: new-orders, tag: order-<id> }", first[0].alert.channelId === "new-orders" && first[0].alert.tag === `order-${o1.id}`);
+      const r0 = await row(o1.id);
+      check("kitchen_notified_at is stamped (server clock); nothing acknowledged yet; no reminders", !!r0.kitchen_notified_at && r0.kitchen_acknowledged_at === null && r0.kitchen_acknowledged_by === null && r0.kitchen_reminders_sent === 0 && r0.kitchen_last_reminder_at === null);
+
+      // ---- reminders (drive the tick with a future 'now' instead of sleeping)
+      const t = (sec) => new Date(Date.now() + sec * 1000);
+      check("nothing is due before 30 s have passed", (await alertSvc.remindDue()).length === 0);
+      const rem1 = await alertSvc.remindDue(t(31)); await settle();
+      const reminders = () => toKitchen(o1.id).filter((p) => p.data.type === "new_order_reminder");
+      check("after 30 s a reminder goes out: title 'Reminder: order waiting', data.type new_order_reminder, same loud channel and the SAME tag (replaces the previous one)",
+        rem1.length === 1 && rem1[0] === o1.id && reminders().length === 1 && reminders()[0].title === "Reminder: order waiting" && reminders()[0].alert.tag === `order-${o1.id}` && reminders()[0].alert.channelId === "new-orders" && /^Fengle Order #\d+ · 1 item/.test(reminders()[0].body));
+      const r1 = await row(o1.id);
+      check("the reminder is counted (kitchen_reminders_sent 1, kitchen_last_reminder_at set) and kitchen_notified_at is untouched", r1.kitchen_reminders_sent === 1 && !!r1.kitchen_last_reminder_at && String(r1.kitchen_notified_at) === String(r0.kitchen_notified_at));
+      check("not again until another 30 s have passed", (await alertSvc.remindDue(t(31))).length === 0 && (await alertSvc.remindDue(t(55))).length === 0);
+      check("…and then it is", (await alertSvc.remindDue(t(62))).length === 1 && (await row(o1.id)).kitchen_reminders_sent === 2);
+      process.env.KITCHEN_MAX_REMINDERS = "2";
+      check("the cap (KITCHEN_MAX_REMINDERS, here 2) stops them", alertSvc.maxReminders() === 2 && (await alertSvc.remindDue(t(500))).length === 0);
+      delete process.env.KITCHEN_MAX_REMINDERS;
+      process.env.KITCHEN_REMINDER_INTERVAL_SECONDS = "5";
+      check("the interval is env-configurable (5 s)", alertSvc.intervalSeconds() === 5 && (await alertSvc.remindDue(t(500))).length === 1);
+      delete process.env.KITCHEN_REMINDER_INTERVAL_SECONDS;
+      await db("orders").where({ id: o1.id }).update({ kitchen_reminders_sent: 10 });
+      check("the default cap is 10 reminders", (await alertSvc.remindDue(t(900))).length === 0);
+      await db("orders").where({ id: o1.id }).update({ kitchen_reminders_sent: 3, kitchen_last_reminder_at: new Date(Date.now() - 3600 * 1000) });
+
+      // ---- acknowledge
+      check("no token -> 401; a customer token -> 403; an unapproved kitchen is behind the verification gate (403 verification_required)",
+        (await call(null, "POST", `/orders/${o1.id}/acknowledge`)).status === 401 && (await call(custTok, "POST", `/orders/${o1.id}/acknowledge`)).status === 403 && (await call(signToken({ id: pendingK, type: "restaurant" }), "POST", `/orders/${o1.id}/acknowledge`)).body.code === "verification_required");
+      check("another kitchen's order, a missing order and a non-numeric id are all 404", (await call(k2Tok, "POST", `/orders/${o1.id}/acknowledge`)).status === 404 && (await call(k1Tok, "POST", "/orders/999999/acknowledge")).status === 404 && (await call(k1Tok, "POST", "/orders/abc/acknowledge")).status === 404);
+      const ack = await call(k1Tok, "POST", `/orders/${o1.id}/acknowledge`);
+      check("POST /orders/:id/acknowledge -> 200 { order } (still placed: accept/reject still decide it), and the kitchen_* fields are not in the kitchen's response",
+        ack.status === 200 && ack.body.order.id === o1.id && ack.body.order.status === "placed" && !/kitchen_(notified|acknowledged|reminders|last)/.test(ack.text));
+      const r2 = await row(o1.id);
+      check("kitchen_acknowledged_at is stamped (server clock) with kitchen_acknowledged_by 'alert'", !!r2.kitchen_acknowledged_at && r2.kitchen_acknowledged_by === "alert");
+      const again = await call(k1Tok, "POST", `/orders/${o1.id}/acknowledge`);
+      check("idempotent: a second call is 200 and changes nothing", again.status === 200 && String((await row(o1.id)).kitchen_acknowledged_at) === String(r2.kitchen_acknowledged_at));
+      check("reminders stop as soon as it is acknowledged", (await alertSvc.remindDue(t(5000))).length === 0);
+      const acc = await call(k1Tok, "POST", `/orders/${o1.id}/accept`, {});
+      check("accepting an acknowledged order works and keeps the first reaction ('alert')", acc.status === 200 && (await row(o1.id)).kitchen_acknowledged_by === "alert" && String((await row(o1.id)).kitchen_acknowledged_at) === String(r2.kitchen_acknowledged_at));
+      check("acknowledging an already-accepted order is not an error", (await call(k1Tok, "POST", `/orders/${o1.id}/acknowledge`)).status === 200);
+
+      // ---- accept / reject stamp the reaction too, and stop the reminders
+      const o2 = await place(); await settle();
+      await call(k1Tok, "POST", `/orders/${o2.id}/accept`, {});
+      const r3 = await row(o2.id);
+      check("accepting without acknowledging stamps kitchen_acknowledged_at with 'accept'", !!r3.kitchen_acknowledged_at && r3.kitchen_acknowledged_by === "accept" && (await alertSvc.remindDue(t(5000))).length === 0);
+
+      const o3 = await place(); await settle();
+      await alertSvc.remindDue(t(31)); await settle();
+      check("(a fresh order is reminded too)", (await row(o3.id)).kitchen_reminders_sent === 1);
+      const rej = await call(k1Tok, "POST", `/orders/${o3.id}/reject`, {});
+      await settle();
+      const r4 = await row(o3.id);
+      check("a reject that re-routes to another kitchen resets the alarm clock for it: notified_at stamped afresh, not acknowledged, 0 reminders, and the new kitchen is pushed",
+        rej.status === 200 && r4.restaurant_id === k2 && !!r4.kitchen_notified_at && r4.kitchen_acknowledged_at === null && r4.kitchen_acknowledged_by === null && r4.kitchen_reminders_sent === 0 && r4.kitchen_last_reminder_at === null
+        && toKitchen(o3.id).some((p) => p.id === k2 && p.data.type === "new_order"));
+      const remindedNew = await alertSvc.remindDue(t(31)); await settle();
+      const remsO3 = toKitchen(o3.id).filter((p) => p.data.type === "new_order_reminder");
+      check("the new kitchen's reminders run from its own first push, and go to it (not to the kitchen that rejected)", remindedNew.includes(o3.id) && remsO3.slice(-1)[0].id === k2 && (await row(o3.id)).kitchen_reminders_sent === 1);
+      await db("restaurant_items").where({ restaurant_id: k1 }).update({ is_available: false }); // so nobody else can take it (k1 would otherwise be the next candidate again)
+      const rej2 = await call(k2Tok, "POST", `/orders/${o3.id}/reject`, {});
+      const r5 = await row(o3.id);
+      check("when nobody else can take it the order is cancelled, the reject counts as the reaction, and reminders stop", rej2.status === 200 && r5.status === "cancelled" && !!r5.kitchen_acknowledged_at && r5.kitchen_acknowledged_by === "reject" && (await alertSvc.remindDue(t(5000))).length === 0);
+
+      // ---- only orders the kitchen can see
+      const o4 = await place(); await settle();
+      await db("orders").where({ id: o4.id }).update({ payment_method: "upi", payment_status: "pending" }); // an online order whose payment hasn't completed
+      check("an unpaid online order is never reminded about, and the kitchen can't acknowledge what it can't see (404)", (await alertSvc.remindDue(t(5000))).length === 0 && (await call(k1Tok, "POST", `/orders/${o4.id}/acknowledge`)).status === 404);
+      await db("orders").where({ id: o4.id }).update({ payment_status: "paid" });
+      check("once paid it is visible and the reminders resume", (await alertSvc.remindDue(t(5000))).includes(o4.id));
+      await db("orders").where({ id: o4.id }).update({ status: "cancelled" });
+      check("a cancelled order is never reminded about", (await alertSvc.remindDue(t(9000))).length === 0);
+
+      // ---- reaction times are visible to ops, and to nobody else
+      const adm = await call(adminTok, "GET", `/admin/orders/${o1.id}`);
+      check("GET /admin/orders/:id returns kitchen_notified_at, kitchen_acknowledged_at, kitchen_acknowledged_by and kitchen_reminders_sent (every admin role)",
+        adm.status === 200 && !!adm.body.order.kitchen_notified_at && !!adm.body.order.kitchen_acknowledged_at && adm.body.order.kitchen_acknowledged_by === "alert" && adm.body.order.kitchen_reminders_sent === 3);
+      const admList = await call(adminTok, "GET", "/admin/orders?limit=100");
+      const listed = (admList.body.orders || []).find((o) => o.id === o1.id);
+      check("the admin order list rows carry them too", !!listed && !!listed.kitchen_notified_at && listed.kitchen_acknowledged_by === "alert" && listed.kitchen_reminders_sent === 3);
+      const custView = await call(custTok, "GET", `/orders/${o1.id}`);
+      const kitView = await call(k1Tok, "GET", `/orders/${o1.id}`);
+      const kitList = await call(k1Tok, "GET", "/orders");
+      check("customers and kitchens never see them (order read, order list)", custView.status === 200 && kitView.status === 200 && ![custView.text, kitView.text, kitList.text].some((x) => /kitchen_(notified|acknowledged|reminders|last)/.test(x)));
+    } finally {
+      push.sendToOwner = realSend;
+      for (const r of savedRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      if (savedEnv.i === undefined) delete process.env.KITCHEN_REMINDER_INTERVAL_SECONDS; else process.env.KITCHEN_REMINDER_INTERVAL_SECONDS = savedEnv.i;
+      if (savedEnv.m === undefined) delete process.env.KITCHEN_MAX_REMINDERS; else process.env.KITCHEN_MAX_REMINDERS = savedEnv.m;
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@alarm.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

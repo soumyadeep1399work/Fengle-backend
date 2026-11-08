@@ -544,11 +544,30 @@ async function acceptOrder(req, res) {
     }
   });
 
+  await markKitchenAcknowledged(id, "accept"); // accepting is also a response: it silences the alarm and stamps the reaction time
   await autoAssignRider(id);
   notifyLater(() => orderPush.orderAccepted(id, order.payment_status === "paid" ? refundAmount : 0));
 
   const updated = await db("orders").where({ id }).first();
   res.json({ order: stripInternalOrderFields(updated) });
+}
+
+/** Stamps the kitchen's first reaction to an order (server clock). A no-op if it already reacted: the first reaction stands. */
+async function markKitchenAcknowledged(orderId, by, conn = db) {
+  await conn("orders").where({ id: orderId }).whereNull("kitchen_acknowledged_at").update({ kitchen_acknowledged_at: new Date(), kitchen_acknowledged_by: by });
+}
+
+/**
+ * POST /orders/:id/acknowledge — "the kitchen has seen it and silenced the alarm" (the app's Stop alarm). Accept / reject still
+ * decide the order. Only the order's CURRENT kitchen, and only once the order is visible to it (paid or COD), else 404.
+ * Idempotent: a second call changes nothing, and an already-accepted order is not an error. 200 { order }.
+ */
+async function acknowledgeOrder(req, res) {
+  const id = Number(req.params.id);
+  const order = Number.isInteger(id) ? await db("orders").where({ id, restaurant_id: req.auth.id }).first() : null;
+  if (!order || !orderPush.isVisibleToRestaurant(order)) return res.status(404).json({ error: "Order not found" });
+  await markKitchenAcknowledged(id, "alert");
+  res.json({ order: stripInternalOrderFields(await db("orders").where({ id }).first()) });
 }
 
 /**
@@ -625,6 +644,8 @@ async function rejectOrder(req, res) {
       grand_total: Number((Number(order.item_total) + deliveryFee + Number(order.cgst_amount) + Number(order.sgst_amount) - Number(order.coupon_discount_amount || 0)).toFixed(2)),
       cascade_attempts: (order.cascade_attempts || 1) + 1,
       status: "placed", // re-enters the queue for the new restaurant
+      // A different kitchen now: its alarm clock starts from zero (newOrderForRestaurant stamps kitchen_notified_at below).
+      kitchen_notified_at: null, kitchen_acknowledged_at: null, kitchen_acknowledged_by: null, kitchen_reminders_sent: 0, kitchen_last_reminder_at: null,
     });
     // Another kitchen now: the payable is recomputed for it (matters for any line still on the commission fallback).
     // The vendor-cost snapshot on the lines stays: today there is one cost per dish for every kitchen.
@@ -636,6 +657,7 @@ async function rejectOrder(req, res) {
   // Nobody else can take it — cancel and refund if paid.
   await db.transaction(async (trx) => {
     await trx("orders").where({ id }).update({ status: "cancelled", cancelled_at: new Date() });
+    await markKitchenAcknowledged(id, "reject", trx);
     if (order.payment_status === "paid") {
       await wallet.recordCustomerRefund(order.customer_id, order.id, Number(order.grand_total), "No restaurant available to fulfil order", trx);
       await trx("orders").where({ id }).update({ payment_status: "refunded" });
@@ -1179,6 +1201,7 @@ module.exports = {
   rejectOrder,
   cancelOrder,
   autoAssignRider,
+  acknowledgeOrder,
   markPickedUp,
   markOnTheWay,
   markDelivered,

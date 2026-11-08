@@ -4,7 +4,8 @@
 // Customer pushes never name the kitchen (CLAUDE.md: restaurant identity is
 // never shown to the customer); rider pushes may, since riders need the pickup.
 const db = require("../config/db");
-const { sendToOwner } = require("./push.service");
+const push = require("./push.service");
+const sendToOwner = (...args) => push.sendToOwner(...args); // looked up per call so a test can spy on the push
 
 const rupees = (amount) => `₹${Number(amount).toFixed(2).replace(/\.00$/, "")}`;
 
@@ -62,8 +63,13 @@ async function orderCancelledBySystem(orderId) {
  * The order is now in this kitchen's queue. Only call once the kitchen can see
  * it — restaurants only see paid or COD orders.
  */
-async function newOrderForRestaurant(orderId) {
+async function newOrderForRestaurant(orderId, { reminder = false } = {}) {
   const order = await load(orderId);
+  if (!order) return;
+  if (!reminder) {
+    // First push for the current kitchen. (Re-routing to another kitchen resets this in rejectOrder, so it is stamped afresh.)
+    await db("orders").where({ id: orderId }).whereNull("kitchen_notified_at").update({ kitchen_notified_at: new Date() });
+  }
   const { count } = await db("order_items")
     .where({ order_id: orderId, status: "confirmed" })
     .sum({ count: "quantity" })
@@ -71,9 +77,11 @@ async function newOrderForRestaurant(orderId) {
   const items = Number(count) === 1 ? "1 item" : `${Number(count) || 0} items`;
   const pay = order.payment_method === "cod" ? " (Cash on delivery)" : "";
   await sendToOwner("restaurant", order.restaurant_id, {
-    title: `New order #${order.id}`,
-    body: `${items} · ${rupees(order.grand_total)}${pay}. Tap to accept.`,
-    data: { type: "new_order", orderId: order.id },
+    title: reminder ? "Reminder: order waiting" : "New order received!",
+    body: `Fengle Order #${order.id} · ${items} · ${rupees(order.grand_total)}${pay}. Tap to view and accept.`,
+    data: { type: reminder ? "new_order_reminder" : "new_order", orderId: order.id },
+    // The siren channel the Restaurant app creates; one notification per order (each reminder replaces the last and re-alerts).
+    alert: { channelId: "new-orders", tag: `order-${order.id}` },
   });
 }
 
