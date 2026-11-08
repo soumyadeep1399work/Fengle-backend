@@ -237,6 +237,14 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   order and kind. They never block on distance (the client wants manual exceptions); a far
   or missing fix just sets `manual`. The GPS detail is admin-only; riders see the two
   times, kitchens `rider_arrived_at`, customers nothing. `services/riderArrival.service.js`.
+- **ONE road distance per order** (2026-11-09): kitchen -> drop-off by road
+  (`services/routeDistance.service.js`, Google Routes API, cached) is used for the customer
+  fee, rider pay and the rider alert, stored on the order (`route_*`); kitchen matching and
+  the catalog radius stay straight-line. With no `GOOGLE_ROUTES_API_KEY` it is the old
+  straight line (`route_source: "straight"`), on an API failure straight x 1.3 (`estimate`);
+  it never blocks an order. Any new place that prices or reports a trip distance must use
+  the order's stored route (`routeDistance.ensureForOrder` / `shipping.tripDistanceKm`),
+  never recompute a straight line.
 - **Never send raw server errors to a client** (2026-11-04): the central error
   handler in `app.js` returns a generic message + `ref` for any 5xx in production
   (the real error is logged under that ref); only deliberate 4xx messages are shown.

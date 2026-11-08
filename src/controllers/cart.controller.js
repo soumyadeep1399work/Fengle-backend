@@ -5,6 +5,7 @@ const routing = require("../services/routing.service");
 const { computeTax } = require("../services/tax.service");
 const couponService = require("../services/coupon.service");
 const riderDispatch = require("../services/riderDispatch.service");
+const routeDistance = require("../services/routeDistance.service");
 const { closedMessage } = require("../utils/serviceHours");
 
 const MIN_ORDER_VALUE = 50; // keep in sync with order.controller.js
@@ -92,8 +93,10 @@ async function quoteCart(req, res) {
     });
   }
 
+  // The trip is measured by ROAD (routeDistance: cached, so this quote and the order placed after it get the same number); matching stayed straight-line.
+  const route = await routeDistance.between({ lat: match.restaurant.lat, lng: match.restaurant.lng }, { lat: Number(delivery_lat), lng: Number(delivery_lng) });
   const deliveryFee = (await shipping.customerFee({
-    distanceKm: match.distanceKm, restaurant: match.restaurant, orderValue: itemTotal, at: new Date(),
+    distanceKm: route.distance_km, restaurant: match.restaurant, orderValue: itemTotal, at: new Date(),
     dropoff: { lat: Number(delivery_lat), lng: Number(delivery_lng) },
   })).fee; // same engine as order placement and the reject-cascade, so a quote can't disagree with the order
   const { cgstAmount, sgstAmount } = computeTax(itemTotal);

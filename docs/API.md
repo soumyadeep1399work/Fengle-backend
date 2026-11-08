@@ -717,6 +717,18 @@ The twin of the kitchen alarm: when an order is assigned, ONLY that rider's phon
 - Columns on `orders`: `reached_restaurant_*` and `reached_customer_*` (`at`, `lat`, `lng`, `accuracy_m`, `distance_m`, `manual`).
 - **Who sees what**: riders' order reads carry only `reached_restaurant_at` and `reached_customer_at` (to restore the app's state); kitchens' carry `rider_arrived_at`; customers' carry nothing; the GPS, distance and manual flag are admin-only. `GET /admin/orders/:id` returns every field; the admin order list rows carry `reached_restaurant_at`, `reached_customer_at` and `minutes_to_arrival` (from the rider's assignment alert to arrival at the kitchen).
 
+## Road distance — one distance per order (added 2026-11-09)
+
+The trip **kitchen -> drop-off** is measured by **road** (Google Routes API), once per order, and that single number is used for the **customer's delivery fee** (cart quote, placement and the reject-cascade), **rider pay** (the estimate and the amount frozen at delivery) and the **rider alert**. Matching kitchens and the catalog radius stay **straight-line** (they are service-area rules, not trip lengths). `services/routeDistance.service.js`.
+
+- **Source** (`route_source`): `road` = the Routes API answered (TWO_WHEELER, then DRIVE as a fallback, one overall timeout `ROUTE_API_TIMEOUT_MS`, default 4000); `estimate` = the key is set but the API failed or timed out, so straight line x `ROUTE_FALLBACK_FACTOR` (default 1.3) — never blocks or fails an order; `straight` = **no `GOOGLE_ROUTES_API_KEY` is configured**, so the distance is exactly the old straight line and nothing changes until the key is set.
+- **Cache** (`route_cache`, origin and destination rounded to 5 decimals): a cart quote and the order placed after it get the **same** number (quote == order) and a repeat address costs nothing. `road` is kept for good; an `estimate` for 15 minutes (so a recovered API is tried again soon).
+- **On the order**: `route_distance_km` (2 dp), `route_duration_min`, `route_source`, stored at placement and recomputed for the new kitchen on a reject-cascade (with the new fee). An order without them (placed before this, or with no key) is measured lazily on first read and stored once it is a real `road` / `estimate` figure. A frozen rider payout never changes.
+- **Exposure**: the three fields are on every order read the apps use — `GET /orders`, `GET /orders/:id` (customer, kitchen, rider, admin) and `GET /riders/me/orders` — and on `GET /admin/orders/:id`.
+- **ETA**: the pickup ETA (`POST /orders/:id/picked-up` -> `eta_minutes`) uses the road route's own `route_duration_min` when there is one, otherwise the old straight line at 20 km/h.
+- **Server env**: `GOOGLE_ROUTES_API_KEY` (a Google Cloud key with the **Routes API** enabled and billing on; separate from the geocoding `GOOGLE_MAPS_API_KEY`), optional `ROUTE_FALLBACK_FACTOR`, `ROUTE_API_TIMEOUT_MS`.
+- **Pricing consequence**: a road is longer than the straight line (roughly 20-40% in a city), so with the key set delivery fees and rider pay rise accordingly; the shipping rules themselves are unchanged.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**

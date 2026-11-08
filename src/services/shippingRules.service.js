@@ -32,8 +32,13 @@ const parseJson = (v, fallback) => {
 
 const byPriority = (a, b) => a.priority - b.priority || a.id - b.id;
 
-/** Kitchen -> drop-off, in km: the one distance measure used for rider pay, customer fee conditions and estimates. Change it here. */
+/**
+ * Kitchen -> drop-off, in km: the one distance measure used for rider pay, customer fee conditions and estimates. The road distance stored on
+ * the order (routeDistance.service: road, or the estimate when the API failed) wins; an order with none yet (or only the old straight line)
+ * falls back to the straight line. Callers that can wait use routeDistance.ensureForOrder first, which fills the stored value in.
+ */
 function tripDistanceKm(order, restaurant) {
+  if (order && order.route_distance_km != null && (order.route_source === "road" || order.route_source === "estimate")) return Number(order.route_distance_km);
   return haversineDistanceKm(Number(restaurant.lat), Number(restaurant.lng), Number(order.delivery_lat), Number(order.delivery_lng));
 }
 

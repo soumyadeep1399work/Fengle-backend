@@ -1,5 +1,6 @@
 const db = require("../config/db");
 const shipping = require("./shippingRules.service");
+const routeDistance = require("./routeDistance.service");
 
 // The formula, in one line, as shown to admins and stored with every payout:
 const FORMULA =
@@ -78,9 +79,13 @@ function computePayout({ distanceKm, config }) {
   };
 }
 
-/** Kitchen -> drop-off distance, the same measure settlement has always used (one function: shippingRules.tripDistanceKm). */
-function orderDistanceKm(order, restaurant) {
-  return shipping.tripDistanceKm(order, restaurant);
+/**
+ * Kitchen -> drop-off distance (one measure for fee, pay and alert: shippingRules.tripDistanceKm). An order without its road distance yet gets it
+ * computed and stored first (routeDistance.ensureForOrder; a no-op with no Routes API key), so what is measured here is what the order carries.
+ */
+async function orderDistanceKm(order, restaurant, conn = db) {
+  const route = await routeDistance.ensureForOrder(order, restaurant, conn);
+  return route.source === "straight" ? shipping.tripDistanceKm({ ...order, route_distance_km: null, route_source: null }, restaurant) : route.distance_km;
 }
 
 /**
@@ -122,7 +127,7 @@ function breakdownFromRules(result, distanceKm) {
  * Returns { payout, breakdown, configId } (configId only for a legacy fallback).
  */
 async function riderPayout({ order, restaurant, at = new Date(), conn = db, ruleSet }) {
-  const km = orderDistanceKm(order, restaurant);
+  const km = await orderDistanceKm(order, restaurant, conn);
   const r = await shipping.compute({
     kind: "rider_pay", distanceKm: km, orderValue: Number(order.item_total), at,
     dropoff: { lat: order.delivery_lat, lng: order.delivery_lng }, restaurant, conn, ruleSet,

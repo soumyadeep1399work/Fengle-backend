@@ -5501,6 +5501,182 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 69: Road distance — one distance per order (Google Routes API, cached, never blocks) for the customer fee, rider pay and the rider alert ---");
+  {
+    const http = require("http");
+    const { signToken } = require("./src/utils/jwt");
+    const { haversineDistanceKm } = require("./src/utils/geo");
+    const app = require("./src/app");
+    const push = require("./src/services/push.service");
+    const shipping = require("./src/services/shippingRules.service");
+    const routeSvc = require("./src/services/routeDistance.service");
+    const realFetch = global.fetch;
+    const KEY = "test-routes-key";
+    const saved = { key: process.env.GOOGLE_ROUTES_API_KEY, factor: process.env.ROUTE_FALLBACK_FACTOR, timeout: process.env.ROUTE_API_TIMEOUT_MS };
+    let mode = "road2x";
+    const calls = [];
+    // Everything that isn't the Routes API goes to the real fetch (this test also talks to its own server).
+    global.fetch = async (url, opts = {}) => {
+      if (!String(url).startsWith("https://routes.googleapis.com")) return realFetch(url, opts);
+      const body = JSON.parse(opts.body);
+      calls.push({ url: String(url), headers: opts.headers, body });
+      const o = body.origin.location.latLng, d = body.destination.location.latLng;
+      const straight = haversineDistanceKm(o.latitude, o.longitude, d.latitude, d.longitude);
+      const ok = (meters) => ({ ok: true, status: 200, json: async () => ({ routes: [{ distanceMeters: meters, duration: "600s" }] }) });
+      if (mode === "fail") return { ok: false, status: 500, json: async () => ({}) };
+      if (mode === "empty") return { ok: true, status: 200, json: async () => ({}) };
+      if (mode === "twoWheelerFails") return body.travelMode === "TWO_WHEELER" ? { ok: true, status: 200, json: async () => ({ routes: [] }) } : ok(Math.round(straight * 2000));
+      if (mode === "hang") return new Promise((_, reject) => { opts.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }))); });
+      return ok(Math.round(straight * 2000)); // road2x: the road is twice the straight line
+    };
+    const pushes = [];
+    const realSend = push.sendToOwner;
+    push.sendToOwner = async (type, id, n) => { pushes.push({ type, id, ...n }); };
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await realFetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) }, body: body !== undefined ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    const savedRiders = await db("riders").select("id", "status");
+    await db("riders").update({ status: "inactive" });
+    try {
+      const A = { lat: 23.7, lng: 89.5 }, B = { lat: 23.7 + 0.03, lng: 89.5 };
+      const straightAB = haversineDistanceKm(A.lat, A.lng, B.lat, B.lng);
+      const rowsInCache = async () => Number((await db("route_cache").count({ n: "*" }).first()).n);
+
+      // ---- no key: exactly the old straight line, nothing called, nothing cached
+      delete process.env.GOOGLE_ROUTES_API_KEY;
+      await db("route_cache").delete();
+      const noKey = await routeSvc.between(A, B);
+      check("with no GOOGLE_ROUTES_API_KEY the distance is the old straight line (source 'straight'), the API isn't called and nothing is cached", noKey.source === "straight" && Math.abs(noKey.distance_km - straightAB) < 1e-9 && noKey.duration_min === null && calls.length === 0 && (await rowsInCache()) === 0);
+
+      // ---- with a key: road via TWO_WHEELER, cached
+      process.env.GOOGLE_ROUTES_API_KEY = KEY;
+      process.env.ROUTE_API_TIMEOUT_MS = "4000";
+      const road = await routeSvc.between(A, B);
+      check("with a key the road distance comes from the Routes API: source 'road', km and duration from the answer",
+        road.source === "road" && Math.abs(road.distance_km - Math.round(straightAB * 2000) / 1000) < 1e-9 && road.duration_min === 10 && calls.length === 1);
+      check("the request: POST computeRoutes with the API key header, a field mask asking only for distance and duration, TWO_WHEELER, the two points",
+        calls[0].url === "https://routes.googleapis.com/directions/v2:computeRoutes" && calls[0].headers["X-Goog-Api-Key"] === KEY && calls[0].headers["X-Goog-FieldMask"] === "routes.distanceMeters,routes.duration" && calls[0].body.travelMode === "TWO_WHEELER"
+        && calls[0].body.origin.location.latLng.latitude === A.lat && calls[0].body.destination.location.latLng.longitude === B.lng);
+      const cached = await routeSvc.between({ lat: A.lat + 0.0000001, lng: A.lng }, B);
+      check("the same trip again (even a hair off, inside 5 decimals) is a cache hit: no new API call and the SAME number", calls.length === 1 && cached.distance_km === road.distance_km && (await rowsInCache()) === 1 && (await db("route_cache").first()).source === "road");
+
+      // ---- fallbacks
+      await db("route_cache").delete(); calls.length = 0;
+      mode = "twoWheelerFails";
+      const drive = await routeSvc.between(A, B);
+      check("when TWO_WHEELER has no route it retries with DRIVE and still returns the road distance", drive.source === "road" && calls.length === 2 && calls[0].body.travelMode === "TWO_WHEELER" && calls[1].body.travelMode === "DRIVE");
+      await db("route_cache").delete(); calls.length = 0;
+      mode = "fail";
+      const est = await routeSvc.between(A, B);
+      const cacheRow = await db("route_cache").first();
+      check("when the API fails the distance is the straight line x 1.3 (source 'estimate'), it is NOT thrown, and the estimate is cached with a short expiry", est.source === "estimate" && Math.abs(est.distance_km - straightAB * 1.3) < 0.002 && cacheRow.source === "estimate" && !!cacheRow.expires_at && new Date(cacheRow.expires_at) > new Date() && new Date(cacheRow.expires_at) < new Date(Date.now() + 16 * 60 * 1000));
+      const before = calls.length;
+      await routeSvc.between(A, B);
+      check("while the estimate is cached the API isn't hammered (quote and order agree)", calls.length === before);
+      await db("route_cache").update({ expires_at: new Date(Date.now() - 1000) }); mode = "road2x";
+      const upgraded = await routeSvc.between(A, B);
+      check("once the estimate expires the API is tried again, and a recovered API upgrades it to 'road' for good", upgraded.source === "road" && (await db("route_cache").first()).source === "road" && (await db("route_cache").first()).expires_at === null && (await rowsInCache()) === 1);
+      await db("route_cache").delete(); mode = "fail"; process.env.ROUTE_FALLBACK_FACTOR = "1.5";
+      const est15 = await routeSvc.between(A, B);
+      check("ROUTE_FALLBACK_FACTOR is configurable (1.5)", Math.abs(est15.distance_km - straightAB * 1.5) < 0.002);
+      delete process.env.ROUTE_FALLBACK_FACTOR;
+      await db("route_cache").delete(); mode = "hang"; process.env.ROUTE_API_TIMEOUT_MS = "60";
+      const t0 = Date.now();
+      const slow = await routeSvc.between(A, B);
+      check("a hanging API is cut off at the timeout (ROUTE_API_TIMEOUT_MS) and falls back to an estimate", slow.source === "estimate" && Date.now() - t0 < 2000);
+      process.env.ROUTE_API_TIMEOUT_MS = "4000"; mode = "empty";
+      await db("route_cache").delete();
+      check("an answer with no route is treated as a failure (estimate)", (await routeSvc.between(A, B)).source === "estimate");
+      mode = "road2x"; await db("route_cache").delete();
+
+      // ---- an order: fee, rider pay, alert and ETA all follow the ONE road distance
+      await db("orders").whereIn("status", ["placed", "accepted"]).update({ status: "cancelled" });
+      const LAT = 23.75, LNG = 89.55;
+      const [cat] = await db("categories").insert({ name: "Road Category" });
+      const [dish] = await db("items").insert({ category_id: cat, name: "Road Dish", price: 200, created_by_type: "admin" });
+      const [dish2] = await db("items").insert({ category_id: cat, name: "Road Dish Both", price: 200, created_by_type: "admin" });
+      const mkKitchen = async (name, phone, dLat) => { const [id] = await db("restaurants").insert({ name, phone, address: "Newtown", lat: LAT + dLat, lng: LNG, radius_km: 5, status: "active" }); await db("restaurant_categories").insert({ restaurant_id: id, category_id: cat }); return id; };
+      const kFar = await mkKitchen("Road Far Kitchen", "8600006901", 0.054);   // ~6 km: inside the 7 km ceiling, beyond the 5 km free radius
+      const kNear = await mkKitchen("Road Near Kitchen", "8600006902", 0.036); // ~4 km
+      await db("restaurant_items").insert([{ restaurant_id: kFar, item_id: dish, is_available: true }, { restaurant_id: kFar, item_id: dish2, is_available: true }, { restaurant_id: kNear, item_id: dish2, is_available: true }]);
+      const [rider] = await db("riders").insert({ name: "Road Rider", phone: "8500006901", status: "active", wallet_balance: 0, last_known_lat: LAT + 0.05, last_known_lng: LNG });
+      const [cust] = await db("users").insert({ name: "Road Customer", phone: "8000006901", wallet_balance: 0 });
+      const custTok = signToken({ id: cust, type: "customer" }), farTok = signToken({ id: kFar, type: "restaurant" }), nearTok = signToken({ id: kNear, type: "restaurant" }), riderTok = signToken({ id: rider, type: "rider" });
+      const dropoff = { lat: LAT, lng: LNG };
+      const items = (id) => [{ item_id: id, quantity: 1 }];
+      const farRestaurant = await db("restaurants").where({ id: kFar }).first();
+      const straightKm = haversineDistanceKm(Number(farRestaurant.lat), Number(farRestaurant.lng), LAT, LNG);
+      const roadKm = Math.round(straightKm * 2000) / 1000;
+      const feeFor = async (km) => (await shipping.customerFee({ distanceKm: km, restaurant: farRestaurant, orderValue: 200, at: new Date(), dropoff })).fee;
+      check("(setup) with these rules the road distance really changes the fee: the straight-line fee and the road fee differ", (await feeFor(straightKm)) !== (await feeFor(roadKm)));
+
+      const quote = await call(custTok, "POST", "/cart/quote", { items: items(dish), delivery_lat: LAT, delivery_lng: LNG });
+      check("the cart quote prices the delivery on the ROAD distance (not the straight line)", quote.status === 200 && quote.body.deliveryFee === (await feeFor(roadKm)) && quote.body.deliveryFee !== (await feeFor(straightKm)));
+      const placed = await call(custTok, "POST", "/orders", { items: items(dish), delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Road Address", payment_method: "cod" });
+      const o1 = placed.body.order;
+      check("the order's delivery fee equals the quote's (quote == order), because both use the same cached road distance", placed.status === 201 && Number(o1.delivery_fee) === quote.body.deliveryFee);
+      check("the order stores the road distance, its duration and its source", Number(o1.route_distance_km) === Number(roadKm.toFixed(2)) && o1.route_duration_min === 10 && o1.route_source === "road");
+      const fresh = await db("orders").where({ id: o1.id }).first();
+      check("(and it is in the database, not just the response)", Number(fresh.route_distance_km) === Number(roadKm.toFixed(2)) && fresh.route_source === "road");
+      pushes.length = 0;
+      await call(farTok, "POST", `/orders/${o1.id}/accept`, {}); await sleep(250);
+      const alert = pushes.find((p) => p.type === "rider" && p.data.orderId === o1.id);
+      check("the rider alert shows the road distance (not the straight line)", !!alert && alert.body.includes(`${roadKm.toFixed(1)} km`) && !alert.body.includes(`${straightKm.toFixed(1)} km`));
+      const riderView = await call(riderTok, "GET", `/orders/${o1.id}`);
+      const expectedPay = (await shipping.compute({ kind: "rider_pay", distanceKm: Number(roadKm.toFixed(2)), orderValue: Number(o1.item_total), at: new Date(), dropoff, restaurant: farRestaurant })).amount;
+      check("the rider's estimated payout is the engine's amount for the ROAD distance", riderView.status === 200 && riderView.body.order.estimated_rider_payout === expectedPay);
+      check("route_distance_km, route_duration_min and route_source are on the rider's order read, list and assigned-orders list (and the customer's read)",
+        riderView.body.order.route_source === "road" && Number(riderView.body.order.route_distance_km) === Number(roadKm.toFixed(2)) && riderView.body.order.route_duration_min === 10
+        && (await call(riderTok, "GET", "/orders")).body.orders.find((o) => o.id === o1.id).route_source === "road" && (await call(riderTok, "GET", "/riders/me/orders")).body.orders.find((o) => o.id === o1.id).route_source === "road"
+        && (await call(custTok, "GET", `/orders/${o1.id}`)).body.order.route_source === "road");
+      await db("orders").where({ id: o1.id }).update({ route_duration_min: 40 });
+      const picked = await call(riderTok, "POST", `/orders/${o1.id}/picked-up`, {});
+      check("the pickup ETA comes from the road route's duration (40 min), not 20 km/h on a straight line", picked.status === 200 && picked.body.eta_minutes === 40);
+      await call(riderTok, "POST", `/orders/${o1.id}/on-the-way`, {});
+      const row1 = await db("orders").where({ id: o1.id }).first();
+      const delivered = await call(riderTok, "POST", `/orders/${o1.id}/delivered`, { delivery_otp: row1.delivery_otp, cod_amount_collected: Number(row1.grand_total) });
+      const done = await db("orders").where({ id: o1.id }).first();
+      check("rider pay is frozen at delivery from the ROAD distance", delivered.status === 200 && Number(done.rider_payout) === expectedPay && (await db("orders").where({ id: o1.id }).first()).rider_payout_breakdown.includes(`"distance_km":${Number(roadKm.toFixed(2))}`));
+      const adm = await (async () => { const [adminId] = await db("admins").insert({ name: "road-support", email: "road-support@road.test", password_hash: "x", role: "support" }); return call(signToken({ id: adminId, type: "admin" }), "GET", `/admin/orders/${o1.id}`); })();
+      check("admin order detail shows the km, duration and source", adm.status === 200 && adm.body.order.route_source === "road" && Number(adm.body.order.route_distance_km) === Number(roadKm.toFixed(2)) && adm.body.order.route_duration_min === 40);
+      await db("orders").where({ id: o1.id }).update({ restaurant_rating_skipped: true });
+
+      // ---- the reject cascade measures the NEW kitchen
+      const o2 = (await call(custTok, "POST", "/orders", { items: items(dish2), delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Road Address", payment_method: "cod" })).body.order;
+      const nearRestaurant = await db("restaurants").where({ id: kNear }).first();
+      const nearRoad = Math.round(haversineDistanceKm(Number(nearRestaurant.lat), Number(nearRestaurant.lng), LAT, LNG) * 2000) / 1000;
+      check("(the nearer kitchen takes it first, with its own road distance)", o2.restaurant_id === kNear && Number(o2.route_distance_km) === Number(nearRoad.toFixed(2)));
+      await call(nearTok, "POST", `/orders/${o2.id}/reject`, {});
+      const re = await db("orders").where({ id: o2.id }).first();
+      check("after a reject the order moves to the other kitchen and its road distance, duration and fee are recomputed for it", re.restaurant_id === kFar && Number(re.route_distance_km) === Number(roadKm.toFixed(2)) && re.route_source === "road" && Number(re.delivery_fee) === (await feeFor(roadKm)));
+
+      // ---- lazy: an order without a stored route gets it on first read (key set), and stays straight with no key
+      await db("orders").where({ id: o2.id }).update({ status: "accepted", rider_id: rider, route_distance_km: null, route_duration_min: null, route_source: null });
+      const lazy = await call(riderTok, "GET", `/orders/${o2.id}`);
+      const stored = await db("orders").where({ id: o2.id }).first();
+      check("an in-flight order with no stored route is measured on first read (estimated payout uses it) and the road distance is stored", lazy.status === 200 && lazy.body.order.estimated_rider_payout === expectedPay && stored.route_source === "road" && Number(stored.route_distance_km) === Number(roadKm.toFixed(2)));
+      await db("orders").where({ id: o2.id }).update({ status: "cancelled" });
+
+      // ---- no key again: new orders are the old straight-line behaviour, stored as 'straight'
+      delete process.env.GOOGLE_ROUTES_API_KEY; calls.length = 0;
+      const o3 = (await call(custTok, "POST", "/orders", { items: items(dish), delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Road Address", payment_method: "cod" }));
+      check("with the key removed, a new order uses the straight line exactly as before and is stored as source 'straight' (no API call)", o3.status === 201 && o3.body.order.route_source === "straight" && Number(o3.body.order.route_distance_km) === Number(straightKm.toFixed(2)) && Number(o3.body.order.delivery_fee) === (await feeFor(straightKm)) && calls.length === 0);
+    } finally {
+      global.fetch = realFetch;
+      push.sendToOwner = realSend;
+      for (const [k, v] of [["GOOGLE_ROUTES_API_KEY", saved.key], ["ROUTE_FALLBACK_FACTOR", saved.factor], ["ROUTE_API_TIMEOUT_MS", saved.timeout]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      for (const r of savedRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@road.test").delete();
+      await db("route_cache").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

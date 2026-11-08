@@ -6,7 +6,7 @@
 const db = require("../config/db");
 const push = require("./push.service");
 const riderPay = require("./riderPay.service");
-const { haversineDistanceKm } = require("../utils/geo");
+const routeDistance = require("./routeDistance.service");
 const sendToOwner = (...args) => push.sendToOwner(...args); // looked up per call so a test can spy on the push
 
 const rupees = (amount) => `₹${Number(amount).toFixed(2).replace(/\.00$/, "")}`;
@@ -112,7 +112,8 @@ async function riderAssigned(orderId, { reminder = false } = {}) {
     await db("orders").where({ id: orderId }).whereNull("rider_notified_at").update({ rider_notified_at: new Date() });
   }
   const restaurant = await db("restaurants").where({ id: order.restaurant_id }).select("name", "address", "lat", "lng", "radius_km", "commission_rate_percent").first();
-  const km = restaurant ? haversineDistanceKm(Number(restaurant.lat), Number(restaurant.lng), Number(order.delivery_lat), Number(order.delivery_lng)) : null;
+  const route = restaurant ? await routeDistance.ensureForOrder(order, restaurant) : null; // the order's one road distance (straight line when no Routes API key)
+  const km = route ? route.distance_km : null;
   const payout = restaurant ? await riderPay.estimatePayout({ order, restaurant }) : null;
   const pickupArea = restaurant ? shortArea(restaurant.address) : "";
   const cod = order.payment_method === "cod" ? ` Collect ${rupees(order.grand_total)} cash.` : "";

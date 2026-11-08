@@ -20,6 +20,7 @@ const { notifyLater } = require("../services/push.service");
 const orderPush = require("../services/orderNotifications.service");
 const riderDispatch = require("../services/riderDispatch.service");
 const riderArrival = require("../services/riderArrival.service");
+const routeDistance = require("../services/routeDistance.service");
 const { closedMessage } = require("../utils/serviceHours");
 
 const MIN_ORDER_VALUE = 50;
@@ -184,7 +185,7 @@ async function placeOrder(req, res) {
 
   if (match) {
     const { order, couponError } = await createOrderForRestaurant({
-      customerId, restaurant: match.restaurant, distanceKm: match.distanceKm,
+      customerId, restaurant: match.restaurant,
       cartItems, deliveryLat: delivery_lat, deliveryLng: delivery_lng,
       deliveryAddress: delivery_address, paymentMethod: payment_method,
       isClubbed: categoryIds.length === 2, cascadeAttempts, couponCode: coupon_code,
@@ -259,12 +260,12 @@ async function attemptClubbedFallbackSplit({ customerId, cartItems, categoryIds,
   if (!resultA.match || !resultB.match) return null;
 
   const { order: orderA } = await createOrderForRestaurant({
-    customerId, restaurant: resultA.match.restaurant, distanceKm: resultA.match.distanceKm,
+    customerId, restaurant: resultA.match.restaurant,
     cartItems: itemsA, deliveryLat, deliveryLng, deliveryAddress, paymentMethod,
     isClubbed: false, cascadeAttempts: resultA.cascadeAttempts,
   });
   const { order: orderB } = await createOrderForRestaurant({
-    customerId, restaurant: resultB.match.restaurant, distanceKm: resultB.match.distanceKm,
+    customerId, restaurant: resultB.match.restaurant,
     cartItems: itemsB, deliveryLat, deliveryLng, deliveryAddress, paymentMethod,
     isClubbed: false, cascadeAttempts: resultB.cascadeAttempts,
   });
@@ -278,11 +279,14 @@ async function attemptClubbedFallbackSplit({ customerId, cartItems, categoryIds,
  * order still goes through, un-discounted) when couponCode was given but
  * turned out invalid/ineligible/expired/over its usage limit; never thrown.
  */
-async function createOrderForRestaurant({ customerId, restaurant, distanceKm, cartItems, deliveryLat, deliveryLng, deliveryAddress, paymentMethod, isClubbed, cascadeAttempts, couponCode }) {
+async function createOrderForRestaurant({ customerId, restaurant, cartItems, deliveryLat, deliveryLng, deliveryAddress, paymentMethod, isClubbed, cascadeAttempts, couponCode }) {
+  // ONE road distance for this order (kitchen -> drop-off), measured before the transaction (it may call the Routes API) and stored on the order:
+  // the customer fee below, the rider's pay and the rider alert all use it. The cache makes it the same number the cart quote showed.
+  const route = await routeDistance.between({ lat: restaurant.lat, lng: restaurant.lng }, { lat: Number(deliveryLat), lng: Number(deliveryLng) });
   return db.transaction(async (trx) => {
     const itemTotal = cartItems.reduce((sum, i) => sum + i.unitPrice * i.quantity, 0);
     const feeResult = await shipping.customerFee({
-      distanceKm, restaurant, orderValue: itemTotal, at: new Date(), dropoff: { lat: Number(deliveryLat), lng: Number(deliveryLng) }, conn: trx,
+      distanceKm: route.distance_km, restaurant, orderValue: itemTotal, at: new Date(), dropoff: { lat: Number(deliveryLat), lng: Number(deliveryLng) }, conn: trx,
     });
     const deliveryFee = feeResult.fee;
     const commissionAmount = commission.computeCommission(itemTotal, restaurant); // unaffected by any coupon — platform-funded, not a restaurant cost
@@ -322,6 +326,7 @@ async function createOrderForRestaurant({ customerId, restaurant, distanceKm, ca
       item_total: itemTotal,
       delivery_fee: deliveryFee,
       delivery_fee_breakdown: JSON.stringify(feeResult.breakdown),
+      ...routeDistance.orderColumns(route),
       commission_amount: commissionAmount, // legacy: no longer drives anything, kept so older reports still read
       restaurant_payable: payable,
       payable_estimated: estimated,
@@ -632,8 +637,10 @@ async function rejectOrder(req, res) {
   if (nextCandidate) {
     const commissionAmount = commission.computeCommission(Number(order.item_total), nextCandidate.restaurant);
     // Re-priced for the new kitchen, but at the ORDER'S placement time so a reassignment can't flip a time-of-day surcharge.
+    // The new kitchen is somewhere else: measure its road distance to the drop-off and store it with the new fee.
+    const nextRoute = await routeDistance.between({ lat: nextCandidate.restaurant.lat, lng: nextCandidate.restaurant.lng }, { lat: Number(order.delivery_lat), lng: Number(order.delivery_lng) });
     const feeResult = await shipping.customerFee({
-      distanceKm: nextCandidate.distanceKm, restaurant: nextCandidate.restaurant, orderValue: Number(order.item_total), at: new Date(order.created_at),
+      distanceKm: nextRoute.distance_km, restaurant: nextCandidate.restaurant, orderValue: Number(order.item_total), at: new Date(order.created_at),
       dropoff: { lat: Number(order.delivery_lat), lng: Number(order.delivery_lng) },
     });
     const deliveryFee = feeResult.fee;
@@ -642,6 +649,7 @@ async function rejectOrder(req, res) {
       commission_amount: commissionAmount,
       delivery_fee: deliveryFee,
       delivery_fee_breakdown: JSON.stringify(feeResult.breakdown),
+      ...routeDistance.orderColumns(nextRoute),
       grand_total: Number((Number(order.item_total) + deliveryFee + Number(order.cgst_amount) + Number(order.sgst_amount) - Number(order.coupon_discount_amount || 0)).toFixed(2)),
       cascade_attempts: (order.cascade_attempts || 1) + 1,
       status: "placed", // re-enters the queue for the new restaurant
@@ -782,9 +790,12 @@ async function markPickedUp(req, res) {
 
   // One-time ETA estimate at pickup — does NOT continuously update (Section 5 / CLAUDE.md).
   const restaurant = await db("restaurants").where({ id: order.restaurant_id }).first();
-  const distanceKm = haversineDistanceKm(Number(restaurant.lat), Number(restaurant.lng), Number(order.delivery_lat), Number(order.delivery_lng));
-  const AVG_SPEED_KMPH = 20; // rough urban delivery average — tune later with real data
-  const etaMinutes = Math.max(5, Math.round((distanceKm / AVG_SPEED_KMPH) * 60));
+  // From the road route's own duration when there is one (routeDistance); otherwise the old straight-line distance at an urban average.
+  const route = await routeDistance.ensureForOrder(order, restaurant);
+  const AVG_SPEED_KMPH = 20; // rough urban delivery average (used only when there is no road duration)
+  const etaMinutes = route.duration_min != null
+    ? Math.max(5, Math.round(route.duration_min))
+    : Math.max(5, Math.round((haversineDistanceKm(Number(restaurant.lat), Number(restaurant.lng), Number(order.delivery_lat), Number(order.delivery_lng)) / AVG_SPEED_KMPH) * 60));
 
   await db("orders").where({ id }).update({ status: "picked_up", picked_up_at: new Date(), eta_minutes: etaMinutes });
   await markRiderAcknowledged(id); // picking it up is also a response
