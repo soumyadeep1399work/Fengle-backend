@@ -4835,7 +4835,7 @@ async function main() {
       const spam = await raw(kTok, "POST", `/restaurants/me/support-tickets/${capTicket.id}/messages`, form({ message: "the twenty-first message today" }));
       check("20 partner messages per ticket per day is the cap (429 too_many_messages)", spam.status === 429 && spam.body.code === "too_many_messages");
       check("a different ticket of the same kitchen is unaffected", (await raw(kTok, "POST", `/restaurants/me/support-tickets/${t2.id}/messages`, form({ message: "A normal reply on another ticket" }))).status === 201);
-      check("the service constants are the agreed ones", supportSvc.MAX_OPEN_TICKETS === 5 && supportSvc.MAX_TICKETS_PER_DAY === 10 && supportSvc.MAX_PARTNER_MESSAGES_PER_TICKET_PER_DAY === 20 && supportSvc.MAX_ATTACHMENTS === 3 && supportSvc.CATEGORIES.length === 8);
+      check("the service constants are the agreed ones", supportSvc.MAX_OPEN_TICKETS === 5 && supportSvc.MAX_TICKETS_PER_DAY === 10 && supportSvc.MAX_PARTNER_MESSAGES_PER_TICKET_PER_DAY === 20 && supportSvc.MAX_ATTACHMENTS === 3 && supportSvc.CATEGORIES.length === 10);
     } finally {
       push.sendToOwner = realSend;
       if (savedRl === undefined) delete process.env.RATE_LIMIT_DISABLED; else process.env.RATE_LIMIT_DISABLED = savedRl;
@@ -5218,6 +5218,104 @@ async function main() {
       if (savedEnv.m === undefined) delete process.env.RIDER_MAX_REMINDERS; else process.env.RIDER_MAX_REMINDERS = savedEnv.m;
       await new Promise((resolve) => server.close(resolve));
       await db("admins").where("email", "like", "%@ralarm.test").delete();
+    }
+  }
+
+  console.log("\n--- Test 66: Rider support tickets — the same thread as the kitchens', mounted for riders, with order_issue and complaint ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const push = require("./src/services/push.service");
+    const supportSvc = require("./src/services/partnerSupport.service");
+    const savedRl = process.env.RATE_LIMIT_DISABLED;
+    process.env.RATE_LIMIT_DISABLED = "1";
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("rider-support-png-0123456789")]);
+    const form = (fields, files = []) => {
+      const f = new FormData();
+      for (const [k, v] of Object.entries(fields)) if (v !== undefined) f.append(k, String(v));
+      for (const x of files) f.append("attachments", new Blob([x.buffer], { type: "image/png" }), x.name || "shot.png");
+      return f;
+    };
+    const raw = async (token, method, p, bodyInit, isJson) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(isJson ? { "Content-Type": "application/json" } : {}) }, body: bodyInit });
+      const buf = Buffer.from(await r.arrayBuffer());
+      const text = buf.toString("utf8");
+      let json = null; try { json = JSON.parse(text); } catch { /* binary */ }
+      return { status: r.status, body: json, text, buf, headers: r.headers };
+    };
+    const jsonCall = (token, method, p, body) => raw(token, method, p, body !== undefined ? JSON.stringify(body) : undefined, body !== undefined);
+    const pushes = [];
+    const realSend = push.sendToOwner;
+    push.sendToOwner = async (type, id, n) => { pushes.push({ type, id, ...n }); };
+    try {
+      check("categories now include order_issue and complaint (10 in all, for every partner type)", supportSvc.CATEGORIES.includes("order_issue") && supportSvc.CATEGORIES.includes("complaint") && supportSvc.CATEGORIES.length === 10);
+      const [rider] = await db("riders").insert({ name: "Support Rider", phone: "8500006601", status: "inactive", wallet_balance: 0 });
+      const [otherRider] = await db("riders").insert({ name: "Other Support Rider", phone: "8500006602", status: "inactive", wallet_balance: 0 });
+      const [pendingRider] = await db("riders").insert({ name: "Pending Support Rider", phone: "8500006603", status: "inactive", wallet_balance: 0, verification_status: "pending" });
+      const [cust] = await db("users").insert({ name: "Rider Support Customer", phone: "8000006601", wallet_balance: 0 });
+      const mkOrder = async (riderId) => (await db("orders").insert({
+        customer_id: cust, restaurant_id: restA, rider_id: riderId, status: "delivered", payment_method: "cod", payment_status: "paid", delivery_lat: 22.58, delivery_lng: 88.46, delivery_address: "Somewhere",
+        item_total: 100, delivery_fee: 0, cgst_amount: 0, sgst_amount: 0, grand_total: 100, commission_amount: 0, delivered_at: new Date(),
+      }))[0];
+      const myOrder = await mkOrder(rider), theirOrder = await mkOrder(otherRider);
+      const tok = signToken({ id: rider, type: "rider" }), otherTok = signToken({ id: otherRider, type: "rider" }), pendTok = signToken({ id: pendingRider, type: "rider" });
+      const [freshKitchen] = await db("restaurants").insert({ name: "Rider Support Fresh Kitchen", phone: "8600006601", address: "Newtown", lat: 22.5, lng: 88.4, radius_km: 5, status: "active" });
+      const kitchenTok = signToken({ id: freshKitchen, type: "restaurant" }), custTok = signToken({ id: cust, type: "customer" });
+      const [adminId] = await db("admins").insert({ name: "rsupport-support", email: "rsupport-support@rsupport.test", password_hash: await bcrypt.hash("a-long-password-1", 4), role: "support" });
+      const adminTok = signToken({ id: adminId, type: "admin" });
+      const create = (t, fields, files) => raw(t, "POST", "/riders/me/support-tickets", form(fields, files));
+      const settle = () => sleep(200);
+
+      check("no token -> 401; a customer or kitchen token -> 403; a token for a deleted rider -> 401",
+        (await create(null, { category: "other", message: "Some rider message here" })).status === 401 && (await create(custTok, { category: "other", message: "Some rider message here" })).status === 403 && (await create(kitchenTok, { category: "other", message: "Some rider message here" })).status === 403 && (await create(signToken({ id: 987654, type: "rider" }), { category: "other", message: "Some rider message here" })).status === 401);
+      check("a rider whose verification is still pending can raise a ticket (allowUnverified)", (await create(pendTok, { category: "login_problem", message: "I cannot see my approval status in the app" })).status === 201);
+
+      // ---- the new categories, and order_id must be the rider's own delivery
+      const issue = await create(tok, { category: "order_issue", order_id: myOrder, message: "The customer was not at the address at all" }, [{ buffer: PNG, name: "proof.png" }]);
+      const t1 = issue.body.ticket;
+      check("order_issue with the rider's own order and a screenshot -> 201, FPS- reference, category and order echoed, message_count 1", issue.status === 201 && t1.category === "order_issue" && t1.order_id === myOrder && /^FPS-\d{6}$/.test(t1.reference) && t1.status === "open" && t1.message_count === 1 && t1.last_message_by === "partner");
+      const complaint = await create(tok, { category: "complaint", message: "General complaint about how payouts are explained" });
+      check("complaint (no order) -> 201; kitchens may use the new categories too", complaint.status === 201 && complaint.body.ticket.order_id === null && (await raw(kitchenTok, "POST", "/restaurants/me/support-tickets", form({ category: "complaint", message: "A kitchen general complaint about something" }))).status === 201);
+      check("an order that was assigned to a different rider, a missing order and a bad category are 400",
+        (await create(tok, { category: "order_issue", order_id: theirOrder, message: "This is not even my own delivery" })).status === 400 && (await create(tok, { category: "order_issue", order_id: 999999, message: "A delivery that does not exist at all" })).status === 400 && (await create(tok, { category: "nope", message: "This category is not a real one" })).status === 400);
+
+      // ---- list / detail / reply / attachment, scoped to the rider
+      const list = await jsonCall(tok, "GET", "/riders/me/support-tickets");
+      check("GET list: only this rider's tickets, newest first; the kitchen's and the other rider's never appear", list.status === 200 && list.body.tickets.length === 2 && list.body.tickets[0].id === complaint.body.ticket.id && list.body.tickets[1].id === t1.id && (await jsonCall(otherTok, "GET", "/riders/me/support-tickets")).body.tickets.length === 0);
+      const det = await jsonCall(tok, "GET", `/riders/me/support-tickets/${t1.id}`);
+      check("detail: { ticket, messages } with the complaint and its attachment { id, name, content_type, size }, no storage path", det.status === 200 && det.body.messages.length === 1 && det.body.messages[0].attachments.length === 1 && det.body.messages[0].attachments[0].name === "proof.png" && !/storage_path|partner-documents/.test(det.text));
+      check("another rider can't read it, reply to it or download its file (404)", (await jsonCall(otherTok, "GET", `/riders/me/support-tickets/${t1.id}`)).status === 404 && (await raw(otherTok, "POST", `/riders/me/support-tickets/${t1.id}/messages`, form({ message: "Not mine to reply to at all" }))).status === 404 && (await raw(otherTok, "GET", `/riders/me/support-tickets/${t1.id}/attachments/${det.body.messages[0].attachments[0].id}`)).status === 404);
+      check("a kitchen's token can't reach rider tickets (403) and a rider can't read a kitchen's ticket through the rider routes (404)", (await jsonCall(kitchenTok, "GET", "/riders/me/support-tickets")).status === 403 && (await jsonCall(tok, "GET", `/riders/me/support-tickets/${(await db("partner_support_tickets").where({ partner_type: "restaurant" }).orderBy("id", "desc").first()).id}`)).status === 404);
+      const dl = await raw(tok, "GET", `/riders/me/support-tickets/${t1.id}/attachments/${det.body.messages[0].attachments[0].id}`);
+      check("the rider downloads their own attachment (exact bytes, image/png, private)", dl.status === 200 && dl.buf.equals(PNG) && /image\/png/.test(dl.headers.get("content-type")) && /private/.test(dl.headers.get("cache-control")));
+      const rep = await raw(tok, "POST", `/riders/me/support-tickets/${t1.id}/messages`, form({ message: "Adding more detail about the address" }, [{ buffer: PNG, name: "more.png" }]));
+      check("POST …/messages -> 201 { ticket, message }: message_count 2, the attachment on the message", rep.status === 201 && rep.body.ticket.message_count === 2 && rep.body.message.attachments.length === 1);
+
+      // ---- admin: the generic side already handles riders
+      const adm = await jsonCall(adminTok, "GET", "/admin/partner-support-tickets?partner_type=rider&limit=100");
+      const row = adm.body.tickets.find((x) => x.id === t1.id);
+      check("admin list with partner_type=rider shows rider tickets with partner { type: rider, id, name, phone }; kitchen tickets are filtered out",
+        adm.status === 200 && !!row && row.partner.type === "rider" && row.partner.name === "Support Rider" && row.partner.phone === "8500006601" && adm.body.tickets.every((x) => x.partner_type === "rider") && (await jsonCall(adminTok, "GET", `/admin/partner-support-tickets?q=Support%20Rider`)).body.tickets.some((x) => x.id === t1.id));
+      const adet = await jsonCall(adminTok, "GET", `/admin/partner-support-tickets/${t1.id}`);
+      check("admin detail: partner is the rider and the order block is the delivery they complained about (no payable / vendor cost)", adet.body.partner.type === "rider" && adet.body.order.id === myOrder && !/payable|vendor_cost|commission/i.test(adet.text));
+      const sum = await jsonCall(adminTok, "GET", "/admin/partner-support-tickets/summary");
+      check("the summary counts riders separately", sum.body.rider.open >= 3 && sum.body.restaurant.open >= 1 && sum.body.open === sum.body.rider.open + sum.body.restaurant.open);
+      pushes.length = 0;
+      const reply = await raw(adminTok, "POST", `/admin/partner-support-tickets/${t1.id}/messages`, form({ message: "Thanks, we have checked the GPS trail and fixed it." }));
+      await settle();
+      check("Fengle's reply moves it to in_progress and pushes the RIDER ('Fengle replied to FPS-…', data type support, normal channel)",
+        reply.status === 201 && reply.body.ticket.status === "in_progress" && pushes.length === 1 && pushes[0].type === "rider" && pushes[0].id === rider && pushes[0].title === `Fengle replied to ${t1.reference}` && pushes[0].data.type === "support" && pushes[0].data.ticket_id === t1.id && pushes[0].alert === undefined);
+      const seen = await jsonCall(tok, "GET", `/riders/me/support-tickets/${t1.id}`);
+      check("the rider sees the reply (author admin) and the new status", seen.body.ticket.status === "in_progress" && seen.body.messages[seen.body.messages.length - 1].author === "admin");
+    } finally {
+      push.sendToOwner = realSend;
+      if (savedRl === undefined) delete process.env.RATE_LIMIT_DISABLED; else process.env.RATE_LIMIT_DISABLED = savedRl;
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@rsupport.test").delete();
     }
   }
 

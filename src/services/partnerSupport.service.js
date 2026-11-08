@@ -10,7 +10,7 @@ const push = require("./push.service");
  * only ever streamed by an authenticated endpoint.
  */
 
-const CATEGORIES = ["not_receiving_orders", "login_problem", "payment_settlement", "order_cancelled", "technical", "menu_or_prices", "documents", "other"];
+const CATEGORIES = ["not_receiving_orders", "login_problem", "payment_settlement", "order_cancelled", "technical", "menu_or_prices", "documents", "other", "order_issue", "complaint"]; // all partner types may use all of them
 const STATUSES = ["open", "in_progress", "resolved"];
 const MESSAGE_MIN = 10; // a new ticket's complaint
 const MESSAGE_MAX = 1000;

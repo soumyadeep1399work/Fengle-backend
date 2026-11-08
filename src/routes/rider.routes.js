@@ -1,7 +1,9 @@
 const express = require("express");
 const { requireAuth } = require("../middleware/auth.middleware");
 const { parseSelfie } = require("../middleware/selfieUpload.middleware");
+const { parseSupportAttachments } = require("../middleware/supportUpload.middleware");
 const riderController = require("../controllers/rider.controller");
+const riderSupport = require("../controllers/partnerSupport.controller").forPartner("rider");
 
 const router = express.Router();
 
@@ -13,5 +15,14 @@ router.patch("/me/availability", requireAuth(["rider"]), riderController.setAvai
 router.patch("/me/location", requireAuth(["rider"]), riderController.updateLocation);
 router.get("/me/orders", requireAuth(["rider"]), riderController.getMyAssignedOrders);
 router.post("/me/accept-agreement", requireAuth(["rider"], { allowUnverified: true }), parseSelfie, riderController.acceptRiderAgreement);
+
+// Partner support (tickets with a reply thread + screenshots): the same implementation as the kitchens'. allowUnverified: a rider whose
+// selfie is still under review, or was denied, can still ask for help.
+const supportAuth = requireAuth(["rider"], { allowUnverified: true });
+router.post("/me/support-tickets", supportAuth, parseSupportAttachments, riderSupport.createTicket);
+router.get("/me/support-tickets", supportAuth, riderSupport.listTickets);
+router.get("/me/support-tickets/:id", supportAuth, riderSupport.getTicket);
+router.post("/me/support-tickets/:id/messages", supportAuth, parseSupportAttachments, riderSupport.addMessage);
+router.get("/me/support-tickets/:id/attachments/:attachmentId", supportAuth, riderSupport.getAttachment);
 
 module.exports = router;

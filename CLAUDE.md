@@ -210,8 +210,8 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   (10) until the kitchen acknowledges (`POST /orders/:id/acknowledge`), accepts or
   rejects; the `kitchen_*` order columns record when it was notified and reacted.
   Never call `sendToOwner("restaurant", …)` for a new order any other way.
-- **Partner support tickets** (2026-11-08): kitchens (riders next — routes not
-  mounted yet, the service is generic via `partner_type`) raise tickets with a reply
+- **Partner support tickets** (2026-11-08): kitchens and riders (both mounted; the
+  service is generic via `partner_type`) raise tickets with a reply
   thread and up to 3 attachments (`/restaurants/me/support-tickets`, `allowUnverified`
   on purpose); every admin role replies (`/admin/partner-support-tickets`). Attachments
   go to the private bucket via `savePartnerDocument` and are only streamed by
