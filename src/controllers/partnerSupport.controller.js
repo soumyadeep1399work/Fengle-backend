@@ -1,5 +1,6 @@
 const db = require("../config/db");
 const support = require("../services/partnerSupport.service");
+const supportContact = require("../services/supportContact.service");
 
 const EXT = { "application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
 
@@ -78,12 +79,12 @@ function sendAttachment(res, { row, buffer }) {
 }
 
 /**
- * GET /support/contact — PUBLIC (the login screen shows it for "I can't log in"). Strings from env, or null for each one that isn't
- * set; the app only shows what is non-null. Nothing is invented.
+ * GET /support/contact — PUBLIC (the login screen shows it for "I can't log in"). What an admin saved in the panel (settings/support-contact),
+ * else the SUPPORT_* env values; each field a string or null, and the app only shows what is non-null. Nothing is invented.
  */
-function getContact(req, res) {
-  const pick = (name) => { const v = (process.env[name] || "").trim(); return v || null; };
-  res.json({ phone: pick("SUPPORT_PHONE"), whatsapp: pick("SUPPORT_WHATSAPP"), email: pick("SUPPORT_EMAIL"), hours: pick("SUPPORT_HOURS") });
+async function getContact(req, res) {
+  res.set("Cache-Control", "no-cache"); // an admin edit should show the next time the screen opens
+  res.json(await supportContact.publicContact());
 }
 
 module.exports = { forPartner, getContact, sendAttachment, fail };

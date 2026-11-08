@@ -5319,6 +5319,68 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 67: Support contact editable by a super_admin; the public endpoint shows it ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const savedEnv = { p: process.env.SUPPORT_PHONE, w: process.env.SUPPORT_WHATSAPP, e: process.env.SUPPORT_EMAIL, h: process.env.SUPPORT_HOURS };
+    process.env.SUPPORT_PHONE = "+91 11111 11111"; process.env.SUPPORT_WHATSAPP = "+91 22222 22222"; process.env.SUPPORT_EMAIL = "env@example.test"; process.env.SUPPORT_HOURS = "env hours";
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) }, body: body !== undefined ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text, headers: r.headers };
+    };
+    try {
+      await db("app_settings").where({ key: "support_contact" }).delete();
+      const mkAdmin = async (name, role) => { const [id] = await db("admins").insert({ name, email: `${name}@scontact.test`, password_hash: await bcrypt.hash("a-long-password-1", 4), role }); return { id, token: signToken({ id, type: "admin" }) }; };
+      const superA = await mkAdmin("sc-super", "super_admin"), opsA = await mkAdmin("sc-ops", "ops"), supA = await mkAdmin("sc-support", "support");
+      const form = { phone: "+91 8392071378", whatsapp: "+91 8392071378", email: "support.fengle@gmail.com", hours: "10 AM to 10 PM, every day" };
+
+      // ---- before anyone saves: the server env, and the admin page can prefill from it
+      const pub0 = await call(null, "GET", "/support/contact");
+      check("with nothing saved, the public endpoint serves the server env values (no token needed)", pub0.status === 200 && JSON.stringify(pub0.body) === JSON.stringify({ phone: "+91 11111 11111", whatsapp: "+91 22222 22222", email: "env@example.test", hours: "env hours" }));
+      const adm0 = await call(supA.token, "GET", "/admin/settings/support-contact");
+      check("every admin role can read what the apps show now: the four values plus source env, no updated_at / updated_by yet", adm0.status === 200 && adm0.body.source === "env" && adm0.body.phone === "+91 11111 11111" && adm0.body.updated_at === null && adm0.body.updated_by === null && (await call(opsA.token, "GET", "/admin/settings/support-contact")).status === 200);
+      check("no token -> 401 on the admin read; a customer token -> 403", (await call(null, "GET", "/admin/settings/support-contact")).status === 401 && (await call(signToken({ id: 1, type: "customer" }), "GET", "/admin/settings/support-contact")).status === 403);
+
+      // ---- only a super_admin saves
+      check("ops and support can't change it (403 forbidden_role)", (await call(opsA.token, "PUT", "/admin/settings/support-contact", form)).body.code === "forbidden_role" && (await call(supA.token, "PUT", "/admin/settings/support-contact", form)).status === 403 && (await call(null, "PUT", "/admin/settings/support-contact", form)).status === 401);
+      check("nothing was stored by the refused attempts: the apps still see the env values", (await call(null, "GET", "/support/contact")).body.phone === "+91 11111 11111");
+
+      // ---- validation
+      const bads = await Promise.all([
+        { ...form, phone: "call me" }, { ...form, phone: "123" }, { ...form, whatsapp: "+91 abc" }, { ...form, email: "not-an-email" }, { ...form, email: `${"a".repeat(120)}@x.com` },
+        { ...form, hours: "line one\nline two" }, { ...form, hours: "x".repeat(101) }, { ...form, phone: 8392071378 }, { phone: form.phone, whatsapp: form.whatsapp, email: form.email }, {},
+      ].map((b) => call(superA.token, "PUT", "/admin/settings/support-contact", b)));
+      check("a bad phone / WhatsApp / email / hours, a non-text value, or a missing field is 400 with a readable error", bads.every((r) => r.status === 400 && typeof r.body.error === "string" && r.body.error.length > 5));
+      check("the missing-field error names what is missing", /hours/.test(bads[8].body.error) && /Missing/.test(bads[8].body.error));
+
+      // ---- save
+      const saved = await call(superA.token, "PUT", "/admin/settings/support-contact", { ...form, phone: "  +91 8392071378  " });
+      check("a super_admin saves: 200 with the same shape, values trimmed, source admin, updated_at and updated_by (the admin's name)", saved.status === 200 && saved.body.phone === "+91 8392071378" && saved.body.hours === form.hours && saved.body.source === "admin" && !!saved.body.updated_at && saved.body.updated_by === "sc-super");
+      const pub1 = await call(null, "GET", "/support/contact");
+      check("the public endpoint now serves the saved values (not the env ones), with no cache so an edit shows at once", JSON.stringify(pub1.body) === JSON.stringify(form) && /no-cache/.test(pub1.headers.get("cache-control")));
+      check("saving again replaces them (still one row)", (await call(superA.token, "PUT", "/admin/settings/support-contact", { ...form, hours: "24/7" })).body.hours === "24/7" && (await call(null, "GET", "/support/contact")).body.hours === "24/7" && (await db("app_settings").where({ key: "support_contact" }).count({ n: "*" }).first()).n === 1);
+
+      // ---- clearing hides a field for real
+      const cleared = await call(superA.token, "PUT", "/admin/settings/support-contact", { phone: "+91 8392071378", whatsapp: "", email: null, hours: "   " });
+      check("an empty string, null or blank hides a field: it comes back null", cleared.body.whatsapp === null && cleared.body.email === null && cleared.body.hours === null && cleared.body.phone === "+91 8392071378");
+      check("a hidden field stays hidden on the public endpoint, it does NOT fall back to the server env", JSON.stringify((await call(null, "GET", "/support/contact")).body) === JSON.stringify({ phone: "+91 8392071378", whatsapp: null, email: null, hours: null }));
+      const allGone = await call(superA.token, "PUT", "/admin/settings/support-contact", { phone: null, whatsapp: null, email: null, hours: null });
+      check("all four cleared is allowed (the apps then show no contact at all)", allGone.status === 200 && allGone.body.source === "admin" && JSON.stringify((await call(null, "GET", "/support/contact")).body) === JSON.stringify({ phone: null, whatsapp: null, email: null, hours: null }));
+    } finally {
+      await db("app_settings").where({ key: "support_contact" }).delete();
+      for (const [k, v] of [["SUPPORT_PHONE", savedEnv.p], ["SUPPORT_WHATSAPP", savedEnv.w], ["SUPPORT_EMAIL", savedEnv.e], ["SUPPORT_HOURS", savedEnv.h]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@scontact.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

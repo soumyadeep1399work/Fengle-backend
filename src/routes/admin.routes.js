@@ -112,6 +112,9 @@ router.get("/documents/:ownerType/:ownerId", partnerDocuments.getOwnerDocuments)
 // Rider pay: every role can read it; only a super_admin can change it.
 router.get("/settings/rider-pay", adminSettings.getRiderPay);
 router.put("/settings/rider-pay", superOnly, adminSettings.updateRiderPay);
+// The support contact the Restaurant and Rider apps show: everyone reads it, only a super_admin changes it.
+router.get("/settings/support-contact", adminSettings.getSupportContact);
+router.put("/settings/support-contact", superOnly, adminSettings.updateSupportContact);
 
 // Restaurant settlement (vendor-cost model): what each kitchen is owed, payments and adjustments. super_admin + ops only
 // (statements show what Fengle pays per dish); support never sees it.

@@ -34,4 +34,22 @@ async function updateRiderPay(req, res) {
   res.status(410).json({ error: "Rider pay is managed under /admin/shipping/rules (kind rider_pay)", code: "moved_to_shipping_rules" });
 }
 
-module.exports = { getRiderPay, updateRiderPay };
+const supportContact = require("../services/supportContact.service");
+
+/** GET /admin/settings/support-contact -> { phone, whatsapp, email, hours, source: "admin" | "env", updated_at, updated_by } (what the apps show right now) */
+async function getSupportContact(req, res) {
+  res.json(await supportContact.current());
+}
+
+/**
+ * PUT /admin/settings/support-contact { phone, whatsapp, email, hours } (super_admin) -> the same shape. All four keys are required (null or ""
+ * hides one). Once saved the saved values are what the apps show: a cleared field stays hidden, it does not fall back to the server env.
+ */
+async function updateSupportContact(req, res) {
+  const v = supportContact.validate(req.body);
+  if (v.error) return res.status(400).json({ error: v.error });
+  await supportContact.save(v.value, req.auth.id);
+  res.json(await supportContact.current());
+}
+
+module.exports = { getRiderPay, updateRiderPay, getSupportContact, updateSupportContact };
