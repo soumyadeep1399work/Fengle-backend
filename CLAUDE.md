@@ -207,6 +207,11 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   day) and worked by **every admin role** including `support` (`/admin/support-tickets`;
   the `requireRole` is explicit on purpose). Resolving needs a note and pushes the
   customer once. The admin order block never includes payable / vendor cost.
+- **Changing a customer's phone needs an OTP to the NEW number** (2026-11-08):
+  `POST /profile/phone/request-change` + `/verify-change`; a taken number is a plain
+  409, the code is bound to the asking customer, the JWT (by id) stays valid, and
+  every change is in `phone_change_history`. Login and this flow share
+  `services/otpDelivery.service.js` — don't add a second OTP path.
 - **Wallet** is shared infrastructure for both customer refunds/credits and
   rider COD reconciliation — see `wallet_ledger` table (owner_type/owner_id
   polymorphic pattern).

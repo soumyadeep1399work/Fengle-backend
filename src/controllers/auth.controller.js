@@ -1,7 +1,7 @@
 const bcrypt = require("bcrypt");
 const db = require("../config/db");
-const { generateOtp, demoOtpFor, hashOtp, verifyOtpHash, getExpiryDate, MAX_ATTEMPTS } = require("../utils/otp");
-const { sendOtpSms } = require("../utils/sms");
+const { verifyOtpHash, MAX_ATTEMPTS } = require("../utils/otp");
+const { issueOtp } = require("../services/otpDelivery.service");
 const { signToken } = require("../utils/jwt");
 
 // Maps an OTP "purpose" to the table we look up / create the user record in.
@@ -46,57 +46,9 @@ async function requestOtp(req, res) {
     if (partner && partner.status === "suspended") return res.status(403).json({ error: ACCOUNT_SUSPENDED });
   }
 
-  const demoOtp = demoOtpFor(phone);
-
-  // Per-PHONE limits (the per-IP ones can't stop someone rotating IPs against one victim's number): a cooldown between codes and
-  // an hourly cap. Each code costs an SMS, and each fresh code resets the 5-guess limit, so unlimited requests would also let
-  // an attacker keep guessing a 6-digit code. Counted from otp_verifications so it survives a restart. Demo phones are exempt
-  // (no SMS is sent for them). Rejected requests above insert no row, so they don't count. Limits read from env on each call.
-  if (!demoOtp) {
-    const cooldown = Number(process.env.OTP_RESEND_COOLDOWN_SECONDS ?? 30);
-    const perHour = Number(process.env.OTP_MAX_REQUESTS_PER_HOUR ?? 6);
-    const recent = await db("otp_verifications")
-      .where({ phone })
-      .whereRaw("created_at > (NOW() - INTERVAL 1 HOUR)")
-      .count({ n: "id" })
-      .first();
-    if (Number(recent.n) >= perHour) {
-      return res.status(429).json({ error: "Too many OTP requests for this number. Please try again in an hour." });
-    }
-    if (cooldown > 0) {
-      const last = await db("otp_verifications")
-        .where({ phone })
-        .whereRaw("created_at > (NOW() - INTERVAL ? SECOND)", [cooldown])
-        .first("id");
-      if (last) {
-        return res.status(429).json({ error: `Please wait ${cooldown} seconds before requesting another OTP.` });
-      }
-    }
-  }
-
-  const otp = demoOtp || generateOtp();
-  const otpHash = await hashOtp(otp);
-
-  await db("otp_verifications").insert({
-    phone,
-    otp_hash: otpHash,
-    purpose,
-    expires_at: getExpiryDate(),
-  });
-
-  // A demo phone's code is fixed and already known to whoever uses it, so
-  // nothing is sent (or logged) for it.
-  if (!demoOtp) {
-    // Caught here (not left to reject) because Express 4 does not forward a
-    // rejected async handler to the error middleware — an SMS provider outage
-    // would otherwise be an unhandled rejection instead of a clean error.
-    try {
-      await sendOtpSms(phone, otp);
-    } catch (err) {
-      console.error(`[otp] SMS send failed for ${phone}:`, err.message);
-      return res.status(502).json({ error: "Could not send the OTP right now. Please try again in a moment." });
-    }
-  }
+  // Per-phone throttling, the stored code and the SMS all live in otpDelivery.service (shared with the change-phone flow).
+  const issued = await issueOtp({ phone, purpose });
+  if (issued.error) return res.status(issued.status).json({ error: issued.error });
 
   return res.json({ message: "OTP sent", expires_in_minutes: 5 });
 }

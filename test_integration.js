@@ -4182,6 +4182,117 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 58: Customer changes their login phone number — OTP to the NEW number, history, no account leaks ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const saved = { otp: process.env.DEMO_LOGIN_OTP, phones: process.env.DEMO_LOGIN_PHONES, rl: process.env.RATE_LIMIT_DISABLED, cap: process.env.PHONE_CHANGE_MAX_PER_HOUR, cool: process.env.OTP_RESEND_COOLDOWN_SECONDS };
+    const DEMO = "654321";
+    const N = (i) => `70000058${String(i).padStart(2, "0")}`; // 10-digit numbers owned by this test
+    process.env.DEMO_LOGIN_OTP = DEMO;
+    process.env.DEMO_LOGIN_PHONES = [N(11), N(12), N(13), N(14), N(15), N(16), N(17), N(18)].join(",");
+    process.env.RATE_LIMIT_DISABLED = "1";
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    try {
+      const [meId] = await db("users").insert({ name: "Phone Changer", phone: N(1), wallet_balance: 0 });
+      const [otherId] = await db("users").insert({ name: "Phone Holder", phone: N(2), wallet_balance: 0 });
+      const [thirdId] = await db("users").insert({ name: "Phone Third", phone: N(3), wallet_balance: 0 });
+      const meTok = signToken({ id: meId, type: "customer" }), otherTok = signToken({ id: otherId, type: "customer" });
+      const reqChange = (tok, phone) => call(tok, "POST", "/profile/phone/request-change", { phone });
+      const verify = (tok, phone, otp) => call(tok, "POST", "/profile/phone/verify-change", { phone, otp });
+      const rows = (phone) => db("otp_verifications").where({ phone, purpose: "phone_change" });
+
+      check("no token -> 401; a rider/restaurant token -> 403", (await call(null, "POST", "/profile/phone/request-change", { phone: N(11) })).status === 401 && (await call(signToken({ id: 1, type: "rider" }), "POST", "/profile/phone/request-change", { phone: N(11) })).status === 403 && (await call(null, "POST", "/profile/phone/verify-change", {})).status === 401);
+
+      // ---- validation + the only thing revealed about other accounts
+      const bads = await Promise.all(["12345", "123456789012", "70000058ab", "", undefined, 7000005811].map((p) => reqChange(meTok, p)));
+      check("an invalid number (too short/long, letters, missing, not a string) is 400 with a readable error", bads.every((r) => r.status === 400 && typeof r.body.error === "string"));
+      const same = await reqChange(meTok, N(1));
+      check("asking for the number they already have is 400", same.status === 400 && /already your number/.test(same.body.error));
+      const taken = await reqChange(meTok, N(2));
+      check("a number another customer already has is 409 'This number is already used by another Fengle account.' — and no OTP is created or sent", taken.status === 409 && taken.body.error === "This number is already used by another Fengle account." && (await rows(N(2))).length === 0);
+      const free = await reqChange(meTok, N(11));
+      check("a free number (a demo number here, so no SMS) -> 200 { message, expires_in_minutes: 5 } with nothing else in the body", free.status === 200 && free.body.message === "OTP sent" && free.body.expires_in_minutes === 5 && Object.keys(free.body).sort().join() === "expires_in_minutes,message");
+      const stored = await rows(N(11));
+      check("the code is stored as a phone_change code for the NEW number, owned by the requesting customer, hashed", stored.length === 1 && stored[0].owner_id === meId && stored[0].verified === 0 && stored[0].otp_hash !== DEMO && stored[0].purpose === "phone_change");
+      check("the phone hasn't changed yet", (await db("users").where({ id: meId }).first()).phone === N(1));
+
+      // ---- verify: wrong / other customer / expired / attempts
+      const wrong = await verify(meTok, N(11), "000000");
+      check("a wrong code is 400 'Incorrect OTP' and counts an attempt", wrong.status === 400 && wrong.body.error === "Incorrect OTP" && (await rows(N(11)))[0].attempt_count === 1);
+      const stolen = await verify(otherTok, N(11), DEMO);
+      check("another customer can't use the code issued to me (400, my number untouched, theirs untouched)", stolen.status === 400 && (await db("users").where({ id: meId }).first()).phone === N(1) && (await db("users").where({ id: otherId }).first()).phone === N(2));
+      check("verify without phone or otp is 400", (await verify(meTok, N(11), undefined)).status === 400 && (await verify(meTok, "abc", DEMO)).status === 400);
+      await db("otp_verifications").where({ phone: N(11), purpose: "phone_change" }).update({ expires_at: new Date(Date.now() - 1000) });
+      const expired = await verify(meTok, N(11), DEMO);
+      check("an expired code is 400 'OTP expired'", expired.status === 400 && /expired/i.test(expired.body.error));
+      await reqChange(meTok, N(11));
+      let last;
+      // (The local MariaDB gives otp_verifications.expires_at a legacy ON UPDATE CURRENT_TIMESTAMP, so every attempt_count bump would
+      // expire the code; production's MySQL 8 doesn't. Re-extending the expiry after each guess keeps this test about attempts only.)
+      const extend = () => db("otp_verifications").where({ phone: N(11), purpose: "phone_change" }).update({ expires_at: new Date(Date.now() + 5 * 60 * 1000) });
+      for (let i = 0; i < 5; i++) { last = await verify(meTok, N(11), "111111"); await extend(); }
+      const locked = await verify(meTok, N(11), DEMO);
+      check("after 5 wrong guesses even the right code is refused (429 'Too many attempts')", last.status === 400 && locked.status === 429 && /Too many attempts/.test(locked.body.error));
+
+      // ---- success
+      await reqChange(meTok, N(12));
+      const ok = await verify(meTok, N(12), DEMO);
+      check("the right code -> 200 { profile } with the new phone (same shape as GET /profile/me)", ok.status === 200 && ok.body.profile.id === meId && ok.body.profile.phone === N(12) && ok.body.profile.name === "Phone Changer" && "wallet_balance" in ok.body.profile && Object.keys(ok.body).join() === "profile");
+      check("users.phone is updated, and exactly one phone_change_history row records old -> new", (await db("users").where({ id: meId }).first()).phone === N(12) && JSON.stringify((await db("phone_change_history").where({ customer_id: meId })).map((h) => [h.old_phone, h.new_phone])) === JSON.stringify([[N(1), N(12)]]));
+      const stillIn = await call(meTok, "GET", "/profile/me");
+      check("the existing session token keeps working (it identifies the customer by id) and shows the new number", stillIn.status === 200 && stillIn.body.profile.phone === N(12));
+      const reuse = await verify(meTok, N(12), DEMO);
+      check("the code is consumed: using it again is 400", reuse.status === 400);
+      await call(null, "POST", "/auth/otp/request", { phone: N(12), purpose: "login" });
+      const login = await call(null, "POST", "/auth/otp/verify", { phone: N(12), otp: DEMO, purpose: "login" });
+      check("logging in with the NEW number reaches the SAME account (no duplicate customer)", login.status === 200 && login.body.user.id === meId && login.body.user.phone === N(12));
+      const oldLogin = await call(null, "POST", "/auth/otp/request", { phone: N(1), purpose: "login" });
+      check("the old number is free again for anyone (it no longer maps to this account)", oldLogin.status === 200 && !(await db("users").where({ phone: N(1) }).first()));
+      check("PATCH /profile/me still can't change the phone", (await call(meTok, "PATCH", "/profile/me", { name: "Phone Changer", phone: N(15) })).body.profile.phone === N(12));
+
+      // ---- taken in the meantime (race): the users.phone unique key decides
+      await reqChange(meTok, N(13));
+      await db("users").where({ id: thirdId }).update({ phone: N(13) }); // someone else registers it before the code is entered
+      const raced = await verify(meTok, N(13), DEMO);
+      check("if the number got taken before verifying: 409 and the account keeps its number", raced.status === 409 && raced.body.error === "This number is already used by another Fengle account." && (await db("users").where({ id: meId }).first()).phone === N(12));
+
+      // ---- limits
+      process.env.PHONE_CHANGE_MAX_PER_HOUR = "2";
+      const before = Number((await db("otp_verifications").where({ purpose: "phone_change", owner_id: meId }).whereRaw("created_at > (NOW() - INTERVAL 1 HOUR)").count({ n: "id" }).first()).n);
+      process.env.PHONE_CHANGE_MAX_PER_HOUR = String(before + 1);
+      const okOne = await reqChange(meTok, N(14));
+      const capped = await reqChange(meTok, N(15));
+      check("a customer's own hourly cap on change requests (PHONE_CHANGE_MAX_PER_HOUR) is 429", okOne.status === 200 && capped.status === 429 && /Too many attempts to change your number/.test(capped.body.error));
+      process.env.PHONE_CHANGE_MAX_PER_HOUR = "100";
+      process.env.OTP_RESEND_COOLDOWN_SECONDS = "30";
+      const realNumber = "7000005899"; // not a demo number: the shared per-phone SMS cooldown applies
+      const r1 = await reqChange(otherTok, realNumber);
+      const r2 = await reqChange(otherTok, realNumber);
+      check("a non-demo number shares the login OTP cooldown: a second request within 30 s is 429", r1.status === 200 && r2.status === 429 && /wait 30 seconds/.test(r2.body.error));
+
+      // ---- support trace
+      const [adminId] = await db("admins").insert({ name: "phone-support", email: "phone-support@phone.test", password_hash: await bcrypt.hash("a-long-password-1", 4), role: "support" });
+      const adm = await call(signToken({ id: adminId, type: "admin" }), "GET", `/admin/customers/${meId}`);
+      check("the admin customer detail shows phone_changes (old -> new, newest first) to every role", adm.status === 200 && adm.body.phone_changes.length === 1 && adm.body.phone_changes[0].old_phone === N(1) && adm.body.phone_changes[0].new_phone === N(12) && !!adm.body.phone_changes[0].created_at);
+      check("a customer with no changes has an empty phone_changes list", (await call(signToken({ id: adminId, type: "admin" }), "GET", `/admin/customers/${otherId}`)).body.phone_changes.length === 0);
+    } finally {
+      const restore = (k, v) => { if (v === undefined) delete process.env[k]; else process.env[k] = v; };
+      restore("DEMO_LOGIN_OTP", saved.otp); restore("DEMO_LOGIN_PHONES", saved.phones); restore("RATE_LIMIT_DISABLED", saved.rl); restore("PHONE_CHANGE_MAX_PER_HOUR", saved.cap); restore("OTP_RESEND_COOLDOWN_SECONDS", saved.cool);
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@phone.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

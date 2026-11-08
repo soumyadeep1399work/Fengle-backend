@@ -102,7 +102,10 @@ async function getCustomer(req, res) {
   const orders = await listOrdersForOwner("customer_id", id);
   const ledger = await wallet.getHistory("customer", id, { limit: 200 });
 
-  res.json({ customer: serializeCustomerRow(row), orders, wallet_ledger: ledger });
+  // Old -> new login numbers, newest first, so support can trace an account whose phone changed.
+  const phone_changes = await db("phone_change_history").where({ customer_id: id }).orderBy("id", "desc").select("old_phone", "new_phone", "created_at");
+
+  res.json({ customer: serializeCustomerRow(row), orders, wallet_ledger: ledger, phone_changes });
 }
 
 /** PATCH /admin/customers/:id  body: { status: 'active'|'blocked' } */

@@ -1,5 +1,6 @@
 const db = require("../config/db");
 const { CUSTOMER_TERMS_VERSION, customerAgreementRequired } = require("../utils/customerTerms");
+const { issueOtp, checkOtp } = require("../services/otpDelivery.service");
 
 const DEFAULT_NOTIFICATION_PREFS = { order_updates: true, promotions: true };
 
@@ -42,6 +43,62 @@ async function updateMyProfile(req, res) {
   }
 
   await db("users").where({ id: req.auth.id }).update(updates);
+  const row = await db("users").where({ id: req.auth.id }).first();
+  res.json({ profile: serializeProfile(row) });
+}
+
+const PHONE_TAKEN = "This number is already used by another Fengle account.";
+const isPhone = (v) => typeof v === "string" && /^\d{10}$/.test(v); // same rule as login
+
+/**
+ * POST /profile/phone/request-change { phone } -> 200 { message, expires_in_minutes }
+ * Step 1 of changing the number a customer logs in with: an OTP goes to the NEW number (proof they own it). 400 for an invalid
+ * number or their current one, 409 if another customer already has it (the only thing revealed about other accounts), 429 on the
+ * shared per-phone SMS limits or this customer's own hourly cap (PHONE_CHANGE_MAX_PER_HOUR, default 5).
+ */
+async function requestPhoneChange(req, res) {
+  const { phone } = req.body || {};
+  if (!isPhone(phone)) return res.status(400).json({ error: "A valid 10-digit phone number is required" });
+  const me = await db("users").where({ id: req.auth.id }).select("phone").first();
+  if (!me) return res.status(404).json({ error: "Profile not found" });
+  if (me.phone === phone) return res.status(400).json({ error: "That is already your number" });
+  if (await db("users").where({ phone }).first("id")) return res.status(409).json({ error: PHONE_TAKEN });
+
+  const perHour = Number(process.env.PHONE_CHANGE_MAX_PER_HOUR ?? 5);
+  const mine = await db("otp_verifications").where({ purpose: "phone_change", owner_id: req.auth.id }).whereRaw("created_at > (NOW() - INTERVAL 1 HOUR)").count({ n: "id" }).first();
+  if (Number(mine.n) >= perHour) return res.status(429).json({ error: "Too many attempts to change your number. Please try again in an hour." });
+
+  const issued = await issueOtp({ phone, purpose: "phone_change", ownerId: req.auth.id });
+  if (issued.error) return res.status(issued.status).json({ error: issued.error });
+  res.json({ message: "OTP sent", expires_in_minutes: 5 });
+}
+
+/**
+ * POST /profile/phone/verify-change { phone, otp } -> 200 { profile }
+ * Step 2: the code sent to the new number. Updates users.phone, writes phone_change_history (old -> new) and consumes the code.
+ * The session token identifies the customer by id, so it stays valid and no new token is issued. 400 wrong/expired code,
+ * 409 if the number was taken in the meantime (the users.phone unique key decides races).
+ */
+async function verifyPhoneChange(req, res) {
+  const { phone, otp } = req.body || {};
+  if (!isPhone(phone) || !otp) return res.status(400).json({ error: "phone and otp are required" });
+  const checked = await checkOtp({ phone, purpose: "phone_change", otp, ownerId: req.auth.id });
+  if (checked.error) return res.status(checked.status).json({ error: checked.error });
+
+  try {
+    await db.transaction(async (trx) => {
+      const me = await trx("users").where({ id: req.auth.id }).forUpdate().first();
+      if (!me) throw Object.assign(new Error("Profile not found"), { status: 404 });
+      if (me.phone !== phone) {
+        await trx("users").where({ id: req.auth.id }).update({ phone });
+        await trx("phone_change_history").insert({ customer_id: req.auth.id, old_phone: me.phone, new_phone: phone });
+      }
+      await trx("otp_verifications").where({ purpose: "phone_change", owner_id: req.auth.id, verified: false }).update({ verified: true });
+    });
+  } catch (err) {
+    if (err && err.code === "ER_DUP_ENTRY") return res.status(409).json({ error: PHONE_TAKEN });
+    throw err;
+  }
   const row = await db("users").where({ id: req.auth.id }).first();
   res.json({ profile: serializeProfile(row) });
 }
@@ -110,4 +167,4 @@ async function acceptAgreement(req, res) {
   res.json({ agreementAcceptedAt: acceptedAt.toISOString() });
 }
 
-module.exports = { getMyProfile, updateMyProfile, updatePreferences, setDefaultAddress, acceptAgreement };
+module.exports = { getMyProfile, updateMyProfile, requestPhoneChange, verifyPhoneChange, updatePreferences, setDefaultAddress, acceptAgreement };

@@ -628,6 +628,16 @@ Customers file complaints that get a reference number; any admin role works them
 - `GET /admin/support-tickets/:id` → `{ ticket, customer: { id, name, phone }, order: { id, status, total, payment_method, payment_status, restaurant: { id, name }, categories: [name], placed_at } | null }`. The order block never carries the kitchen payable or vendor cost.
 - `PATCH /admin/support-tickets/:id { status?, resolution_note? }` → `{ ticket }`. `resolution_note` (≤ 1000 chars) is **required to resolve** (400 otherwise; a note already stored counts). Becoming `resolved` stamps `resolved_by` / `resolved_at` and **pushes the customer once** ("Your complaint FSP-000123 is resolved", `data: { type: "support", ticket_id }`, honouring the customer's order-updates toggle). Editing the note of an already-resolved ticket doesn't push again; moving back to `open` / `in_progress` clears the stamp.
 
+## Changing the login phone number (added 2026-11-08)
+
+The phone is the customer's login identity, so a new number is proved with an OTP sent to **that number**. Customer token. The session token identifies the customer by **id**, so it stays valid after the change and no new token is issued.
+
+- `POST /profile/phone/request-change { phone }` → **200 `{ message: "OTP sent", expires_in_minutes: 5 }`**. `phone` is a 10-digit string (same rule as login). 400 for an invalid number or the customer's current one; **409** `{ error: "This number is already used by another Fengle account." }` if another customer has it (the only thing revealed about other accounts; no code is created or sent); **429** on the shared per-phone SMS limits (30 s cooldown, 6 per hour per number — the same counters as login) or this customer's own cap (`PHONE_CHANGE_MAX_PER_HOUR`, default 5). Demo numbers follow the login demo rules (fixed code, no SMS). Also behind the per-IP OTP limiter.
+- `POST /profile/phone/verify-change { phone, otp }` → **200 `{ profile }`** (the `GET /profile/me` shape with the new phone). 400 wrong or expired code or none pending, 429 after 5 wrong guesses, **409** if the number was taken in the meantime (the unique key on `users.phone` decides). A code is bound to the customer who asked (`otp_verifications.owner_id`), so another customer can't use it; it is consumed on success.
+- `PATCH /profile/me` still ignores `phone`.
+- Trace: every change writes `phone_change_history` (old → new). `GET /admin/customers/:id` returns `phone_changes: [{ old_phone, new_phone, created_at }]` newest first, to every admin role.
+- Implementation: OTP issuing/checking is shared with login in `services/otpDelivery.service.js`.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**
