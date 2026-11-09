@@ -18,13 +18,18 @@ const ITEM_COLUMNS = ["items.id", "items.name", "items.description", "items.pric
 /**
  * Restaurants within catalog-visibility range of a location, optionally
  * narrowed to ones serving a specific category. Shared by every
- * location-filtered catalog read (category items, category detail, search)
- * so they all agree on what "nearby" means.
+ * location-filtered catalog read (category items, category detail, search,
+ * popular, deals, the category list) so they all agree on what "nearby" means.
+ *
+ * A kitchen the owner has switched OFFLINE (restaurants.is_online) is not "nearby" at all: its menu is hidden from customers everywhere, and a
+ * category that only offline kitchens carry disappears. A kitchen that is only outside its service HOURS stays visible (its category shows
+ * `closed` with `opens_at`): the client chose that for scheduled closing, but an owner who takes the kitchen offline wants it gone.
  */
 async function getInRangeRestaurants(lat, lng, categoryId) {
   let query = db("restaurants")
     .where("restaurants.status", "active")
     .andWhere("restaurants.verification_status", "approved")
+    .andWhere("restaurants.is_online", true)
     .modify((qb) => applyDocumentsGate(qb, "restaurants.documents_valid_until"));
   if (categoryId) {
     query = query

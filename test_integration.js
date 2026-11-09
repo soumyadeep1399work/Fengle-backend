@@ -4445,6 +4445,9 @@ async function main() {
       const candAll = await routing.findCandidates({ items: [{ itemId: dish, categoryId: cat }], customerLat: LAT, customerLng: LNG, includeClosed: true });
       check("routing skips the offline nearest kitchen by default (it is listed with includeClosed)", candDefault.length === 1 && candDefault[0].restaurant.id === kFar && candAll.length === 2 && candAll[0].restaurant.id === kNear);
       const q1 = await quote();
+      const partlyOffline = await call(null, "GET", `/categories/${cat}/items?lat=${LAT}&lng=${LNG}`);
+      const catsPartly = (await call(null, "GET", `/categories?lat=${LAT}&lng=${LNG}`)).body.categories.find((c) => c.id === cat);
+      check("with the nearest kitchen offline but another one online, the dish is still offered (from the online kitchen) and the category is open", partlyOffline.body.items.length === 1 && partlyOffline.body.closed === false && !!catsPartly && catsPartly.closed === false);
       check("quote with the nearest offline but another online: still valid (priced from the online one)", q1.body.valid === true && q1.body.unavailable_reason === null);
       const p2 = await call(custTok, "POST", "/orders", orderBody);
       check("a new order goes to the online kitchen", p2.status === 201 && p2.body.order.restaurant_id === kFar);
@@ -4456,11 +4459,13 @@ async function main() {
       await setOnline(farTok, false);
       const cats = await call(null, "GET", `/categories?lat=${LAT}&lng=${LNG}`);
       const c1 = cats.body.categories.find((c) => c.id === cat);
-      check("catalog: a category whose only kitchens are offline shows closed:true with opens_at null (and is not hidden)", !!c1 && c1.closed === true && c1.opens_at === null);
+      check("catalog: a category that only OFFLINE kitchens carry disappears from the customer's category list (the owner switched it off, so its menu is hidden)", !c1);
       const items1 = await call(null, "GET", `/categories/${cat}/items?lat=${LAT}&lng=${LNG}`);
-      check("items endpoint likewise: items still listed, closed:true, opens_at null", items1.body.items.length === 1 && items1.body.closed === true && items1.body.opens_at === null);
+      check("the items endpoint lists none of an offline kitchen's dishes", items1.status === 200 && items1.body.items.length === 0);
       const detail1 = await call(null, "GET", `/categories/${cat}?lat=${LAT}&lng=${LNG}`);
-      check("category detail carries closed:true, opens_at null", detail1.body.category.closed === true && detail1.body.category.opens_at === null);
+      check("category detail has no dishes either", detail1.status === 200 && detail1.body.sections.flatMap((s) => s.items).length === 0);
+      const hiddenElsewhere = await Promise.all([call(null, "GET", `/items/search?q=Switch&lat=${LAT}&lng=${LNG}`), call(null, "GET", `/items/popular?lat=${LAT}&lng=${LNG}`), call(null, "GET", `/items/deals?lat=${LAT}&lng=${LNG}`)]);
+      check("search, popular and deals hide an offline kitchen's dish too", hiddenElsewhere.every((r) => r.status === 200 && !JSON.stringify(r.body.items || []).includes("Switch Dish")));
       const qc = await quote();
       check("quote: valid:false, delivery_available:false, unavailable_reason kitchen_closed, opens_at null, reason \"This kitchen isn't taking orders right now.\" (still priced, clubbable)",
         qc.body.valid === false && qc.body.delivery_available === false && qc.body.unavailable_reason === "kitchen_closed" && qc.body.opens_at === null && qc.body.reason === "This kitchen isn't taking orders right now." && qc.body.clubbable === true && qc.body.grandTotal > 0);
