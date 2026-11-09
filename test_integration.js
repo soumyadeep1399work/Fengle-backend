@@ -692,12 +692,17 @@ async function main() {
   check("rider's GET /orders/:id HAS the restaurant's name, address and coordinates",
     asRider.body.order.restaurant_name === restaurantRow.name && asRider.body.order.restaurant_address === restaurantRow.address &&
     Number(asRider.body.order.restaurant_lat) === Number(restaurantRow.lat) && Number(asRider.body.order.restaurant_lng) === Number(restaurantRow.lng));
-  check("rider's GET /orders/:id ALSO now has the customer's phone (rider->customer calling)", asRider.body.order.customer_phone === contactCustomerRow.phone);
+  check("rider's GET /orders/:id has NO customer phone before pickup (details are shown after pickup, 2026-11-09), but says so: customer_details_visible false", asRider.body.order.customer_phone === null && asRider.body.order.customer_details_visible === false);
 
   const listRider = fakeRes();
   await orderController.listMyOrders(fakeReq({}, {}, { id: riderForContact, type: "rider" }), listRider);
   check("rider's GET /orders list HAS the restaurant contact fields", listRider.body.orders.find((o) => o.id === contactOrderId).restaurant_name === restaurantRow.name);
-  check("rider's GET /orders list ALSO has the customer's phone on the row", listRider.body.orders.find((o) => o.id === contactOrderId).customer_phone === contactCustomerRow.phone);
+  check("rider's GET /orders list row has no customer phone before pickup either", listRider.body.orders.find((o) => o.id === contactOrderId).customer_phone === null);
+  await db("orders").where({ id: contactOrderId }).update({ status: "picked_up" });
+  const asRiderPicked = fakeRes();
+  await orderController.getOrder(fakeReq({}, { id: contactOrderId }, { id: riderForContact, type: "rider" }), asRiderPicked);
+  check("once the order is picked up the rider's read HAS the customer's phone (rider->customer calling)", asRiderPicked.body.order.customer_phone === contactCustomerRow.phone && asRiderPicked.body.order.customer_details_visible === true);
+  await db("orders").where({ id: contactOrderId }).update({ status: "accepted" });
 
   const riderCtl = require("./src/controllers/rider.controller");
   const assignedRes = fakeRes();
@@ -5679,6 +5684,129 @@ async function main() {
       await new Promise((resolve) => server.close(resolve));
       await db("admins").where("email", "like", "%@road.test").delete();
       await db("route_cache").delete();
+    }
+  }
+
+  console.log("\n--- Test 70: Delivery details — building / landmark / instructions, and the customer's details hidden from the rider until pickup ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) }, body: body !== undefined ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    const savedRiders = await db("riders").select("id", "status");
+    await db("riders").update({ status: "inactive" });
+    try {
+      await db("orders").whereIn("status", ["placed", "accepted"]).update({ status: "cancelled" });
+      const LAT = 23.85, LNG = 89.65;
+      const ADDRESS = "Flat 7C, Green Heights Apartments, Plot 21, Action Area 2, New Town, Kolkata 700156";
+      const NAME = "Deliveree Secretname", PHONE = "8000007001", BUILDING = "Flat 7C, Tower B, 3rd floor", LANDMARK = "Opposite the blue water tank", INSTR = "Ring twice and leave with the guard";
+      const [cat] = await db("categories").insert({ name: "Details Category" });
+      const [dish] = await db("items").insert({ category_id: cat, name: "Details Dish", price: 200, created_by_type: "admin" });
+      const [kit] = await db("restaurants").insert({ name: "Details Kitchen", phone: "8600007001", address: "Newtown", lat: LAT + 0.01, lng: LNG, radius_km: 5, status: "active" });
+      await db("restaurant_categories").insert({ restaurant_id: kit, category_id: cat });
+      await db("restaurant_items").insert({ restaurant_id: kit, item_id: dish, is_available: true });
+      const [rider] = await db("riders").insert({ name: "Details Rider", phone: "8500007001", status: "active", wallet_balance: 0, last_known_lat: LAT + 0.011, last_known_lng: LNG });
+      const [cust] = await db("users").insert({ name: NAME, phone: PHONE, wallet_balance: 0 });
+      const custTok = signToken({ id: cust, type: "customer" }), kitTok = signToken({ id: kit, type: "restaurant" }), riderTok = signToken({ id: rider, type: "rider" });
+      const [adminId] = await db("admins").insert({ name: "details-support", email: "details-support@details.test", password_hash: await bcrypt.hash("a-long-password-1", 4), role: "support" });
+      const adminTok = signToken({ id: adminId, type: "admin" });
+      const body = (extra = {}) => ({ items: [{ item_id: dish, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG, delivery_address: ADDRESS, payment_method: "cod", ...extra });
+      const place = (extra) => call(custTok, "POST", "/orders", body(extra));
+
+      // ---- input
+      const tooLong = await Promise.all([place({ delivery_building: "b".repeat(121) }), place({ delivery_landmark: "l".repeat(121) }), place({ delivery_instructions: "i".repeat(251) }), place({ delivery_building: 42 }), place({ delivery_instructions: ["x"] })]);
+      check("a too-long building / landmark / instructions, or a non-text value, is 400 with a readable error and nothing is created", tooLong.every((r) => r.status === 400 && typeof r.body.error === "string") && (await db("orders").where({ customer_id: cust }).count({ n: "*" }).first()).n === 0);
+      const old = await place();
+      check("an old-style order with none of the new fields keeps working: they are null", old.status === 201 && old.body.order.delivery_building === null && old.body.order.delivery_landmark === null && old.body.order.delivery_instructions === null);
+      await db("orders").where({ id: old.body.order.id }).update({ status: "cancelled" });
+      const blank = await place({ delivery_building: "   ", delivery_landmark: "", delivery_instructions: null });
+      check("blank, empty and null fields all become null", blank.status === 201 && blank.body.order.delivery_building === null && blank.body.order.delivery_landmark === null && blank.body.order.delivery_instructions === null);
+      await db("orders").where({ id: blank.body.order.id }).update({ status: "cancelled" });
+      const placed = await place({ delivery_building: `  ${BUILDING}  `, delivery_landmark: LANDMARK, delivery_instructions: INSTR });
+      const o1 = placed.body.order;
+      check("the three fields are stored trimmed, and the customer's own response carries them", placed.status === 201 && o1.delivery_building === BUILDING && o1.delivery_landmark === LANDMARK && o1.delivery_instructions === INSTR);
+      const custRead = await call(custTok, "GET", `/orders/${o1.id}`);
+      const custList = await call(custTok, "GET", "/orders");
+      check("the customer's own order read and list have them too", custRead.body.order.delivery_building === BUILDING && custRead.body.order.delivery_instructions === INSTR && custList.body.orders.find((o) => o.id === o1.id).delivery_landmark === LANDMARK);
+
+      // ---- a kitchen never gets them, and sees the address exactly as before
+      const kitRead = await call(kitTok, "GET", `/orders/${o1.id}`);
+      const kitList = await call(kitTok, "GET", "/orders");
+      check("kitchens never get the building, landmark, instructions, customer name or phone — and still see delivery_address as before",
+        kitRead.status === 200 && kitRead.body.order.delivery_address === ADDRESS && ![kitRead.text, kitList.text].some((x) => /delivery_building|delivery_landmark|delivery_instructions|customer_name|customer_phone/.test(x) || x.includes(BUILDING) || x.includes(LANDMARK) || x.includes(INSTR) || x.includes(NAME) || x.includes(PHONE)));
+
+      // ---- before pickup: the rider sees the AREA only
+      await call(kitTok, "POST", `/orders/${o1.id}/accept`, {}); await sleep(250);
+      const area = (await require("./src/services/orderNotifications.service").shortArea(ADDRESS));
+      const reads = async () => ({
+        one: await call(riderTok, "GET", `/orders/${o1.id}`),
+        list: await call(riderTok, "GET", "/orders"),
+        assigned: await call(riderTok, "GET", "/riders/me/orders"),
+      });
+      const rowsOf = (r) => ({ one: r.one.body.order, list: r.list.body.orders.find((o) => o.id === o1.id), assigned: r.assigned.body.orders.find((o) => o.id === o1.id) });
+      const hidden = await reads();
+      const h = rowsOf(hidden);
+      check("the order is assigned to the rider", (await db("orders").where({ id: o1.id }).first()).rider_id === rider && !!h.one && !!h.list && !!h.assigned);
+      check("BEFORE pickup, through ALL THREE rider reads: delivery_address is the short area, delivery_area is set, customer_details_visible is false",
+        Object.values(h).every((o) => o.delivery_address === area && o.delivery_area === area && o.customer_details_visible === false));
+      check("…the coordinates are rounded to 2 decimals (about 1 km), so an old rider app still computes a sane distance", Object.values(h).every((o) => Number(o.delivery_lat) === Number(LAT.toFixed(2)) && Number(o.delivery_lng) === Number(LNG.toFixed(2))));
+      check("…and the customer's phone, name, building, landmark and instructions are null on every read",
+        Object.values(h).every((o) => o.customer_phone === null && o.customer_name === null && o.delivery_building === null && o.delivery_landmark === null && o.delivery_instructions === null));
+      const leakText = hidden.one.text + hidden.list.text + hidden.assigned.text;
+      check("the full address, the phone, the customer's name, the landmark, the building and the instructions appear NOWHERE in those three responses",
+        ![ADDRESS, PHONE, NAME, LANDMARK, BUILDING, INSTR, "Flat 7C"].some((secret) => leakText.includes(secret)));
+      check("the rider's own earnings view still works before pickup: the estimated payout and the road distance are there (computed from the real coordinates)", typeof h.one.estimated_rider_payout === "number" && h.one.route_source !== undefined);
+      check("GET /riders/me/orders no longer carries the delivery code or the kitchen's payable (it used to return the raw order row)", !/delivery_otp|restaurant_payable|payable_estimated|delivery_fee_breakdown/.test(hidden.assigned.text));
+
+      // ---- after pickup: full details
+      await call(riderTok, "POST", `/orders/${o1.id}/picked-up`, {});
+      const shown = rowsOf(await reads());
+      check("AFTER pickup, all three rider reads carry the full address, exact coordinates, phone, name, building, landmark and instructions, with customer_details_visible true",
+        Object.values(shown).every((o) => o.delivery_address === ADDRESS && Number(o.delivery_lat) === LAT && Number(o.delivery_lng) === LNG && o.customer_phone === PHONE && o.customer_name === NAME && o.delivery_building === BUILDING && o.delivery_landmark === LANDMARK && o.delivery_instructions === INSTR && o.customer_details_visible === true));
+      await call(riderTok, "POST", `/orders/${o1.id}/on-the-way`, {});
+      const stillShown = rowsOf(await reads());
+      check("and still while on the way", Object.values(stillShown).every((o) => o.customer_details_visible === true && o.customer_phone === PHONE && o.delivery_address === ADDRESS));
+      const reach = await call(riderTok, "POST", `/orders/${o1.id}/reached-customer`, { lat: LAT, lng: LNG, accuracy_m: 5 });
+      check("server-side logic keeps using the REAL coordinates: 'reached customer' at the exact drop-off is a few metres away, not manual", reach.status === 200 && reach.body.arrival.distance_m < 20 && reach.body.arrival.manual === false);
+
+      // ---- delivered: hidden again, and the delivered flow (OTP + COD) is unaffected
+      const row = await db("orders").where({ id: o1.id }).first();
+      const delivered = await call(riderTok, "POST", `/orders/${o1.id}/delivered`, { delivery_otp: row.delivery_otp, cod_amount_collected: Number(row.grand_total) });
+      check("the delivered flow still works: OTP + COD amount", delivered.status === 200 && (await db("orders").where({ id: o1.id }).first()).status === "delivered");
+      const after = await reads();
+      const a = rowsOf(after);
+      const afterText = after.one.text + after.list.text;
+      check("AFTER delivery the details are hidden again on the rider's reads (history shows the area only)",
+        a.one.delivery_address === area && a.one.customer_details_visible === false && a.one.customer_phone === null && a.one.customer_name === null && a.list.delivery_address === area && a.list.customer_phone === null && ![ADDRESS, PHONE, NAME, LANDMARK, INSTR].some((x) => afterText.includes(x)));
+      check("the rider's earnings are untouched by the masking: the frozen payout is on the delivered order", typeof a.one.rider_payout === "number" && a.one.rider_payout > 0);
+
+      // ---- admin sees everything in full
+      const adm = await call(adminTok, "GET", `/admin/orders/${o1.id}`);
+      check("admin order detail shows the delivery address, building, landmark and instructions in full, with the customer's name and phone",
+        adm.status === 200 && adm.body.order.delivery_address === ADDRESS && adm.body.order.delivery_building === BUILDING && adm.body.order.delivery_landmark === LANDMARK && adm.body.order.delivery_instructions === INSTR && adm.body.customer.name === NAME && adm.body.customer.phone === PHONE);
+
+      // ---- reorder carries the details when it is the same place
+      await db("orders").where({ id: o1.id }).update({ restaurant_rating_skipped: true });
+      const re1 = await call(custTok, "POST", `/orders/${o1.id}/reorder`, { delivery_lat: LAT, delivery_lng: LNG, delivery_address: ADDRESS, payment_method: "cod" });
+      check("reorder to the same place reuses the original's building, landmark and instructions", re1.status === 201 && re1.body.order.delivery_building === BUILDING && re1.body.order.delivery_landmark === LANDMARK && re1.body.order.delivery_instructions === INSTR);
+      await db("orders").where({ id: re1.body.order.id }).update({ status: "cancelled" });
+      const re2 = await call(custTok, "POST", `/orders/${o1.id}/reorder`, { delivery_lat: LAT + 0.005, delivery_lng: LNG, delivery_address: "A different place, New Town", payment_method: "cod" });
+      check("reorder to a DIFFERENT place does not carry them over", re2.status === 201 && re2.body.order.delivery_building === null && re2.body.order.delivery_instructions === null);
+      await db("orders").where({ id: re2.body.order.id }).update({ status: "cancelled" });
+      const re3 = await call(custTok, "POST", `/orders/${o1.id}/reorder`, { delivery_lat: LAT, delivery_lng: LNG, delivery_address: ADDRESS, payment_method: "cod", delivery_building: "New flat 9", delivery_instructions: "" });
+      check("fields sent with the reorder win (an empty string clears one)", re3.status === 201 && re3.body.order.delivery_building === "New flat 9" && re3.body.order.delivery_instructions === null && re3.body.order.delivery_landmark === LANDMARK);
+    } finally {
+      for (const r of savedRiders) await db("riders").where({ id: r.id }).update({ status: r.status });
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@details.test").delete();
     }
   }
 

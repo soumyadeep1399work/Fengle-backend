@@ -5,6 +5,9 @@ const { CURRENT_AGREEMENT_VERSION, agreementRequired } = require("../utils/agree
 const storage = require("../services/storage.service");
 const partnerDocuments = require("../services/partnerDocuments.service");
 const riderDispatch = require("../services/riderDispatch.service");
+const riderArrival = require("../services/riderArrival.service");
+const customerDetails = require("../services/customerDetails.service");
+const { stripInternalOrderFields } = require("../utils/orderPrivacy");
 
 const VEHICLE_TYPES = ["bike", "scooter", "bicycle", "car"];
 
@@ -203,7 +206,17 @@ async function getMyAssignedOrders(req, res) {
       "restaurants.name as restaurant_name", "restaurants.address as restaurant_address",
       "restaurants.lat as restaurant_lat", "restaurants.lng as restaurant_lng"
     );
-  res.json({ orders });
+  // The same privacy as every other order read: no internal settlement fields and never the delivery code, and the customer's details only
+  // once the order is picked up (customerDetails.forRider: before that, the area only).
+  const customerIds = [...new Set(orders.map((o) => o.customer_id))];
+  const customers = customerIds.length ? await db("users").whereIn("id", customerIds).select("id", "name", "phone") : [];
+  const customerById = Object.fromEntries(customers.map((c) => [c.id, c]));
+  res.json({
+    orders: orders.map((o) => {
+      const { delivery_otp, ...visible } = stripInternalOrderFields(o);
+      return { ...visible, ...riderArrival.visibleTo(o, "rider"), ...customerDetails.forRider(o, customerById[o.customer_id]) };
+    }),
+  });
 }
 
 module.exports = { getMyProfile, putBankAccount, updateMyProfile, getMyRate, setAvailability, updateLocation, getMyAssignedOrders, acceptRiderAgreement };

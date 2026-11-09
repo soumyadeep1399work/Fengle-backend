@@ -730,6 +730,17 @@ The trip **kitchen -> drop-off** is measured by **road** (Google Routes API), on
 - **Server env**: `GOOGLE_ROUTES_API_KEY` (a Google Cloud key with the **Routes API** enabled and billing on; separate from the geocoding `GOOGLE_MAPS_API_KEY`), optional `ROUTE_FALLBACK_FACTOR`, `ROUTE_API_TIMEOUT_MS`.
 - **Pricing consequence**: a road is longer than the straight line (roughly 20-40% in a city), so with the key set delivery fees and rider pay rise accordingly; the shipping rules themselves are unchanged.
 
+## Delivery details, and what a rider may see before pickup (added 2026-11-09)
+
+- **New optional fields** on `POST /orders` (and on `POST /orders/:id/reorder`): `delivery_building` (flat / house no., building, floor; <= 120), `delivery_landmark` (<= 120), `delivery_instructions` (<= 250). Trimmed; blank, empty or `null` = null; not text or too long = **400** `{ error }`. `delivery_address` stays the **map address**. Older customer apps keep merging that text into `delivery_address` and send none of these: that keeps working (unknown fields are simply ignored by an older server). Reorder: fields sent with the request win (an empty string clears one); if it sends none and the drop-off is the same place as the original order, the original's are reused, otherwise they are null. Stored on `orders`.
+- **Who sees them**: the **customer** (their own order responses, including the `POST /orders` response, `GET /orders`, `GET /orders/:id`), **admin** (`GET /admin/orders/:id`, in full, with the customer's name and phone), and a **rider only after pickup**. A **kitchen never gets them** (nor the customer's name or phone) and still sees `delivery_address` exactly as before.
+- **Rider reads** (`GET /orders`, `GET /orders/:id`, `GET /riders/me/orders`) are gated by the order's status, server-side:
+  - **before pickup** (`accepted`, and again once `delivered` or `cancelled`): `delivery_address` is the **area only** (the end of the address: locality, city, pin, at most about 40 characters, `…` prefix when cut; the same text as the push), `delivery_lat` / `delivery_lng` rounded to **2 decimals (~1 km)**, and `customer_phone`, `customer_name`, `delivery_building`, `delivery_landmark`, `delivery_instructions` are **null**. Always present: `delivery_area` (the short area) and `customer_details_visible: false`.
+  - **`picked_up` / `on_the_way`**: the full `delivery_address`, exact `delivery_lat` / `delivery_lng`, `customer_phone`, `customer_name` (may be null), the three delivery fields, and `customer_details_visible: true`.
+  - Server-side logic (the road distance, the arrival distance, the OTP check, COD, payouts) always uses the **real** coordinates. A rider's earnings and history are unaffected.
+- **Fixed in passing**: `GET /riders/me/orders` used to return the raw order row; it now goes through the same privacy as every other order read (no delivery code, no kitchen payable or other internal fields).
+- **Behaviour change**: the rider could previously call the customer as soon as the order was assigned; now the customer's phone is shown only from pickup.
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**

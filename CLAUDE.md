@@ -58,8 +58,11 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   self-serve — this asymmetry is intentional, don't "fix" it.)
 - **Rider can see restaurant name/location. Customer never can.** This
   permission reversal is intentional.
-- **Calling works both ways once a rider is assigned** (customer→rider
-  shipped earlier; rider→customer added 2026-09-30): `GET /orders/:id` and
+- **Calling works both ways** (customer→rider once a rider is assigned;
+  rider→customer added 2026-09-30, but since **2026-11-09 only from PICKUP**: before
+  that the rider gets the area only and the customer's phone/name/building/landmark/
+  instructions are null, gated server-side by `services/customerDetails.service.js`;
+  they are hidden again after delivery or cancellation): `GET /orders/:id` and
   `GET /orders` expose `customer_phone` to `rider`/`admin` only, mirroring
   `restaurantContactFields()`'s pattern (`customerContactFields()` in
   `order.controller.js`). **Restaurants still get neither** — they only ever
@@ -247,6 +250,12 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   it never blocks an order. Any new place that prices or reports a trip distance must use
   the order's stored route (`routeDistance.ensureForOrder` / `shipping.tripDistanceKm`),
   never recompute a straight line.
+- **Delivery details and rider privacy** (2026-11-09): `orders.delivery_building` /
+  `delivery_landmark` / `delivery_instructions` (optional, separate from the map
+  `delivery_address`). The customer and admin see them, a kitchen never, a rider only once
+  the order is `picked_up` / `on_the_way`; before that and after delivery the rider gets
+  `delivery_area` only, coordinates rounded to ~1 km and null contact. Every rider-facing order
+  read must go through `customerDetails.forRider` (never return a raw order row to a rider).
 - **Never send raw server errors to a client** (2026-11-04): the central error
   handler in `app.js` returns a generic message + `ref` for any 5xx in production
   (the real error is logged under that ref); only deliberate 4xx messages are shown.

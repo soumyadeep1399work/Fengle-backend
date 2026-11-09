@@ -21,6 +21,7 @@ const orderPush = require("../services/orderNotifications.service");
 const riderDispatch = require("../services/riderDispatch.service");
 const riderArrival = require("../services/riderArrival.service");
 const routeDistance = require("../services/routeDistance.service");
+const customerDetails = require("../services/customerDetails.service");
 const { closedMessage } = require("../utils/serviceHours");
 
 const MIN_ORDER_VALUE = 50;
@@ -130,6 +131,8 @@ async function placeOrder(req, res) {
   if (delivery_lat == null || delivery_lng == null || !delivery_address) {
     return res.status(400).json({ error: "delivery_lat, delivery_lng and delivery_address are required" });
   }
+  const details = customerDetails.validateInput(req.body); // optional flat/building, landmark and delivery instructions (older apps send none)
+  if (details.error) return res.status(400).json({ error: details.error });
   if (!["upi", "card", "netbanking", "cod", "wallet"].includes(payment_method)) {
     return res.status(400).json({ error: "Invalid payment_method" });
   }
@@ -187,13 +190,13 @@ async function placeOrder(req, res) {
     const { order, couponError } = await createOrderForRestaurant({
       customerId, restaurant: match.restaurant,
       cartItems, deliveryLat: delivery_lat, deliveryLng: delivery_lng,
-      deliveryAddress: delivery_address, paymentMethod: payment_method,
+      deliveryAddress: delivery_address, paymentMethod: payment_method, deliveryDetails: details.value,
       isClubbed: categoryIds.length === 2, cascadeAttempts, couponCode: coupon_code,
     });
     const result = await withPaymentOrder(order, payment_method);
     if (result.error) return res.status(result.status).json({ error: result.error });
     notifyRestaurantIfVisible(result.order);
-    const responseOrder = withCancelInfo(result.order);
+    const responseOrder = { ...withCancelInfo(result.order), ...customerDetails.forCustomer(result.order) }; // the customer gets their own delivery details back
     if (couponError) responseOrder.couponError = couponError; // order still placed — an invalid code just doesn't discount it
     return res.status(201).json({ ...result, order: responseOrder });
   }
@@ -205,7 +208,7 @@ async function placeOrder(req, res) {
   if (categoryIds.length === 2) {
     const orders = await attemptClubbedFallbackSplit({
       customerId, cartItems, categoryIds, routingInput,
-      deliveryLat: delivery_lat, deliveryLng: delivery_lng, deliveryAddress: delivery_address, paymentMethod: payment_method,
+      deliveryLat: delivery_lat, deliveryLng: delivery_lng, deliveryAddress: delivery_address, paymentMethod: payment_method, deliveryDetails: details.value,
     });
     if (orders) {
       const results = [];
@@ -223,7 +226,7 @@ async function placeOrder(req, res) {
         message: coupon_code
           ? "These items are being sent as two separate orders since no single kitchen could prepare both. The coupon could not be applied to a split order."
           : "These items are being sent as two separate orders since no single kitchen could prepare both.",
-        orders: results.map((r) => ({ ...r, order: withCancelInfo(r.order) })),
+        orders: results.map((r) => ({ ...r, order: { ...withCancelInfo(r.order), ...customerDetails.forCustomer(r.order) } })),
       });
     }
   }
@@ -247,7 +250,7 @@ async function respondNoKitchen(res, routingInput) {
  * Returns null (not partial results) if either half can't be fulfilled —
  * caller treats that as a full failure rather than silently dropping items.
  */
-async function attemptClubbedFallbackSplit({ customerId, cartItems, categoryIds, routingInput, deliveryLat, deliveryLng, deliveryAddress, paymentMethod }) {
+async function attemptClubbedFallbackSplit({ customerId, cartItems, categoryIds, routingInput, deliveryLat, deliveryLng, deliveryAddress, paymentMethod, deliveryDetails }) {
   const [catA, catB] = categoryIds;
   const itemsA = cartItems.filter((i) => i.categoryId === catA);
   const itemsB = cartItems.filter((i) => i.categoryId === catB);
@@ -261,12 +264,12 @@ async function attemptClubbedFallbackSplit({ customerId, cartItems, categoryIds,
 
   const { order: orderA } = await createOrderForRestaurant({
     customerId, restaurant: resultA.match.restaurant,
-    cartItems: itemsA, deliveryLat, deliveryLng, deliveryAddress, paymentMethod,
+    cartItems: itemsA, deliveryLat, deliveryLng, deliveryAddress, paymentMethod, deliveryDetails,
     isClubbed: false, cascadeAttempts: resultA.cascadeAttempts,
   });
   const { order: orderB } = await createOrderForRestaurant({
     customerId, restaurant: resultB.match.restaurant,
-    cartItems: itemsB, deliveryLat, deliveryLng, deliveryAddress, paymentMethod,
+    cartItems: itemsB, deliveryLat, deliveryLng, deliveryAddress, paymentMethod, deliveryDetails,
     isClubbed: false, cascadeAttempts: resultB.cascadeAttempts,
   });
 
@@ -279,7 +282,7 @@ async function attemptClubbedFallbackSplit({ customerId, cartItems, categoryIds,
  * order still goes through, un-discounted) when couponCode was given but
  * turned out invalid/ineligible/expired/over its usage limit; never thrown.
  */
-async function createOrderForRestaurant({ customerId, restaurant, cartItems, deliveryLat, deliveryLng, deliveryAddress, paymentMethod, isClubbed, cascadeAttempts, couponCode }) {
+async function createOrderForRestaurant({ customerId, restaurant, cartItems, deliveryLat, deliveryLng, deliveryAddress, paymentMethod, deliveryDetails, isClubbed, cascadeAttempts, couponCode }) {
   // ONE road distance for this order (kitchen -> drop-off), measured before the transaction (it may call the Routes API) and stored on the order:
   // the customer fee below, the rider's pay and the rider alert all use it. The cache makes it the same number the cart quote showed.
   const route = await routeDistance.between({ lat: restaurant.lat, lng: restaurant.lng }, { lat: Number(deliveryLat), lng: Number(deliveryLng) });
@@ -323,6 +326,7 @@ async function createOrderForRestaurant({ customerId, restaurant, cartItems, del
       delivery_lat: deliveryLat,
       delivery_lng: deliveryLng,
       delivery_address: deliveryAddress,
+      ...(deliveryDetails || {}), // delivery_building / delivery_landmark / delivery_instructions (null when not given)
       item_total: itemTotal,
       delivery_fee: deliveryFee,
       delivery_fee_breakdown: JSON.stringify(feeResult.breakdown),
@@ -900,7 +904,8 @@ function restaurantContactFields(requesterType, restaurant) {
  * applies to the rider's own phone shown to the customer.
  */
 function customerContactFields(requesterType, customer) {
-  if ((requesterType !== "rider" && requesterType !== "admin") || !customer) return {};
+  // Admin only here. A rider's view of the customer (phone, name, address detail) is gated by the order's status in customerDetails.forRider.
+  if (requesterType !== "admin" || !customer) return {};
   return { customer_phone: customer.phone };
 }
 
@@ -927,7 +932,7 @@ async function getOrder(req, res) {
   const categories = distinctCategories(items);
   const rider = order.rider_id ? await db("riders").where({ id: order.rider_id }).select("name", "phone").first() : null;
   const restaurant = await db("restaurants").where({ id: order.restaurant_id }).select("name", "address", "lat", "lng").first();
-  const customer = type === "rider" || type === "admin" ? await db("users").where({ id: order.customer_id }).select("phone").first() : null;
+  const customer = type === "rider" || type === "admin" ? await db("users").where({ id: order.customer_id }).select("name", "phone").first() : null;
   // What the rider would earn for a delivery still to be done (live config; the payout itself is frozen at delivery).
   const estimatedRiderPayout = type === "rider" || type === "admin"
     ? await riderPay.estimatePayout({ order, restaurant })
@@ -951,6 +956,8 @@ async function getOrder(req, res) {
         ...restaurantContactFields(type, restaurant),
         ...customerContactFields(type, customer),
         ...riderArrival.visibleTo(order, type),
+        ...(type === "rider" ? customerDetails.forRider(order, customer) : {}),
+        ...(type === "customer" || type === "admin" ? customerDetails.forCustomer(order) : {}),
       },
       type
     ), type),
@@ -1127,6 +1134,7 @@ async function reorder(req, res) {
   if (originalItems.length === 0) return res.status(409).json({ error: "This order has no items left to reorder" });
 
   let { delivery_lat, delivery_lng, delivery_address, payment_method } = req.body || {};
+  const given = req.body || {};
   if (delivery_lat == null || delivery_lng == null || !delivery_address) {
     const defaultAddress = await db("addresses").where({ customer_id: req.auth.id, is_default: true }).first();
     if (!defaultAddress) {
@@ -1138,9 +1146,13 @@ async function reorder(req, res) {
   }
   if (!payment_method) payment_method = original.payment_method;
 
+  // The delivery details come from the request; if it sends none and the drop-off is the same place as the original order, reuse that order's.
+  const samePlace = Math.abs(Number(delivery_lat) - Number(original.delivery_lat)) < 0.00002 && Math.abs(Number(delivery_lng) - Number(original.delivery_lng)) < 0.00002;
+  const detailFields = Object.fromEntries(customerDetails.FIELDS.map((f) => [f, given[f] !== undefined ? given[f] : (samePlace ? original[f] : null)]));
+
   req.body = {
     items: originalItems.map((oi) => ({ item_id: oi.item_id, quantity: oi.quantity })),
-    delivery_lat, delivery_lng, delivery_address, payment_method,
+    delivery_lat, delivery_lng, delivery_address, payment_method, ...detailFields,
   };
   return placeOrder(req, res);
 }
@@ -1207,7 +1219,7 @@ async function listMyOrders(req, res) {
   const customerById = type !== "rider" || customerIds.length === 0
     ? {}
     : Object.fromEntries(
-        (await db("users").whereIn("id", customerIds).select("id", "phone")).map((c) => [c.id, c])
+        (await db("users").whereIn("id", customerIds).select("id", "name", "phone")).map((c) => [c.id, c])
       );
 
   const liveRiderPay = type === "rider" || type === "admin" ? await shipping.loadRuleSet(db, "rider_pay") : null;
@@ -1223,6 +1235,8 @@ async function listMyOrders(req, res) {
           ...restaurantContactFields(type, restaurantById[o.restaurant_id]),
           ...customerContactFields(type, customerById[o.customer_id]),
           ...riderArrival.visibleTo(o, type),
+          ...(type === "rider" ? customerDetails.forRider(o, customerById[o.customer_id]) : {}),
+          ...(type === "customer" ? customerDetails.forCustomer(o) : {}),
         },
         type
       ), type);
