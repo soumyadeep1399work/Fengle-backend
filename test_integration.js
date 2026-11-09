@@ -5141,7 +5141,7 @@ async function main() {
       const first = toRiders(o1.id);
       check("on assignment ONLY the assigned (nearest) rider is pushed — never the other online rider, never a broadcast", first.length === 1 && first[0].id === r1 && (await row(o1.id)).rider_id === r1 && pushes.filter((p) => p.type === "rider" && p.id === r2).length === 0);
       check("title 'New delivery request'; body 'Pickup: <kitchen>, <short area>. Drop: <short area>. <km> km · ₹<pay>' (+ Collect ₹… cash for COD); data { type: new_delivery, orderId }",
-        first[0].title === "New delivery request" && first[0].body.startsWith("Pickup: Rider Alert Kitchen, …") && /Drop: …[^.]*Kolkata 700156\./.test(first[0].body) && /[0-9]+\.[0-9] km · ₹[0-9.]+/.test(first[0].body) && /Collect ₹[0-9.]+ cash\.$/.test(first[0].body) && first[0].data.type === "new_delivery" && first[0].data.orderId === o1.id);
+        first[0].title === "New delivery request" && first[0].body.startsWith(`Order #${o1.id} · Pickup: Rider Alert Kitchen, …`) && /Drop: …[^.]*Kolkata 700156\./.test(first[0].body) && /[0-9]+\.[0-9] km · ₹[0-9.]+/.test(first[0].body) && /Collect ₹[0-9.]+ cash\.$/.test(first[0].body) && first[0].data.type === "new_delivery" && first[0].data.orderId === o1.id);
       check("the customer's house / flat is not in the notification (only the area), and the customer is never named", !/Flat 4B|Sunrise|Rider Alarm Customer|8000006501/.test(first[0].body));
       check("it is the loud push: alert { channelId: new-deliveries, tag: delivery-<id> }", first[0].alert.channelId === "new-deliveries" && first[0].alert.tag === `delivery-${o1.id}`);
       const a0 = await row(o1.id);

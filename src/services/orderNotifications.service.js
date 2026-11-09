@@ -120,7 +120,7 @@ async function riderAssigned(orderId, { reminder = false } = {}) {
   const figures = [km != null && Number.isFinite(km) ? `${km.toFixed(1)} km` : null, payout != null ? rupees(payout) : null].filter(Boolean).join(" · ");
   await sendToOwner("rider", order.rider_id, {
     title: reminder ? "Reminder: delivery waiting" : "New delivery request",
-    body: `Pickup: ${restaurant ? restaurant.name : "the kitchen"}${pickupArea ? `, ${pickupArea}` : ""}. Drop: ${shortArea(order.delivery_address) || "see the order"}.${figures ? ` ${figures}` : ""}${cod}`,
+    body: `Order #${order.id} · Pickup: ${restaurant ? restaurant.name : "the kitchen"}${pickupArea ? `, ${pickupArea}` : ""}. Drop: ${shortArea(order.delivery_address) || "see the order"}.${figures ? ` ${figures}` : ""}${cod}`,
     data: { type: reminder ? "new_delivery_reminder" : "new_delivery", orderId: order.id },
     // The siren channel the Rider app creates; one notification per delivery (each reminder replaces the last and re-alerts).
     alert: { channelId: "new-deliveries", tag: `delivery-${order.id}` },
