@@ -259,7 +259,8 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
 - **System health** (2026-11-09): `GET /admin/health`, super_admin only, read-only, services/systemHealth.service.js.
   A flat list of checks (`server`, `data`, `messaging`, `payments`, `google`, `domains`, `aws`). Never put a secret in the output; every
   outside call goes through the exported `probes` object (the tests replace it, the suite never touches the network for this); billed
-  checks (Cost Explorer, Google Routes) are cached and `?refresh=1` must never bypass them. The S3 checks overwrite one `_health/ping.txt`
+  checks (Cost Explorer, Google Routes) are cached; forcing them is limited server-side (`?refresh=1` 2 per IST day for all admins,
+  `?key=` paid checks 2 per key per day, free ones 20 s apart), in memory inside the service only, never shared with app flows. The S3 checks overwrite one `_health/ping.txt`
   and do not delete (the instance role has no DeleteObject by design).
 - **Never send raw server errors to a client** (2026-11-04): the central error
   handler in `app.js` returns a generic message + `ref` for any 5xx in production

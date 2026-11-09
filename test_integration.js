@@ -5917,13 +5917,68 @@ async function main() {
       // --- no secret anywhere in the response
       check("no key, secret or token appears anywhere in the response", SECRETS.every((s) => !first.text.includes(s)) && !first.text.includes("FAKEKEYID") && !/Bearer |Basic /.test(first.text));
 
-      // --- caching: billed checks run once, and a refresh does not bypass them
+      // --- caching: a plain GET reuses every cached result and never counts against a limit
       const before = { ...calls };
-      await get(superTok, "/admin/health?refresh=1");
-      await get(superTok, "/admin/health?refresh=1");
-      check("a failed Cost Explorer call is cached (not retried on every page load) and ?refresh=1 never re-runs it", calls.cost === 1 && before.cost === 1);
-      check("Google Routes (billed) is called once however often the page loads or refreshes", calls.routes === 1);
-      check("Fast2SMS wallet, RDAP and the buckets are reused from the cache inside their window", calls.fast2sms === 1 && calls.rdap === 1 && calls.s3 === 2);
+      const plain2 = await get(superTok);
+      await get(superTok);
+      check("plain GETs reuse the cache: a failed Cost Explorer call is not retried, Routes (billed), Fast2SMS, RDAP and the buckets are not called again", calls.cost === 1 && calls.routes === 1 && calls.fast2sms === 1 && calls.rdap === 1 && calls.s3 === 2 && before.cost === 1);
+      check("every check carries paid + refresh; only google.routes and aws.cost_mtd are paid", first.body.checks.every((c) => typeof c.paid === "boolean" && c.refresh && typeof c.refresh.allowed === "boolean") && first.body.checks.filter((c) => c.paid).map((c) => c.key).sort().join() === "aws.cost_mtd,google.routes");
+      check("paid checks report used/max (0 of 2) and are allowed; free checks have no used/max", byKey["google.routes"].refresh.used === 0 && byKey["google.routes"].refresh.max === 2 && byKey["google.routes"].refresh.allowed === true && byKey["google.routes"].refresh.next_at === null && !("used" in byKey["server.memory"].refresh));
+      check("top-level universal_refresh: allowed, used 0 of 2, next_at null; plain GETs never counted", plain2.body.universal_refresh.allowed === true && plain2.body.universal_refresh.used === 0 && plain2.body.universal_refresh.max === 2 && plain2.body.universal_refresh.next_at === null);
+
+      // --- "Check now" (?refresh=1): re-runs EVERYTHING, caches and billed checks included, 2 per IST day for all admins
+      const ist = 5.5 * 3600000;
+      const nextIstMidnight = () => new Date((Math.floor((Date.now() + ist) / 86400000) + 1) * 86400000 - ist).toISOString();
+      const u1 = await get(superTok, "/admin/health?refresh=1");
+      check("?refresh=1 re-runs every check including the billed and cached ones (Routes, Cost Explorer, Fast2SMS, RDAP, both buckets)", u1.status === 200 && calls.routes === 2 && calls.cost === 2 && calls.fast2sms === 2 && calls.rdap === 2 && calls.s3 === 4);
+      check("and says 1 of 2 used", u1.body.universal_refresh.used === 1 && u1.body.universal_refresh.allowed === true);
+      const u2 = await get(superTok, "/admin/health?refresh=1");
+      check("the second is allowed and now says 2 of 2, not allowed, next_at = 00:00 IST", u2.status === 200 && u2.body.universal_refresh.used === 2 && u2.body.universal_refresh.allowed === false && u2.body.universal_refresh.next_at === nextIstMidnight());
+      const callsAfterTwo = { ...calls };
+      const u3 = await get(superTok, "/admin/health?refresh=1");
+      check("the third is refused: 429 { error, code: refresh_limit, next_at } and nothing is re-run", u3.status === 429 && u3.body.code === "refresh_limit" && typeof u3.body.error === "string" && u3.body.next_at === nextIstMidnight() && JSON.stringify(calls) === JSON.stringify(callsAfterTwo));
+      const plain3 = await get(superTok);
+      check("a plain GET after the limit still works (cached, never counted)", plain3.status === 200 && plain3.body.universal_refresh.used === 2 && JSON.stringify(calls) === JSON.stringify(callsAfterTwo));
+
+      // --- single item (?key=)
+      health.clearCache();
+      await get(superTok); // warm every cache
+      const k0 = { ...calls };
+      const s1 = await get(superTok, "/admin/health?key=messaging.fast2sms_wallet");
+      const w1 = s1.body.checks.find((c) => c.key === "messaging.fast2sms_wallet");
+      check("?key= re-runs just that check (bypassing its cache) and returns the full response", s1.status === 200 && s1.body.checks.length === wantKeys.length && calls.fast2sms === k0.fast2sms + 1 && calls.routes === k0.routes && calls.cost === k0.cost && calls.rdap === k0.rdap && calls.s3 === k0.s3);
+      check("a free check then waits 20 s: refresh.allowed false with next_at ~20 s ahead; others unaffected; the universal counter untouched", w1.refresh.allowed === false && Math.abs(Date.parse(w1.refresh.next_at) - Date.now() - 20000) < 3000 && s1.body.checks.find((c) => c.key === "server.disk").refresh.allowed === true && s1.body.universal_refresh.used === 0);
+      const s2 = await get(superTok, "/admin/health?key=messaging.fast2sms_wallet");
+      check("forcing the same free check again inside 20 s -> 429 refresh_limit with next_at, nothing re-run", s2.status === 429 && s2.body.code === "refresh_limit" && typeof s2.body.next_at === "string" && calls.fast2sms === k0.fast2sms + 1);
+      check("a different free check can still be forced right away", (await get(superTok, "/admin/health?key=server.disk")).status === 200);
+      const bad = await get(superTok, "/admin/health?key=nope.nothing");
+      check("an unknown key -> 400 unknown_key", bad.status === 400 && bad.body.code === "unknown_key");
+
+      // paid checks: 2 forced runs per key per IST day
+      const p1 = await get(superTok, "/admin/health?key=google.routes");
+      const p2 = await get(superTok, "/admin/health?key=google.routes");
+      const p3 = await get(superTok, "/admin/health?key=google.routes");
+      check("a paid check can be forced twice a day: two runs (the stub saw them), the response counts used 1 then 2 of 2", p1.status === 200 && p2.status === 200 && calls.routes === k0.routes + 2 && p1.body.checks.find((c) => c.key === "google.routes").refresh.used === 1 && p2.body.checks.find((c) => c.key === "google.routes").refresh.used === 2 && p2.body.checks.find((c) => c.key === "google.routes").refresh.allowed === false);
+      check("the third forced run -> 429 refresh_limit with next_at = 00:00 IST, and no billed call is made", p3.status === 429 && p3.body.code === "refresh_limit" && p3.body.next_at === nextIstMidnight() && calls.routes === k0.routes + 2);
+      const c1 = await get(superTok, "/admin/health?key=aws.cost_mtd");
+      check("the other paid check has its own counter", c1.status === 200 && c1.body.checks.find((c) => c.key === "aws.cost_mtd").refresh.used === 1 && calls.cost === k0.cost + 1);
+
+      // the IST day rollover, driven through the service with an injected clock
+      health.clearCache();
+      const T = Date.UTC(2026, 10, 9, 18, 0, 0); // 23:30 IST on 9 Nov
+      await health.run({ key: "aws.cost_mtd", now: T }); await health.run({ key: "aws.cost_mtd", now: T + 1000 });
+      const lim = await health.run({ key: "aws.cost_mtd", now: T + 2000 }).catch((e) => e);
+      const midnightIst = Date.UTC(2026, 10, 9, 18, 30, 0);
+      check("rollover: refused at 23:30 IST with next_at exactly 00:00 IST", lim.status === 429 && lim.next_at === new Date(midnightIst).toISOString());
+      const okAgain = await health.run({ key: "aws.cost_mtd", now: midnightIst + 1000 }).catch((e) => e);
+      check("rollover: allowed again just after 00:00 IST, counter starts again at 1", !okAgain.status && okAgain.checks.find((c) => c.key === "aws.cost_mtd").refresh.used === 1);
+      health.clearCache();
+      await health.run({ refresh: true, now: T }); await health.run({ refresh: true, now: T + 1000 });
+      const ulim = await health.run({ refresh: true, now: T + 2000 }).catch((e) => e);
+      const uok = await health.run({ refresh: true, now: midnightIst + 1000 }).catch((e) => e);
+      check("rollover: Check now is refused after 2 and works again after 00:00 IST", ulim.status === 429 && ulim.next_at === new Date(midnightIst).toISOString() && !uok.status && uok.universal_refresh.used === 1);
+      health.clearCache();
+
       const raw = await fetch(base + "/admin/health", { headers: { Authorization: `Bearer ${superTok}` } });
       check("the response is Cache-Control: no-store", raw.headers.get("cache-control") === "no-store");
 

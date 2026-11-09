@@ -19,7 +19,11 @@ const push = require("./push.service");
  */
 
 const CHECK_TIMEOUT_MS = 5000;
-const MIN_REFRESH_GAP_MS = 20 * 1000; // ?refresh=1 cannot re-run a check more often than this (the page polling must not hammer anything)
+// Forced re-runs ("Check now"), enforced here for ALL admins together, counted per IST calendar day (resets at 00:00 IST, no DST):
+const UNIVERSAL_REFRESH_MAX = 2; //  GET ?refresh=1  re-runs every check, caches and billed ones included
+const PAID_REFRESH_MAX = 2; //       GET ?key=<paid check>: per key
+const FREE_REFRESH_GAP_MS = 20 * 1000; // GET ?key=<free check>: at least this long between forced runs of the same key
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
 
@@ -508,29 +512,28 @@ async function checkAwsCost() {
 const SSL_HOSTS = () => (process.env.HEALTH_SSL_HOSTS ? process.env.HEALTH_SSL_HOSTS.split(",").map((h) => h.trim()).filter(Boolean) : ["fengle.in", "api.fengle.in", "admin.fengle.in", "partner.fengle.in"]);
 
 /**
- * ttl: how long a good result is reused. failTtl: how long a down/unknown one is. refreshable: ?refresh=1 may re-run it.
- * Billed checks (aws.cost_mtd, google.routes) are never refreshable.
+ * ttl: how long a good result is reused. failTtl: how long a down/unknown one is. paid: a billed call (limited more strictly when forced).
  */
 function definitions() {
   const defs = [
-    { key: "server.memory", group: "server", label: "Memory", run: checkMemory, ttl: 15000, failTtl: 15000, refreshable: true },
-    { key: "server.disk", group: "server", label: "Disk space", run: checkDisk, ttl: 60000, failTtl: 15000, refreshable: true },
-    { key: "server.load_uptime", group: "server", label: "CPU load and uptime", run: checkLoadUptime, ttl: 15000, failTtl: 15000, refreshable: true },
-    { key: "data.mysql", group: "data", label: "Database (MySQL)", run: checkMysql, ttl: 15000, failTtl: 5000, refreshable: true },
-    { key: "data.s3_uploads", group: "data", label: "File storage (uploads)", run: checkBucket("AWS_S3_BUCKET", "Uploads bucket"), ttl: 60000, failTtl: 15000, refreshable: true },
-    { key: "data.s3_private", group: "data", label: "File storage (private documents)", run: checkBucket("AWS_S3_PRIVATE_BUCKET", "Private bucket"), ttl: 60000, failTtl: 15000, refreshable: true },
-    { key: "data.backup", group: "data", label: "Database backup", run: checkBackup, ttl: 60000, failTtl: 30000, refreshable: true },
-    { key: "messaging.fast2sms_wallet", group: "messaging", label: "SMS balance (Fast2SMS)", run: checkFast2Sms, ttl: 10 * MIN, failTtl: MIN, refreshable: true },
-    { key: "messaging.push", group: "messaging", label: "Push notifications", run: checkPush, ttl: 60000, failTtl: 30000, refreshable: true },
-    { key: "payments.razorpay", group: "payments", label: "Razorpay", run: checkRazorpay, ttl: 10 * MIN, failTtl: MIN, refreshable: true },
-    { key: "google.routes", group: "google", label: "Google Routes (road distance)", run: checkGoogleRoutes, ttl: HOUR, failTtl: 5 * MIN, refreshable: false },
+    { key: "server.memory", group: "server", label: "Memory", run: checkMemory, ttl: 15000, failTtl: 15000 },
+    { key: "server.disk", group: "server", label: "Disk space", run: checkDisk, ttl: 60000, failTtl: 15000 },
+    { key: "server.load_uptime", group: "server", label: "CPU load and uptime", run: checkLoadUptime, ttl: 15000, failTtl: 15000 },
+    { key: "data.mysql", group: "data", label: "Database (MySQL)", run: checkMysql, ttl: 15000, failTtl: 5000 },
+    { key: "data.s3_uploads", group: "data", label: "File storage (uploads)", run: checkBucket("AWS_S3_BUCKET", "Uploads bucket"), ttl: 60000, failTtl: 15000 },
+    { key: "data.s3_private", group: "data", label: "File storage (private documents)", run: checkBucket("AWS_S3_PRIVATE_BUCKET", "Private bucket"), ttl: 60000, failTtl: 15000 },
+    { key: "data.backup", group: "data", label: "Database backup", run: checkBackup, ttl: 60000, failTtl: 30000 },
+    { key: "messaging.fast2sms_wallet", group: "messaging", label: "SMS balance (Fast2SMS)", run: checkFast2Sms, ttl: 10 * MIN, failTtl: MIN },
+    { key: "messaging.push", group: "messaging", label: "Push notifications", run: checkPush, ttl: 60000, failTtl: 30000 },
+    { key: "payments.razorpay", group: "payments", label: "Razorpay", run: checkRazorpay, ttl: 10 * MIN, failTtl: MIN },
+    { key: "google.routes", group: "google", label: "Google Routes (road distance)", run: checkGoogleRoutes, ttl: HOUR, failTtl: 5 * MIN, paid: true },
   ];
   for (const host of SSL_HOSTS()) {
-    defs.push({ key: `domains.ssl_${host.replace(/[^a-z0-9]+/gi, "_")}`, group: "domains", label: `HTTPS certificate: ${host}`, run: sslCheck(host), ttl: 6 * HOUR, failTtl: 5 * MIN, refreshable: false });
+    defs.push({ key: `domains.ssl_${host.replace(/[^a-z0-9]+/gi, "_")}`, group: "domains", label: `HTTPS certificate: ${host}`, run: sslCheck(host), ttl: 6 * HOUR, failTtl: 5 * MIN });
   }
   defs.push(
-    { key: "domains.registration", group: "domains", label: "Domain registration", run: checkDomainRegistration, ttl: 24 * HOUR, failTtl: 10 * MIN, refreshable: false },
-    { key: "aws.cost_mtd", group: "aws", label: "AWS cost this month", run: checkAwsCost, ttl: 24 * HOUR, failTtl: 10 * MIN, refreshable: false },
+    { key: "domains.registration", group: "domains", label: "Domain registration", run: checkDomainRegistration, ttl: 24 * HOUR, failTtl: 10 * MIN },
+    { key: "aws.cost_mtd", group: "aws", label: "AWS cost this month", run: checkAwsCost, ttl: 24 * HOUR, failTtl: 10 * MIN, paid: true },
   );
   return defs;
 }
@@ -538,11 +541,57 @@ function definitions() {
 const cache = new Map(); // key -> { result, at, expires }
 const inflight = new Map(); // key -> Promise (so two viewers at once share one run)
 
-function clearCache() { cache.clear(); inflight.clear(); }
+// Forced-run bookkeeping (in memory: a restart resets it, which is acceptable).
+const universal = { day: null, used: 0 };
+const perKey = new Map(); // key -> { day, used, lastAt }
 
-async function runOne(def, refresh, now = Date.now()) {
+function clearCache() { cache.clear(); inflight.clear(); universal.day = null; universal.used = 0; perKey.clear(); }
+
+const istDay = (now) => Math.floor((now + IST_OFFSET_MS) / 86400000);
+const nextIstMidnight = (now) => new Date((istDay(now) + 1) * 86400000 - IST_OFFSET_MS).toISOString();
+
+/** What the page needs per check: can it be forced now, when, and (for the daily-limited ones) how many are used. */
+function refreshInfo(def, now) {
+  const e = perKey.get(def.key);
+  if (def.paid) {
+    const used = e && e.day === istDay(now) ? e.used : 0;
+    return { allowed: used < PAID_REFRESH_MAX, next_at: used < PAID_REFRESH_MAX ? null : nextIstMidnight(now), used, max: PAID_REFRESH_MAX };
+  }
+  const wait = e && e.lastAt != null ? e.lastAt + FREE_REFRESH_GAP_MS - now : 0;
+  return { allowed: wait <= 0, next_at: wait > 0 ? new Date(now + wait).toISOString() : null };
+}
+
+function universalInfo(now) {
+  const used = universal.day === istDay(now) ? universal.used : 0;
+  return { allowed: used < UNIVERSAL_REFRESH_MAX, used, max: UNIVERSAL_REFRESH_MAX, next_at: used < UNIVERSAL_REFRESH_MAX ? null : nextIstMidnight(now) };
+}
+
+function limitError(message, nextAt) {
+  return Object.assign(new Error(message), { health: true, status: 429, code: "refresh_limit", next_at: nextAt });
+}
+
+/** Take one forced run for a single check, or throw a 429 error. Synchronous, so two simultaneous requests cannot both slip through. */
+function takeKeyRefresh(def, now) {
+  const info = refreshInfo(def, now);
+  if (!info.allowed) {
+    throw limitError(def.paid ? `This check costs money, so it can be forced only ${PAID_REFRESH_MAX} times a day (resets at 00:00 IST).` : "This check was just refreshed; try again in a few seconds.", info.next_at);
+  }
+  const e = perKey.get(def.key);
+  const today = istDay(now);
+  perKey.set(def.key, { day: today, used: (e && e.day === today ? e.used : 0) + (def.paid ? 1 : 0), lastAt: now });
+}
+
+function takeUniversalRefresh(now) {
+  const info = universalInfo(now);
+  if (!info.allowed) throw limitError(`"Check now" can be used ${UNIVERSAL_REFRESH_MAX} times a day (resets at 00:00 IST).`, info.next_at);
+  universal.day = istDay(now);
+  universal.used = info.used + 1;
+}
+
+/** `force`: ignore the cache (the caller has already taken a forced run from the limiter). */
+async function runOne(def, force, now = Date.now()) {
   const hit = cache.get(def.key);
-  if (hit && now < hit.expires && !(refresh && def.refreshable && now - hit.at >= MIN_REFRESH_GAP_MS)) return hit.result;
+  if (hit && now < hit.expires && !force) return hit.result;
   if (inflight.has(def.key)) return inflight.get(def.key);
 
   const job = (async () => {
@@ -581,13 +630,37 @@ function cleanDetails(details) {
   return out;
 }
 
-/** { checked_at, overall, checks: [...] } in group order. */
-async function run({ refresh = false } = {}) {
+/**
+ * { checked_at, overall, universal_refresh, checks: [...] } in group order.
+ *   (nothing)       cached results; never counts against a limit
+ *   refresh: true   "Check now": re-run EVERY check, bypassing every cache (2 per IST day, all admins together); else a 429 error
+ *   key: "<key>"    re-run just that check (free: 20 s apart; paid: 2 per IST day per key); unknown key -> 400; over the limit -> 429
+ * The errors carry { health: true, status, code, next_at } for the controller. `now` is injectable for the tests.
+ */
+async function run({ refresh = false, key = null, now = Date.now() } = {}) {
   const defs = definitions();
-  const checks = await Promise.all(defs.map((d) => runOne(d, refresh)));
+  let forced = new Set();
+  if (key) {
+    const def = defs.find((d) => d.key === key);
+    if (!def) throw Object.assign(new Error(`Unknown check "${String(key).slice(0, 60)}"`), { health: true, status: 400, code: "unknown_key" });
+    takeKeyRefresh(def, now);
+    forced = new Set([def.key]);
+  } else if (refresh) {
+    takeUniversalRefresh(now);
+    forced = new Set(defs.map((d) => d.key));
+    for (const d of defs) { const e = perKey.get(d.key); perKey.set(d.key, { day: e ? e.day : null, used: e ? e.used : 0, lastAt: now }); } // a full re-run also starts each free check's 20 s gap
+  }
+  const results = await Promise.all(defs.map((d) => runOne(d, forced.has(d.key))));
+  const after = Date.now() > now ? Date.now() : now;
+  const checks = results.map((r, i) => ({ ...r, paid: Boolean(defs[i].paid), refresh: refreshInfo(defs[i], after) }));
   checks.sort((a, b) => GROUP_ORDER.indexOf(a.group) - GROUP_ORDER.indexOf(b.group)); // stable: keeps the order within a group
   const statuses = checks.map((c) => c.status);
-  return { checked_at: new Date().toISOString(), overall: statuses.includes("down") ? "down" : statuses.includes("warn") ? "warn" : "ok", checks };
+  return {
+    checked_at: new Date().toISOString(),
+    overall: statuses.includes("down") ? "down" : statuses.includes("warn") ? "warn" : "ok",
+    universal_refresh: universalInfo(after),
+    checks,
+  };
 }
 
 module.exports = { run, probes, clearCache, withTimeout, safeMessage, assessBackupLog, parseLineTime, definitions, CHECK_TIMEOUT_MS, GROUP_ORDER };
