@@ -331,13 +331,17 @@ async function checkFast2Sms() {
     const rejected = r.status === 401 || r.status === 403 || r.status === 412 || /authori[sz]ation|invalid.*key/i.test(String((r.json && r.json.message) || ""));
     return down(rejected ? "Fast2SMS rejected the API key" : `Fast2SMS did not return a balance (HTTP ${r.status})`, { details: { message: safeMessage((r.json && r.json.message) || `HTTP ${r.status}`) } });
   }
-  const rate = Number(process.env.FAST2SMS_RATE_PER_SMS); // rupees per OTP SMS, optional: only then can we say how many OTPs are left
-  const otps = Number.isFinite(rate) && rate > 0 ? Math.floor(balance / rate) : null;
-  const status = balance < 50 ? "down" : balance < 200 ? "warn" : "ok";
+  // Fast2SMS reports sms_count with the wallet: how many SMS the balance covers at the account's own slab rate. That is what actually runs
+  // out, so it drives the status. Without it (an older/changed response) fall back to the rupee balance, and to FAST2SMS_RATE_PER_SMS for the estimate.
+  const reported = r.json.sms_count != null ? Number(r.json.sms_count) : NaN;
+  const hasCount = Number.isFinite(reported) && reported >= 0;
+  const rate = Number(process.env.FAST2SMS_RATE_PER_SMS);
+  const smsLeft = hasCount ? Math.floor(reported) : Number.isFinite(rate) && rate > 0 ? Math.floor(balance / rate) : null;
+  const status = hasCount ? (reported < 200 ? "down" : reported < 800 ? "warn" : "ok") : balance < 50 ? "down" : balance < 200 ? "warn" : "ok";
   const money = `₹${balance.toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
   return {
-    status, value: round(balance, 2), summary: otps != null ? `${money} left (~${otps.toLocaleString("en-IN")} OTPs)` : `${money} left`,
-    details: { balance_rupees: round(balance, 2), rupees_per_sms_used_for_estimate: otps != null ? rate : null, approx_otps_left: otps },
+    status, value: round(balance, 2), summary: smsLeft != null ? `${money} left (~${smsLeft.toLocaleString("en-IN")} SMS)` : `${money} left`,
+    details: { balance_rupees: round(balance, 2), sms_left: smsLeft, sms_left_source: hasCount ? "reported by Fast2SMS" : smsLeft != null ? "estimated from FAST2SMS_RATE_PER_SMS" : null },
   };
 }
 

@@ -763,7 +763,7 @@ The trip **kitchen -> drop-off** is measured by **road** (Google Routes API), on
 | `data.mysql` | ping latency and database size / table count | down if the ping fails, warn > 500 ms |
 | `data.s3_uploads`, `data.s3_private` | writes then reads back one tiny object `_health/ping.txt` (overwritten each time, never deleted: the server role may not delete) and times both | down on any failure, warn > 2 s; `unknown` when the bucket env is not set |
 | `data.backup` | last success line in `~/fengle-backup/backup.log` (`BACKUP_DIR` overrides the folder), and the newest local dump's size | warn > 26 h, down > 50 h or when an error line comes after the last success |
-| `messaging.fast2sms_wallet` | wallet balance in rupees (`GET /dev/wallet`); `approx_otps_left` only when `FAST2SMS_RATE_PER_SMS` is set | warn < 200, down < 50 or when the key is rejected |
+| `messaging.fast2sms_wallet` | wallet balance in rupees plus the SMS count Fast2SMS reports for it (`GET /dev/wallet` returns `wallet` and `sms_count`): summary `₹105.75 left (~423 SMS)`, `details.sms_left`. `FAST2SMS_RATE_PER_SMS` is only a fallback when `sms_count` is missing | by `sms_count`: warn < 800, down < 200 (without it: balance warn < ₹200, down < ₹50); down when the key is rejected |
 | `messaging.push` | FCM configured and signed in, delivery counters, registered devices | down if FCM is not configured in production or cannot sign in; warn if >= 5 failed and >= 25% of attempts |
 | `payments.razorpay` | keys valid (`GET /v1/payments?count=1`), `mode` test/live from the key prefix, webhook secret configured | down if rejected; warn if the webhook secret is missing |
 | `google.routes` | one tiny computeRoutes call (billed, so cached an hour) | ok / down with Google's reason |
