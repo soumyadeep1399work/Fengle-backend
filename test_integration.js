@@ -5810,6 +5810,191 @@ async function main() {
     }
   }
 
+  console.log("\n--- Test 71: System health — GET /admin/health (super_admin only), every check, thresholds, caching, no secrets ---");
+  {
+    const http = require("http");
+    const bcrypt = require("bcrypt");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const health = require("./src/services/systemHealth.service");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const hash = await bcrypt.hash("a-long-password-1", 4);
+    const mkAdmin = async (name, role) => {
+      const [id] = await db("admins").insert({ name, email: `${name}@health.test`, password_hash: hash, role });
+      return signToken({ id, type: "admin" });
+    };
+    const superTok = await mkAdmin("health-super", "super_admin");
+    const opsTok = await mkAdmin("health-ops", "ops");
+    const supTok = await mkAdmin("health-support", "support");
+    const get = async (tok, p = "/admin/health") => {
+      const r = await fetch(base + p, { headers: tok ? { Authorization: `Bearer ${tok}` } : {} });
+      const text = await r.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch { /* not json */ }
+      return { status: r.status, body: json, text };
+    };
+
+    // Everything that touches the outside world is replaced; the suite never goes to the network for this.
+    const realProbes = { ...health.probes };
+    const envKeys = ["FAST2SMS_API_KEY", "FAST2SMS_RATE_PER_SMS", "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_WEBHOOK_SECRET", "GOOGLE_ROUTES_API_KEY", "AWS_S3_BUCKET", "AWS_S3_PRIVATE_BUCKET", "BACKUP_DIR", "HEALTH_DOMAIN"];
+    const savedEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
+    const SECRETS = ["FAKE-FAST2SMS-KEY-0123456789abcdefghijklmn", "FAKE-RZP-SECRET-0123456789abcdefghijklmnop", "FAKE-WEBHOOK-SECRET-0123456789abcdefghijk", "FAKE-ROUTES-KEY-0123456789abcdefghijklmnopq"];
+    process.env.FAST2SMS_API_KEY = SECRETS[0];
+    process.env.RAZORPAY_KEY_ID = "rzp_test_FAKEKEYID12345";
+    process.env.RAZORPAY_KEY_SECRET = SECRETS[1];
+    process.env.RAZORPAY_WEBHOOK_SECRET = SECRETS[2];
+    process.env.GOOGLE_ROUTES_API_KEY = SECRETS[3];
+    process.env.AWS_S3_BUCKET = "test-uploads-bucket";
+    process.env.AWS_S3_PRIVATE_BUCKET = "test-private-bucket";
+    delete process.env.FAST2SMS_RATE_PER_SMS;
+
+    const calls = { routes: 0, cost: 0, fast2sms: 0, rdap: 0, s3: 0 };
+    let wallet = { status: 200, ok: true, json: { return: true, wallet: "412.50" } };
+    let razorpay = { status: 200, ok: true, json: { entity: "collection", items: [] } };
+    let sslDays = { "fengle.in": 80, "api.fengle.in": 15, "admin.fengle.in": 5, "partner.fengle.in": 80 };
+    let diskPct = 85, memText = "MemTotal: 1000000 kB\nMemAvailable: 400000 kB\nSwapTotal: 1000000 kB\nSwapFree: 900000 kB\n";
+    let costError = Object.assign(new Error("User is not authorized to perform: ce:GetCostAndUsage"), { name: "AccessDeniedException" });
+    let backupText = "", backupMtime = Date.now();
+    let privateBucketError = Object.assign(new Error("Access Denied"), { name: "AccessDenied" });
+    const rdapDays = 400;
+    health.probes.http = async (url) => {
+      if (url.includes("fast2sms")) { calls.fast2sms += 1; return wallet; }
+      if (url.includes("razorpay")) return razorpay;
+      if (url.includes("routes.googleapis")) { calls.routes += 1; return { status: 200, ok: true, json: { routes: [{ distanceMeters: 900 }] } }; }
+      if (url.includes("rdap")) { calls.rdap += 1; return { status: 200, ok: true, json: { status: ["client transfer prohibited"], events: [{ eventAction: "registration", eventActor: "hostinger", eventDate: "2026-09-29T00:00:00Z" }, { eventAction: "expiration", eventDate: new Date(Date.now() + rdapDays * 86400000).toISOString() }] } }; }
+      throw new Error("unexpected url in the health test: " + url);
+    };
+    health.probes.tlsCertificate = async (host) => ({ valid_to: new Date(Date.now() + sslDays[host] * 86400000 + 3600000), authorized: true, authorization_error: null });
+    health.probes.s3RoundTrip = async (bucket) => {
+      calls.s3 += 1;
+      if (bucket === "test-private-bucket" && privateBucketError) throw privateBucketError;
+      return { put_ms: 40, get_ms: 25, matches: true };
+    };
+    health.probes.monthToDateCost = async () => { calls.cost += 1; if (costError) throw costError; return { amount: 12.34, unit: "USD" }; };
+    health.probes.diskUsage = async () => ({ total: 8 * 1073741824, used: (diskPct / 100) * 8 * 1073741824, pct: diskPct });
+    health.probes.readFile = async (file) => { if (String(file).endsWith("meminfo")) return memText; if (String(file).endsWith("backup.log")) return backupText; throw new Error("ENOENT"); };
+    health.probes.statFile = async (file) => { if (String(file).endsWith("backup.log")) return { mtimeMs: backupMtime, size: backupText.length }; return { mtimeMs: Date.now() - 3600000, size: 31 * 1024 }; };
+    health.probes.readdir = async () => ["fengle-2026-11-09.sql.gz", "fengle-2026-11-08.sql.gz"];
+
+    try {
+      // --- access
+      check("no token -> 401", (await get(null)).status === 401);
+      const asOps = await get(opsTok), asSupport = await get(supTok);
+      check("ops -> 403 forbidden_role", asOps.status === 403 && asOps.body.code === "forbidden_role");
+      check("support -> 403 forbidden_role", asSupport.status === 403 && asSupport.body.code === "forbidden_role");
+
+      // --- shape
+      health.clearCache();
+      backupText = `${new Date(Date.now() - 3 * 3600000).toISOString()} backup done: fengle-2026-11-09.sql.gz uploaded, sha256 verified\n`;
+      const first = await get(superTok);
+      check("super_admin -> 200 with checked_at, overall and a checks array", first.status === 200 && typeof first.body.checked_at === "string" && Array.isArray(first.body.checks) && ["ok", "warn", "down"].includes(first.body.overall));
+      const byKey = Object.fromEntries(first.body.checks.map((c) => [c.key, c]));
+      const wantKeys = ["server.memory", "server.disk", "server.load_uptime", "data.mysql", "data.s3_uploads", "data.s3_private", "data.backup", "messaging.fast2sms_wallet", "messaging.push", "payments.razorpay", "google.routes", "domains.ssl_fengle_in", "domains.ssl_api_fengle_in", "domains.ssl_admin_fengle_in", "domains.ssl_partner_fengle_in", "domains.registration", "aws.cost_mtd"];
+      check(`every planned check is present (${wantKeys.filter((k) => !byKey[k]).join(", ") || "none missing"})`, wantKeys.every((k) => byKey[k]) && first.body.checks.length === wantKeys.length);
+      const GROUPS = ["server", "data", "messaging", "payments", "google", "domains", "aws"];
+      const flat = (d) => Object.values(d).every((v) => v === null || ["string", "number", "boolean"].includes(typeof v));
+      check("every check has key, group, label, status, summary, value (number|null), checked_at and flat details", first.body.checks.every((c) => typeof c.key === "string" && GROUPS.includes(c.group) && c.key.startsWith(c.group + ".") && typeof c.label === "string" && ["ok", "warn", "down", "unknown"].includes(c.status) && typeof c.summary === "string" && c.summary.length > 0 && (c.value === null || typeof c.value === "number") && typeof c.checked_at === "string" && (c.details === undefined || flat(c.details))));
+      check("checks come back grouped in the planned order", first.body.checks.map((c) => GROUPS.indexOf(c.group)).every((g, i, a) => i === 0 || a[i - 1] <= g));
+
+      // --- the checks themselves
+      check("memory: 60% used with swap -> ok, value 60", byKey["server.memory"].status === "ok" && byKey["server.memory"].value === 60 && /swap/.test(byKey["server.memory"].summary));
+      check("disk 85% -> warn", byKey["server.disk"].status === "warn" && byKey["server.disk"].value === 85);
+      check("load/uptime has CPU count and uptime", byKey["server.load_uptime"].details.cpu_count >= 1 && typeof byKey["server.load_uptime"].details.system_uptime === "string");
+      check("mysql answers (real ping) with latency and a database size", byKey["data.mysql"].status !== "down" && typeof byKey["data.mysql"].details.ping_ms === "number" && byKey["data.mysql"].details.database_size_mb > 0 && byKey["data.mysql"].details.tables > 10);
+      check("uploads bucket ok with latency", byKey["data.s3_uploads"].status === "ok" && byKey["data.s3_uploads"].details.write_ms === 40 && /Write 40 ms, read 25 ms/.test(byKey["data.s3_uploads"].summary));
+      check("private bucket AccessDenied -> down with the error code, not a crash", byKey["data.s3_private"].status === "down" && /AccessDenied/.test(byKey["data.s3_private"].summary));
+      check("backup 3 h ago -> ok, with the dump size", byKey["data.backup"].status === "ok" && byKey["data.backup"].value === 3 && byKey["data.backup"].details.latest_dump_kb === 31 && /31 KB/.test(byKey["data.backup"].summary));
+      check("Fast2SMS ₹412.50 -> ok (no rate configured, so no OTP estimate)", byKey["messaging.fast2sms_wallet"].status === "ok" && byKey["messaging.fast2sms_wallet"].value === 412.5 && byKey["messaging.fast2sms_wallet"].details.approx_otps_left === null);
+      check("push: no FCM on the test box -> unknown (not a failure), with counters", byKey["messaging.push"].status === "unknown" && typeof byKey["messaging.push"].details.sent_last_24h === "number");
+      check("Razorpay: valid test keys + webhook secret -> ok, mode test", byKey["payments.razorpay"].status === "ok" && byKey["payments.razorpay"].details.mode === "test" && byKey["payments.razorpay"].details.webhook_secret_configured === true);
+      check("Google Routes works -> ok", byKey["google.routes"].status === "ok");
+      check("SSL 80 days -> ok, 15 -> warn, 5 -> down", byKey["domains.ssl_fengle_in"].status === "ok" && byKey["domains.ssl_api_fengle_in"].status === "warn" && byKey["domains.ssl_admin_fengle_in"].status === "down" && byKey["domains.ssl_api_fengle_in"].value === 15);
+      check("domain registration read from RDAP: ok, 400 days, registrar", byKey["domains.registration"].status === "ok" && byKey["domains.registration"].value >= 399 && byKey["domains.registration"].details.registrar === "hostinger");
+      check("AWS cost without ce:GetCostAndUsage -> unknown 'Needs the ce:GetCostAndUsage permission'", byKey["aws.cost_mtd"].status === "unknown" && byKey["aws.cost_mtd"].summary === "Needs the ce:GetCostAndUsage permission");
+      check("overall is down while a check is down", first.body.overall === "down");
+
+      // --- no secret anywhere in the response
+      check("no key, secret or token appears anywhere in the response", SECRETS.every((s) => !first.text.includes(s)) && !first.text.includes("FAKEKEYID") && !/Bearer |Basic /.test(first.text));
+
+      // --- caching: billed checks run once, and a refresh does not bypass them
+      const before = { ...calls };
+      await get(superTok, "/admin/health?refresh=1");
+      await get(superTok, "/admin/health?refresh=1");
+      check("a failed Cost Explorer call is cached (not retried on every page load) and ?refresh=1 never re-runs it", calls.cost === 1 && before.cost === 1);
+      check("Google Routes (billed) is called once however often the page loads or refreshes", calls.routes === 1);
+      check("Fast2SMS wallet, RDAP and the buckets are reused from the cache inside their window", calls.fast2sms === 1 && calls.rdap === 1 && calls.s3 === 2);
+      const raw = await fetch(base + "/admin/health", { headers: { Authorization: `Bearer ${superTok}` } });
+      check("the response is Cache-Control: no-store", raw.headers.get("cache-control") === "no-store");
+
+      // --- thresholds (clear the cache and change what the stubs say)
+      health.clearCache();
+      wallet = { status: 200, ok: true, json: { return: true, wallet: "120" } };
+      diskPct = 95; memText = "MemTotal: 1000000 kB\nMemAvailable: 30000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n";
+      sslDays = { "fengle.in": 80, "api.fengle.in": 80, "admin.fengle.in": 80, "partner.fengle.in": 80 };
+      privateBucketError = null;
+      razorpay = { status: 200, ok: true, json: {} };
+      delete process.env.RAZORPAY_WEBHOOK_SECRET;
+      costError = null;
+      process.env.FAST2SMS_RATE_PER_SMS = "0.25";
+      backupText = `${new Date(Date.now() - 30 * 3600000).toISOString()} backup done\n`;
+      let t = (await get(superTok)).body.checks, k = Object.fromEntries(t.map((c) => [c.key, c]));
+      check("Fast2SMS ₹120 -> warn, and with a rate set the OTPs left are estimated (480)", k["messaging.fast2sms_wallet"].status === "warn" && k["messaging.fast2sms_wallet"].details.approx_otps_left === 480 && /~480 OTPs/.test(k["messaging.fast2sms_wallet"].summary));
+      check("disk 95% -> down", k["server.disk"].status === "down");
+      check("memory 97% used and no swap -> down", k["server.memory"].status === "down" && k["server.memory"].value === 97 && /no swap/.test(k["server.memory"].summary));
+      check("private bucket healthy -> ok; all certificates 80 days -> ok", k["data.s3_private"].status === "ok" && ["fengle_in", "api_fengle_in", "admin_fengle_in", "partner_fengle_in"].every((h) => k[`domains.ssl_${h}`].status === "ok"));
+      check("Razorpay without the webhook secret -> warn", k["payments.razorpay"].status === "warn" && k["payments.razorpay"].details.webhook_secret_configured === false);
+      check("backup 30 h old -> warn", k["data.backup"].status === "warn" && k["data.backup"].value === 30);
+      check("AWS cost works -> ok, $12.34 with a month-end estimate", k["aws.cost_mtd"].status === "ok" && k["aws.cost_mtd"].value === 12.34 && /\$12\.34/.test(k["aws.cost_mtd"].summary) && k["aws.cost_mtd"].details.month_end_estimate > 12.34 - 0.01);
+      wallet = { status: 200, ok: true, json: { return: true, wallet: "30" } };
+      health.clearCache();
+      check("Fast2SMS ₹30 -> down", (await get(superTok)).body.checks.find((c) => c.key === "messaging.fast2sms_wallet").status === "down");
+      wallet = { status: 412, ok: false, json: { return: false, status_code: 412, message: "Invalid Authentication, Check Authorization Key" } };
+      health.clearCache();
+      const rejected = (await get(superTok)).body.checks.find((c) => c.key === "messaging.fast2sms_wallet");
+      check("Fast2SMS rejecting the key -> down 'rejected the API key'", rejected.status === "down" && /rejected the API key/.test(rejected.summary));
+      razorpay = { status: 401, ok: false, json: { error: { description: "Authentication failed" } } };
+      health.clearCache();
+      check("Razorpay 401 -> down 'rejected the keys'", (await get(superTok)).body.checks.find((c) => c.key === "payments.razorpay").summary === "Razorpay rejected the keys");
+
+      // --- a probe that throws becomes a down check, not a 500 for the whole page
+      health.probes.diskUsage = async () => { throw new Error("statfs exploded " + SECRETS[0]); };
+      health.clearCache();
+      const boom = await get(superTok);
+      const diskBoom = boom.body.checks.find((c) => c.key === "server.disk");
+      check("one check throwing -> that check is down and the page still answers 200", boom.status === 200 && diskBoom.status === "down" && /Check failed/.test(diskBoom.summary) && boom.body.checks.length === wantKeys.length);
+      check("a long token-like string inside an error message is redacted", !boom.text.includes(SECRETS[0]));
+
+      // --- timeout
+      const slow = await health.withTimeout(new Promise(() => {}), 30);
+      check("a hanging check becomes down 'No response in N s'", slow.status === "down" && /^No response in \d+ s$/.test(slow.summary));
+
+      // --- backup log parsing
+      const iso = (hoursAgo) => new Date(Date.now() - hoursAgo * 3600000).toISOString();
+      const A = health.assessBackupLog;
+      check("backup: fresh success -> ok", A(`${iso(2)} backup done\n`, Date.now()).status === "ok");
+      check("backup: 60 h old -> down", A(`${iso(60)} backup done\n`, Date.now()).status === "down");
+      check("backup: an error after the last success -> down, with the error line and the last good age", (() => { const r = A(`${iso(5)} backup done\n${iso(1)} mysqldump: error 1045 access denied\n`, Date.now()); return r.status === "down" && r.details.last_run_errored === true && /access denied/.test(r.details.last_error_line) && /last good backup/.test(r.summary); })());
+      check("backup: empty log -> down; no success line -> down", A("", Date.now()).status === "down" && A(`${iso(1)} starting dump\n`, Date.now()).status === "down");
+      check("backup: a final line without a timestamp uses the file's modified time", A("backup done\n", Date.now() - 2 * 3600000).status === "ok");
+      check("backup: a `date`-style stamp is understood", (() => { const d = new Date(Date.now() - 4 * 3600000); const s = d.toUTCString().replace(/^(\w{3}), (\d{2}) (\w{3}) (\d{4}) ([\d:]+) GMT$/, (m, w, dd, mon, y, tm) => `${w} ${mon} ${dd} ${tm} UTC ${y}`); const r = A(`${s}\nbackup done\n`, Date.now()); return r.status === "ok" && r.value >= 3.9 && r.value <= 4.1; })());
+      health.clearCache();
+      health.probes.statFile = async () => { throw new Error("ENOENT"); };
+      check("backup: no log file on the machine -> unknown", (await get(superTok)).body.checks.find((c) => c.key === "data.backup").status === "unknown");
+
+      // --- real probe wiring that needs no network
+      check("withTimeout passes a normal result through untouched", (await health.withTimeout(Promise.resolve({ status: "ok", summary: "x" }), 1000)).summary === "x");
+      check("safeMessage shortens and redacts", health.safeMessage(new Error("a".repeat(300))).length <= 140 && !health.safeMessage(new Error("key=" + "Z".repeat(40))).includes("Z".repeat(40)));
+      check("push counters exist and are numbers", (() => { const s = require("./src/services/push.service").deliveryStats(); return typeof s.sent === "number" && typeof s.failed === "number" && typeof s.dead_tokens === "number" && typeof s.window_hours === "number"; })());
+    } finally {
+      Object.assign(health.probes, realProbes);
+      for (const k of envKeys) { if (savedEnv[k] === undefined) delete process.env[k]; else process.env[k] = savedEnv[k]; }
+      health.clearCache();
+      await new Promise((resolve) => server.close(resolve));
+      await db("admins").where("email", "like", "%@health.test").delete();
+    }
+  }
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

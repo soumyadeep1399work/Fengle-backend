@@ -741,6 +741,46 @@ The trip **kitchen -> drop-off** is measured by **road** (Google Routes API), on
 - **Fixed in passing**: `GET /riders/me/orders` used to return the raw order row; it now goes through the same privacy as every other order read (no delivery code, no kitchen payable or other internal fields).
 - **Behaviour change**: the rider could previously call the customer as soon as the order was assigned; now the customer's phone is shown only from pickup.
 
+## System health (admin, super_admin only; added 2026-11-09)
+
+`GET /admin/health` (optional `?refresh=1`). **super_admin only**: ops and support get **403** `{ code: "forbidden_role" }`. Read-only. Sent with `Cache-Control: no-store`.
+
+```
+{ checked_at, overall: "ok"|"warn"|"down",
+  checks: [ { key, group, label, status: "ok"|"warn"|"down"|"unknown", summary, value: number|null,
+              details?: { [label]: string|number|boolean|null }, checked_at } ] }
+```
+
+- `key` is `<group>.<name>`; `group` is one of `server`, `data`, `messaging`, `payments`, `google`, `domains`, `aws`; checks come back grouped in that order. `summary` is one short human line. `value` is the headline number (percent, latency, rupees, days, hours...) or null. `status: "unknown"` means it cannot be checked from here (not configured, no permission): not a failure. `overall` is the worst status (`unknown` does not count).
+- Every check runs in parallel under a **5 s** timeout (a hang becomes `down`, summary `No response in 5 s`); one check failing never fails the response. Nothing in the response is a secret.
+- **Caching**: cheap checks 15-60 s, `?refresh=1` re-runs them (at most once per 20 s per check). Slow, rate-limited or **billed** checks are cached and `?refresh=1` does **not** bypass them: Fast2SMS wallet and Razorpay 10 min, Google Routes 1 h, certificates 6 h, domain registration 24 h, AWS cost 24 h. A failed result is cached for much less (5 s - 10 min) than a good one.
+
+| key | what | thresholds |
+|---|---|---|
+| `server.memory` | RAM used %, plus swap (reads MemAvailable) | warn > 85, down > 95 |
+| `server.disk` | root filesystem used % | warn > 80, down > 92 |
+| `server.load_uptime` | load avg (1/5/15 min) vs CPU count, system and API-process uptime, PM2 restart count when known | warn when 5-min load > 1.5 x CPUs, down > 3 x |
+| `data.mysql` | ping latency and database size / table count | down if the ping fails, warn > 500 ms |
+| `data.s3_uploads`, `data.s3_private` | writes then reads back one tiny object `_health/ping.txt` (overwritten each time, never deleted: the server role may not delete) and times both | down on any failure, warn > 2 s; `unknown` when the bucket env is not set |
+| `data.backup` | last success line in `~/fengle-backup/backup.log` (`BACKUP_DIR` overrides the folder), and the newest local dump's size | warn > 26 h, down > 50 h or when an error line comes after the last success |
+| `messaging.fast2sms_wallet` | wallet balance in rupees (`GET /dev/wallet`); `approx_otps_left` only when `FAST2SMS_RATE_PER_SMS` is set | warn < 200, down < 50 or when the key is rejected |
+| `messaging.push` | FCM configured and signed in, delivery counters, registered devices | down if FCM is not configured in production or cannot sign in; warn if >= 5 failed and >= 25% of attempts |
+| `payments.razorpay` | keys valid (`GET /v1/payments?count=1`), `mode` test/live from the key prefix, webhook secret configured | down if rejected; warn if the webhook secret is missing |
+| `google.routes` | one tiny computeRoutes call (billed, so cached an hour) | ok / down with Google's reason |
+| `domains.ssl_<host>` (`fengle_in`, `api_fengle_in`, `admin_fengle_in`, `partner_fengle_in`; override the list with `HEALTH_SSL_HOSTS`) | days to certificate expiry, and whether the chain is trusted | warn < 20, down < 7 or untrusted |
+| `domains.registration` | expiry of `HEALTH_DOMAIN` (default fengle.in) from public RDAP (the .in registry, rdap.org as the fallback) | warn < 30, down < 7 |
+| `aws.cost_mtd` | month-to-date unblended cost via Cost Explorer `GetCostAndUsage` (billed ~$0.01, cached 24 h) plus a straight-line month-end estimate in `details` | always `ok` unless `HEALTH_COST_WARN_USD` is set; `unknown` with summary `Needs the ce:GetCostAndUsage permission` until the instance role has it |
+
+Push counters (`sent_last_24h`, `failed_last_24h`, `dead_tokens_removed_last_24h`) are in memory: they start at zero on every server restart and the check says over how many hours they were counted (`counted_over_hours`). A dead token (app uninstalled) is counted apart and is not a failure.
+
+IAM policy for the cost check (attach to the EC2 instance role; the Cost Explorer endpoint is global, `Resource` must be `*`):
+
+```json
+{ "Version": "2012-10-17", "Statement": [ { "Effect": "Allow", "Action": ["ce:GetCostAndUsage"], "Resource": "*" } ] }
+```
+
+If it is still denied after that, the AWS root user must switch on "IAM user and role access to Billing information" (Account page).
+
 ## Known gaps / placeholders
 
 **Needs a real value from the client before go-live**

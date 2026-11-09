@@ -18,6 +18,31 @@ const EXPO_MAX_BATCH = 100;
 const FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
+// Delivery counters for the admin System health page. In memory only: they start at zero when the server restarts, and the
+// page says so. A "dead token" (app uninstalled) is not a failure of the push system, so it is counted apart.
+const WINDOW_MS = 24 * 60 * 60 * 1000;
+const stats = { startedAt: Date.now(), events: [], lastError: null, lastErrorAt: null }; // events: [timestamp, "sent"|"failed"|"dead"]
+function record(kind, n = 1) {
+  const now = Date.now();
+  for (let i = 0; i < n; i += 1) stats.events.push([now, kind]);
+  if (stats.events.length > 20000) stats.events.splice(0, stats.events.length - 20000);
+}
+function recordError(message) {
+  stats.lastError = String(message || "unknown").slice(0, 160);
+  stats.lastErrorAt = new Date().toISOString();
+}
+/** Pushes accepted / rejected / dead-token in the last 24 h (or since this process started, if that is shorter). */
+function deliveryStats() {
+  const cutoff = Date.now() - WINDOW_MS;
+  while (stats.events.length && stats.events[0][0] < cutoff) stats.events.shift();
+  const count = (kind) => stats.events.filter((e) => e[1] === kind).length;
+  return {
+    sent: count("sent"), failed: count("failed"), dead_tokens: count("dead"),
+    window_hours: Math.min(24, Math.round(((Date.now() - stats.startedAt) / 3600000) * 10) / 10),
+    last_error: stats.lastError, last_error_at: stats.lastErrorAt,
+  };
+}
+
 const isExpoToken = (token) => token.startsWith("ExponentPushToken[") || token.startsWith("ExpoPushToken[");
 
 async function deleteTokens(tokens) {
@@ -93,7 +118,7 @@ function buildFcmMessage(token, { title, body, data = {}, alert }) {
 async function sendFcm(tokens, { title, body, data, alert }) {
   const sa = getServiceAccount();
   if (!tokens.length) return { sent: 0, failed: 0 };
-  if (!sa) return { sent: 0, failed: tokens.length }; // FCM isn't configured on this server
+  if (!sa) { record("failed", tokens.length); recordError("FCM is not configured on this server"); return { sent: 0, failed: tokens.length }; } // FCM isn't configured on this server
   let sent = 0;
   const accessToken = await getAccessToken(sa);
   const url = `https://fcm.googleapis.com/v1/projects/${sa.project_id}/messages:send`;
@@ -105,10 +130,10 @@ async function sendFcm(tokens, { title, body, data, alert }) {
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
         body: JSON.stringify({ message: buildFcmMessage(token, { title, body, data, alert }) }),
       });
-      if (res.ok) { sent += 1; return; }
+      if (res.ok) { sent += 1; record("sent"); return; }
       const { error } = await res.json().catch(() => ({}));
-      if (isDeadTokenError(res.status, error)) dead.push(token);
-      else console.error("[push] FCM send failed", res.status, error && error.message);
+      if (isDeadTokenError(res.status, error)) { dead.push(token); record("dead"); }
+      else { console.error("[push] FCM send failed", res.status, error && error.message); record("failed"); recordError(`FCM ${res.status} ${(error && error.message) || ""}`); }
     })
   );
   await deleteTokens(dead);
@@ -131,15 +156,16 @@ async function sendExpo(tokens, { title, body, data, alert }) {
     const payload = await res.json().catch(() => null);
     if (!res.ok || !payload || !Array.isArray(payload.data)) {
       console.error("[push] Expo push request failed", res.status, payload && payload.errors);
+      record("failed", batch.length); recordError(`Expo push request failed (${res.status})`);
       continue; // this whole batch counts as failed (sent is only incremented for accepted tickets)
     }
 
     // Tickets come back in message order.
     const dead = [];
     payload.data.forEach((ticket, idx) => {
-      if (ticket.status !== "error") { sent += 1; return; }
-      if (ticket.details && ticket.details.error === "DeviceNotRegistered") dead.push(batch[idx].to);
-      else console.error("[push] Expo ticket error", ticket.message);
+      if (ticket.status !== "error") { sent += 1; record("sent"); return; }
+      if (ticket.details && ticket.details.error === "DeviceNotRegistered") { dead.push(batch[idx].to); record("dead"); }
+      else { console.error("[push] Expo ticket error", ticket.message); record("failed"); recordError(`Expo: ${ticket.message || "ticket error"}`); }
     });
     await deleteTokens(dead);
   }
@@ -243,4 +269,22 @@ function notifyLater(job) {
   });
 }
 
-module.exports = { buildFcmMessage, sendToOwner, notifyLater, CHANNEL_ID, promoOptIn, sendPromoBroadcast, sendToCustomerDevices };
+/**
+ * What the System health page needs: is FCM configured, can we still get an OAuth token (the cached one when there is one, so this is
+ * almost always free), and the delivery counters. Never returns key material.
+ */
+async function health() {
+  let fcm = { configured: false, auth_ok: false, error: null };
+  try {
+    const sa = getServiceAccount();
+    if (sa) {
+      fcm.configured = true;
+      try { await getAccessToken(sa); fcm.auth_ok = true; } catch (err) { fcm.error = String(err.message).slice(0, 160); }
+    }
+  } catch (err) {
+    fcm.error = "The FCM service account file could not be read";
+  }
+  return { fcm, expo_access_token_set: Boolean(process.env.EXPO_ACCESS_TOKEN), stats: deliveryStats() };
+}
+
+module.exports = { health, deliveryStats, buildFcmMessage, sendToOwner, notifyLater, CHANNEL_ID, promoOptIn, sendPromoBroadcast, sendToCustomerDevices };

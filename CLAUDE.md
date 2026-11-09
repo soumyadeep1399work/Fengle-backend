@@ -256,6 +256,11 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   the order is `picked_up` / `on_the_way`; before that and after delivery the rider gets
   `delivery_area` only, coordinates rounded to ~1 km and null contact. Every rider-facing order
   read must go through `customerDetails.forRider` (never return a raw order row to a rider).
+- **System health** (2026-11-09): `GET /admin/health`, super_admin only, read-only, services/systemHealth.service.js.
+  A flat list of checks (`server`, `data`, `messaging`, `payments`, `google`, `domains`, `aws`). Never put a secret in the output; every
+  outside call goes through the exported `probes` object (the tests replace it, the suite never touches the network for this); billed
+  checks (Cost Explorer, Google Routes) are cached and `?refresh=1` must never bypass them. The S3 checks overwrite one `_health/ping.txt`
+  and do not delete (the instance role has no DeleteObject by design).
 - **Never send raw server errors to a client** (2026-11-04): the central error
   handler in `app.js` returns a generic message + `ref` for any 5xx in production
   (the real error is logged under that ref); only deliberate 4xx messages are shown.

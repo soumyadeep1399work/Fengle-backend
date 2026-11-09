@@ -18,6 +18,7 @@ const adminNotifications = require("../controllers/adminNotifications.controller
 const adminShipping = require("../controllers/adminShipping.controller");
 const adminRestSettlement = require("../controllers/adminRestaurantSettlement.controller");
 const partnerDocuments = require("../controllers/partnerDocuments.controller");
+const adminHealth = require("../controllers/adminHealth.controller");
 
 const router = express.Router();
 
@@ -34,6 +35,9 @@ const superOnly = requireRole("super_admin");
 const staff = requireRole("super_admin", "ops");
 
 router.get("/dashboard", adminController.dashboardSummary);
+
+// System health (read-only checks of the server, database, storage, SMS, payments, certificates, AWS cost): super_admin only.
+router.get("/health", superOnly, adminHealth.getHealth);
 
 // Orders
 router.get("/orders", adminOrders.listOrders);
