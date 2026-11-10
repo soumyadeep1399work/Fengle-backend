@@ -4,7 +4,7 @@ const { normalizeCategoryName } = require("../utils/categoryName");
 const categoryService = require("../services/category.service");
 const { parsePortionInput, presentPortion } = require("../utils/portion");
 const { presentPricing, presentAdminPricing, offerIsActive } = require("../utils/pricing");
-const { openStatus } = require("../utils/serviceHours");
+const { openStatus, isOnline, isWithinHours } = require("../utils/serviceHours");
 
 // What customers see for an item: portion label + price/offer/effective_price.
 const presentCatalogItem = (row) => presentPricing(presentPortion(row));
@@ -25,11 +25,11 @@ const ITEM_COLUMNS = ["items.id", "items.name", "items.description", "items.pric
  * category that only offline kitchens carry disappears. A kitchen that is only outside its service HOURS stays visible (its category shows
  * `closed` with `opens_at`): the client chose that for scheduled closing, but an owner who takes the kitchen offline wants it gone.
  */
-async function getInRangeRestaurants(lat, lng, categoryId) {
+async function getInRangeRestaurants(lat, lng, categoryId, { includeOffline = false } = {}) {
   let query = db("restaurants")
     .where("restaurants.status", "active")
     .andWhere("restaurants.verification_status", "approved")
-    .andWhere("restaurants.is_online", true)
+    .modify((qb) => { if (!includeOffline) qb.andWhere("restaurants.is_online", true); })
     .modify((qb) => applyDocumentsGate(qb, "restaurants.documents_valid_until"));
   if (categoryId) {
     query = query
@@ -38,6 +38,41 @@ async function getInRangeRestaurants(lat, lng, categoryId) {
   }
   const restaurants = await query.select("restaurants.id", "restaurants.lat", "restaurants.lng", "restaurants.opens_at", "restaurants.closes_at", "restaurants.is_online");
   return restaurants.filter((r) => haversineDistanceKm(Number(lat), Number(lng), Number(r.lat), Number(r.lng)) <= CATALOG_RANGE_KM);
+}
+
+/**
+ * Every dish a kitchen within range carries for ONE category, offline kitchens and disabled dishes included, each with `available` and
+ * `unavailable_reason` (null | 'kitchen_offline' | 'kitchen_closed' | 'item_disabled') so the customer app can fade the row instead of the dish
+ * vanishing. Live reads, nothing cached: a kitchen's toggle shows on the very next call.
+ *
+ * A kitchen can take a dish only if it is online AND inside its service hours AND has the dish switched on (the rule the order path uses).
+ * A dish is available when at least one in-range kitchen can. Otherwise, per carrying kitchen the reason is offline > closed > item_disabled, and
+ * for the dish: all kitchens offline -> 'kitchen_offline'; else none of them has it disabled (offline/closed mix) -> 'kitchen_closed'; else 'item_disabled'.
+ * Returns plain item rows (ITEM_COLUMNS) plus those two fields. The customer never learns which kitchen: the reason names no one.
+ */
+async function getCategoryItemsWithAvailability(lat, lng, categoryId, now = new Date()) {
+  const kitchens = await getInRangeRestaurants(lat, lng, categoryId, { includeOffline: true });
+  if (kitchens.length === 0) return [];
+  const byId = new Map(kitchens.map((k) => [k.id, k]));
+  const rows = await db("items")
+    .join("restaurant_items", "items.id", "restaurant_items.item_id")
+    .whereIn("restaurant_items.restaurant_id", [...byId.keys()])
+    .andWhere("items.category_id", categoryId)
+    .andWhere("items.is_active", true)
+    .select([...ITEM_COLUMNS, "restaurant_items.restaurant_id as kitchen_id", "restaurant_items.is_available as kitchen_item_on"]);
+
+  const byItem = new Map(); // item id -> { row, reasons: [null | reason, ...] } (one entry per carrying kitchen)
+  for (const { kitchen_id, kitchen_item_on, ...row } of rows) {
+    const kitchen = byId.get(kitchen_id);
+    const reason = !isOnline(kitchen) ? "kitchen_offline" : !isWithinHours(kitchen, now) ? "kitchen_closed" : !kitchen_item_on ? "item_disabled" : null;
+    if (!byItem.has(row.id)) byItem.set(row.id, { row, reasons: [] });
+    byItem.get(row.id).reasons.push(reason);
+  }
+  return [...byItem.values()].map(({ row, reasons }) => {
+    const available = reasons.some((r) => r === null);
+    const unavailable_reason = available ? null : reasons.every((r) => r === "kitchen_offline") ? "kitchen_offline" : reasons.every((r) => r !== "item_disabled") ? "kitchen_closed" : "item_disabled";
+    return { ...row, available, unavailable_reason };
+  });
 }
 
 async function getInRangeRestaurantIds(lat, lng, categoryId) {
@@ -234,24 +269,16 @@ async function getCategoryDetail(req, res) {
   const category = await db("categories").where({ id, is_active: true }).first();
   if (!category) return res.status(404).json({ error: "Category not found" });
 
-  const inRangeRestaurantIds = await getInRangeRestaurantIds(lat, lng, id);
-  let items = [];
-  if (inRangeRestaurantIds.length > 0) {
-    items = await db("items")
-      .join("restaurant_items", "items.id", "restaurant_items.item_id")
-      .whereIn("restaurant_items.restaurant_id", inRangeRestaurantIds)
-      .andWhere("restaurant_items.is_available", true)
-      .andWhere("items.category_id", id)
-      .andWhere("items.is_active", true)
-      .groupBy(...ITEM_COLUMNS)
-      .select(ITEM_COLUMNS);
-  }
+  // Every dish an in-range kitchen carries, with `available` / `unavailable_reason` (a dish nobody can take right now is listed, flagged, not hidden).
+  const items = await getCategoryItemsWithAvailability(lat, lng, id);
 
-  const itemsWithRatings = (await attachRatings(items)).map(presentCatalogItem);
-  const sorted = [...itemsWithRatings].sort((a, b) => (b.ratingCount - a.ratingCount) || (b.avgRating || 0) - (a.avgRating || 0));
-  const popular = sorted.slice(0, 3);
+  const itemsWithRatings = (await attachRatings(items)).map((i) => ({ ...presentCatalogItem(i), available: i.available, unavailable_reason: i.unavailable_reason }));
+  const byPopularity = (a, b) => (b.ratingCount - a.ratingCount) || (b.avgRating || 0) - (a.avgRating || 0);
+  const availableItems = itemsWithRatings.filter((i) => i.available).sort(byPopularity);
+  const unavailableItems = itemsWithRatings.filter((i) => !i.available).sort(byPopularity);
+  const popular = availableItems.slice(0, 3); // only dishes that can be ordered are "Popular"
   const popularIds = new Set(popular.map((i) => i.id));
-  const more = sorted.filter((i) => !popularIds.has(i.id));
+  const more = [...availableItems.filter((i) => !popularIds.has(i.id)), ...unavailableItems]; // available first, the faded ones after
 
   res.json({
     category: serializeCategory(category, {
@@ -278,23 +305,11 @@ async function listItemsForCategory(req, res) {
     return res.status(400).json({ error: "lat and lng query params are required" });
   }
 
-  const inRangeRestaurants = await getInRangeRestaurants(lat, lng, categoryId);
-  const inRangeRestaurantIds = inRangeRestaurants.map((r) => r.id);
-  const { closed, opens_at } = openStatus(inRangeRestaurants);
-  if (inRangeRestaurantIds.length === 0) {
-    return res.json({ items: [], closed, opens_at });
-  }
-
-  const items = await db("items")
-    .join("restaurant_items", "items.id", "restaurant_items.item_id")
-    .whereIn("restaurant_items.restaurant_id", inRangeRestaurantIds)
-    .andWhere("restaurant_items.is_available", true)
-    .andWhere("items.category_id", categoryId)
-    .andWhere("items.is_active", true)
-    .groupBy(...ITEM_COLUMNS)
-    .select(ITEM_COLUMNS);
-
-  res.json({ items: (await attachRatings(items)).map(presentCatalogItem), closed, opens_at });
+  // closed / opens_at describe the ONLINE kitchens only, exactly as before; the items also include the offline kitchens' dishes, flagged.
+  const { closed, opens_at } = openStatus(await getInRangeRestaurants(lat, lng, categoryId));
+  const items = await getCategoryItemsWithAvailability(lat, lng, categoryId);
+  const presented = (await attachRatings(items)).map((i) => ({ ...presentCatalogItem(i), available: i.available, unavailable_reason: i.unavailable_reason }));
+  res.json({ items: [...presented.filter((i) => i.available), ...presented.filter((i) => !i.available)], closed, opens_at }); // available first
 }
 
 /**

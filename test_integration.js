@@ -4466,9 +4466,9 @@ async function main() {
       const c1 = cats.body.categories.find((c) => c.id === cat);
       check("catalog: a category that only OFFLINE kitchens carry disappears from the customer's category list (the owner switched it off, so its menu is hidden)", !c1);
       const items1 = await call(null, "GET", `/categories/${cat}/items?lat=${LAT}&lng=${LNG}`);
-      check("the items endpoint lists none of an offline kitchen's dishes", items1.status === 200 && items1.body.items.length === 0);
+      check("the items endpoint still LISTS an offline kitchen's dish, but flagged (available false, kitchen_offline) so the app can fade it", items1.status === 200 && items1.body.items.length === 1 && items1.body.items[0].available === false && items1.body.items[0].unavailable_reason === "kitchen_offline");
       const detail1 = await call(null, "GET", `/categories/${cat}?lat=${LAT}&lng=${LNG}`);
-      check("category detail has no dishes either", detail1.status === 200 && detail1.body.sections.flatMap((s) => s.items).length === 0);
+      check("category detail lists it too, flagged, and never under Popular", detail1.status === 200 && detail1.body.sections.flatMap((s) => s.items).length === 1 && detail1.body.sections.find((s) => s.title === "Popular").items.length === 0 && detail1.body.sections.flatMap((s) => s.items)[0].available === false);
       const hiddenElsewhere = await Promise.all([call(null, "GET", `/items/search?q=Switch&lat=${LAT}&lng=${LNG}`), call(null, "GET", `/items/popular?lat=${LAT}&lng=${LNG}`), call(null, "GET", `/items/deals?lat=${LAT}&lng=${LNG}`)]);
       check("search, popular and deals hide an offline kitchen's dish too", hiddenElsewhere.every((r) => r.status === 200 && !JSON.stringify(r.body.items || []).includes("Switch Dish")));
       const qc = await quote();
@@ -6057,6 +6057,104 @@ async function main() {
       health.clearCache();
       await new Promise((resolve) => server.close(resolve));
       await db("admins").where("email", "like", "%@health.test").delete();
+    }
+  }
+
+  console.log("\n--- Test 72: Category dishes that cannot be ordered right now are listed, flagged (available / unavailable_reason), not hidden ---");
+  {
+    const http = require("http");
+    const hours = require("./src/utils/serviceHours");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) }, body: body !== undefined ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    try {
+      const LAT = 23.25, LNG = 89.15;
+      const [cat] = await db("categories").insert({ name: "Flag Category" });
+      const mkDish = async (name, extra = {}) => (await db("items").insert({ category_id: cat, name, price: 100, created_by_type: "admin", ...extra }))[0];
+      const dA = await mkDish("Flag Dish A"), dB = await mkDish("Flag Dish B"), dC = await mkDish("Flag Dish C"), dD = await mkDish("Flag Dish D"), dE = await mkDish("Flag Dish E");
+      const dInactive = await mkDish("Flag Dish Inactive", { is_active: false }), dFar = await mkDish("Flag Dish Far");
+      const mkKitchen = async (name, phone, dLat, extra = {}) => {
+        const [id] = await db("restaurants").insert({ name, phone, address: "Newtown", lat: LAT + dLat, lng: LNG, radius_km: 5, status: "active", ...extra });
+        await db("restaurant_categories").insert({ restaurant_id: id, category_id: cat });
+        return id;
+      };
+      const carry = (kitchen, item, on = true) => db("restaurant_items").insert({ restaurant_id: kitchen, item_id: item, is_available: on });
+      const k1 = await mkKitchen("Flag K1", "8700072001", 0.004);
+      const k2 = await mkKitchen("Flag K2 offline", "8700072002", 0.006, { is_online: false });
+      const kFar = await mkKitchen("Flag K far", "8700072003", 0.3); // ~33 km: out of range
+      const kPending = await mkKitchen("Flag K pending", "8700072004", 0.005, { verification_status: "pending" });
+      await carry(k1, dA); await carry(k1, dB); await carry(k1, dC, false); await carry(k1, dE, false); await carry(k1, dInactive);
+      await carry(k2, dA); await carry(k2, dD); await carry(k2, dE);
+      await carry(kFar, dFar); await carry(kPending, dD);
+      const [cust] = await db("users").insert({ name: "Flag Customer", phone: "8000072001", wallet_balance: 0 });
+      const custTok = signToken({ id: cust, type: "customer" });
+      const k1Tok = signToken({ id: k1, type: "restaurant" });
+      const items = async () => (await call(null, "GET", `/categories/${cat}/items?lat=${LAT}&lng=${LNG}`)).body.items;
+      const by = (list) => Object.fromEntries(list.map((i) => [i.name, i]));
+      const state = (i) => `${i.available}/${i.unavailable_reason}`;
+
+      // --- situation 3 (item disabled), situation 1 (kitchen offline), dishes that can be ordered
+      let list = by(await items());
+      check("every dish an in-range kitchen carries is listed; inactive, out-of-range and unapproved-kitchen-only dishes are not", Object.keys(list).sort().join() === "Flag Dish A,Flag Dish B,Flag Dish C,Flag Dish D,Flag Dish E" && !list["Flag Dish Inactive"] && !list["Flag Dish Far"]);
+      check("dishes an online, open kitchen has switched on: available true, reason null (A even though the other kitchen is offline)", state(list["Flag Dish A"]) === "true/null" && state(list["Flag Dish B"]) === "true/null");
+      check("the kitchen disabled the dish (situation 3) -> available false, item_disabled", state(list["Flag Dish C"]) === "false/item_disabled");
+      check("only an OFFLINE kitchen carries it (situation 1) -> available false, kitchen_offline", state(list["Flag Dish D"]) === "false/kitchen_offline");
+      check("disabled at the online kitchen + offline elsewhere (mixed) -> item_disabled", state(list["Flag Dish E"]) === "false/item_disabled");
+      const flat = await items();
+      check("flat list: available dishes first, the faded ones after, every row carries both fields", flat.every((i) => typeof i.available === "boolean" && "unavailable_reason" in i) && flat.slice(0, 2).every((i) => i.available) && flat.slice(2).every((i) => !i.available));
+      check("the usual item fields are untouched (price, effective_price, avgRating ...)", flat[0].price !== undefined && flat[0].effective_price !== undefined && "avgRating" in flat[0] && !("kitchen_id" in flat[0]) && !("restaurant_id" in flat[0]));
+
+      // --- the sectioned detail
+      const detail = await call(null, "GET", `/categories/${cat}?lat=${LAT}&lng=${LNG}`);
+      const popular = detail.body.sections.find((s) => s.title === "Popular").items, more = detail.body.sections.find((s) => s.title === "More").items;
+      check("category detail: 'Popular' holds only dishes that can be ordered; 'More' lists available ones first, then the faded ones", detail.status === 200 && popular.length === 2 && popular.every((i) => i.available) && more.length === 3 && more.every((i) => !i.available) && detail.body.sections.flatMap((s) => s.items).every((i) => typeof i.available === "boolean"));
+
+      // --- live: a kitchen's toggle shows on the very next read (no caching)
+      const off = await call(k1Tok, "PATCH", "/restaurants/me/availability", { online: false });
+      list = by(await items());
+      check("kitchen switches OFFLINE -> its dishes show kitchen_offline on the very next read (dish A, B: every carrying kitchen is offline now)", off.status === 200 && state(list["Flag Dish A"]) === "false/kitchen_offline" && state(list["Flag Dish B"]) === "false/kitchen_offline");
+      check("and a dish it had disabled is now reported as offline (offline beats disabled)", state(list["Flag Dish C"]) === "false/kitchen_offline");
+      const categories = (await call(null, "GET", `/categories?lat=${LAT}&lng=${LNG}`)).body.categories;
+      check("GET /categories (the list) is unchanged: a category only offline kitchens carry is absent from it", !categories.find((c) => c.id === cat));
+      await call(k1Tok, "PATCH", "/restaurants/me/availability", { online: true });
+      check("switching back ONLINE -> available again on the next read", state(by(await items())["Flag Dish B"]) === "true/null");
+      await db("restaurant_items").where({ restaurant_id: k1, item_id: dB }).update({ is_available: false });
+      check("kitchen disables a dish -> item_disabled on the next read", state(by(await items())["Flag Dish B"]) === "false/item_disabled");
+      await db("restaurant_items").where({ restaurant_id: k1, item_id: dB }).update({ is_available: true });
+
+      // --- situation 2 (outside service hours)
+      const nowMin = hours.nowMinutesIst();
+      const hhmm = (min) => { const m = ((min % 1440) + 1440) % 1440; return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`; };
+      await db("restaurants").where({ id: k1 }).update({ opens_at: hhmm(nowMin + 120), closes_at: hhmm(nowMin + 240) });
+      const closedFlat = await call(null, "GET", `/categories/${cat}/items?lat=${LAT}&lng=${LNG}`);
+      list = by(closedFlat.body.items);
+      check("the kitchen is outside its service hours (situation 2) -> kitchen_closed", state(list["Flag Dish B"]) === "false/kitchen_closed");
+      check("closed beats disabled; closed + another kitchen offline (mix) -> kitchen_closed; only-offline stays kitchen_offline", state(list["Flag Dish C"]) === "false/kitchen_closed" && state(list["Flag Dish A"]) === "false/kitchen_closed" && state(list["Flag Dish D"]) === "false/kitchen_offline");
+      check("dish E: closed at the online kitchen (closed beats disabled) and offline at the other -> kitchen_closed", state(list["Flag Dish E"]) === "false/kitchen_closed");
+      check("the response's closed / opens_at still describe the online kitchens (unchanged)", closedFlat.body.closed === true && closedFlat.body.opens_at === hhmm(nowMin + 120));
+      await db("restaurants").where({ id: k1 }).update({ opens_at: null, closes_at: null });
+
+      // --- everything else stays as it was
+      const search = await call(null, "GET", `/items/search?q=Flag%20Dish&lat=${LAT}&lng=${LNG}`);
+      const popularList = await call(null, "GET", `/items/popular?lat=${LAT}&lng=${LNG}`);
+      const names = (r) => (r.body.items || []).map((i) => i.name);
+      check("search lists available dishes only (no disabled / offline-only dish) and adds no new fields", search.status === 200 && names(search).includes("Flag Dish A") && names(search).includes("Flag Dish B") && !names(search).includes("Flag Dish C") && !names(search).includes("Flag Dish D") && search.body.items.every((i) => !("unavailable_reason" in i)));
+      check("popular hides them too", popularList.status === 200 && !names(popularList).includes("Flag Dish C") && !names(popularList).includes("Flag Dish D"));
+      const qOk = await call(custTok, "POST", "/cart/quote", { items: [{ item_id: dC, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG });
+      const qOffline = await call(custTok, "POST", "/cart/quote", { items: [{ item_id: dD, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG });
+      check("the quote still refuses a disabled dish and an offline-only dish (not valid, with a reason)", qOk.body.valid === false && qOffline.body.valid === false && (qOk.body.unavailable_reason || qOk.body.reason || qOk.body.error || qOk.text).toString().length > 0);
+      const ordC = await call(custTok, "POST", "/orders", { items: [{ item_id: dC, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Flag Address", payment_method: "cod" });
+      check("POST /orders still rejects a dish nobody can take", ordC.status >= 400 && ordC.status < 500);
+      check("no lat/lng -> 400 still", (await call(null, "GET", `/categories/${cat}/items`)).status === 400 && (await call(null, "GET", `/categories/${cat}`)).status === 400);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
     }
   }
 

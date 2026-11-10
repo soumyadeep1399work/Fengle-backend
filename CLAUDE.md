@@ -206,8 +206,11 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   offline kitchen is simply "closed" (with `opens_at` null when the switch is the only
   reason). Logout doesn't change it; admins can force it; changes are in
   `restaurant_availability_history`.
-  Offline also HIDES the kitchen's menu from the customer catalog (`getInRangeRestaurants`
-  filters `is_online`); only a kitchen outside its hours still shows, as a closed category.
+  Offline also HIDES the kitchen's menu from the customer catalog lists, search, popular and deals (`getInRangeRestaurants`
+  filters `is_online`); only a kitchen outside its hours still shows, as a closed category. The ONE exception (2026-11-10, client
+  request): a category's own dish lists (`GET /categories/:id`, `/categories/:id/items`) show every dish an in-range kitchen carries,
+  flagged `available` / `unavailable_reason` (`kitchen_offline` | `kitchen_closed` | `item_disabled`), uncached, so the app can fade them
+  (`getCategoryItemsWithAvailability`).
 - **Kitchen new-order alarm** (2026-11-08): every new-order push to a kitchen
   goes through `orderNotifications.newOrderForRestaurant` (loud Android channel
   `new-orders`, one notification per order via a tag). `services/kitchenAlert.service.js`
