@@ -41,9 +41,11 @@ async function getInRangeRestaurants(lat, lng, categoryId, { includeOffline = fa
 }
 
 /**
- * Every dish a kitchen within range carries for ONE category, offline kitchens and disabled dishes included, each with `available` and
- * `unavailable_reason` (null | 'kitchen_offline' | 'kitchen_closed' | 'item_disabled') so the customer app can fade the row instead of the dish
- * vanishing. Live reads, nothing cached: a kitchen's toggle shows on the very next call.
+ * EVERY dish an active, approved kitchen carries for ONE category (offline kitchens, disabled dishes and kitchens beyond the 7 km routing
+ * ceiling included), each with `available` and `unavailable_reason` (null | 'kitchen_offline' | 'kitchen_closed' | 'item_disabled' |
+ * 'out_of_area') so the customer app can fade the row instead of the dish vanishing. Live reads, nothing cached.
+ * The same dish (category + lower(trim(name))) is listed ONCE, with the best status across its kitchens: orderable > unavailable in range >
+ * out_of_area, and the returned id is the item row routing would use (nearest kitchen that can take it, then lowest id).
  *
  * A kitchen can take a dish only if it is online AND inside its service hours AND has the dish switched on (the rule the order path uses).
  * A dish is available when at least one in-range kitchen can. Otherwise, per carrying kitchen the reason is offline > closed > item_disabled, and
@@ -51,9 +53,16 @@ async function getInRangeRestaurants(lat, lng, categoryId, { includeOffline = fa
  * Returns plain item rows (ITEM_COLUMNS) plus those two fields. The customer never learns which kitchen: the reason names no one.
  */
 async function getCategoryItemsWithAvailability(lat, lng, categoryId, now = new Date()) {
-  const kitchens = await getInRangeRestaurants(lat, lng, categoryId, { includeOffline: true });
-  if (kitchens.length === 0) return [];
-  const byId = new Map(kitchens.map((k) => [k.id, k]));
+  // EVERY active, approved kitchen anywhere that carries this category (offline included), each with its distance from the customer.
+  const query = db("restaurants")
+    .join("restaurant_categories", "restaurants.id", "restaurant_categories.restaurant_id")
+    .where("restaurant_categories.category_id", categoryId)
+    .andWhere("restaurants.status", "active")
+    .andWhere("restaurants.verification_status", "approved")
+    .modify((qb) => applyDocumentsGate(qb, "restaurants.documents_valid_until"));
+  const all = await query.select("restaurants.id", "restaurants.lat", "restaurants.lng", "restaurants.opens_at", "restaurants.closes_at", "restaurants.is_online");
+  if (all.length === 0) return [];
+  const byId = new Map(all.map((k) => [k.id, { ...k, distanceKm: haversineDistanceKm(Number(lat), Number(lng), Number(k.lat), Number(k.lng)) }]));
   const rows = await db("items")
     .join("restaurant_items", "items.id", "restaurant_items.item_id")
     .whereIn("restaurant_items.restaurant_id", [...byId.keys()])
@@ -61,19 +70,35 @@ async function getCategoryItemsWithAvailability(lat, lng, categoryId, now = new 
     .andWhere("items.is_active", true)
     .select([...ITEM_COLUMNS, "restaurant_items.restaurant_id as kitchen_id", "restaurant_items.is_available as kitchen_item_on"]);
 
-  const byItem = new Map(); // item id -> { row, reasons: [null | reason, ...] } (one entry per carrying kitchen)
+  // Group "the same dish" (category + lower(trim(name))) so it is listed once, however many item rows / kitchens carry it. One entry per
+  // (item row, kitchen) pair; each pair has a status: null = orderable, else its reason ('out_of_area' beyond the 7 km routing ceiling).
+  const groups = new Map();
   for (const { kitchen_id, kitchen_item_on, ...row } of rows) {
     const kitchen = byId.get(kitchen_id);
-    const reason = !isOnline(kitchen) ? "kitchen_offline" : !isWithinHours(kitchen, now) ? "kitchen_closed" : !kitchen_item_on ? "item_disabled" : null;
-    if (!byItem.has(row.id)) byItem.set(row.id, { row, reasons: [] });
-    byItem.get(row.id).reasons.push(reason);
+    const inRange = kitchen.distanceKm <= CATALOG_RANGE_KM;
+    const reason = !inRange ? "out_of_area" : !isOnline(kitchen) ? "kitchen_offline" : !isWithinHours(kitchen, now) ? "kitchen_closed" : !kitchen_item_on ? "item_disabled" : null;
+    const key = String(row.name).trim().toLowerCase();
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ row, reason, inRange, distanceKm: kitchen.distanceKm });
   }
-  return [...byItem.values()].map(({ row, reasons }) => {
-    const available = reasons.some((r) => r === null);
-    const unavailable_reason = available ? null : reasons.every((r) => r === "kitchen_offline") ? "kitchen_offline" : reasons.every((r) => r !== "item_disabled") ? "kitchen_closed" : "item_disabled";
-    return { ...row, available, unavailable_reason };
+
+  // The item id the app puts in the cart must be the one routing would use: the nearest kitchen that can take it, then the lowest id.
+  const nearest = (pairs) => pairs.reduce((best, p) => (!best || p.distanceKm < best.distanceKm || (p.distanceKm === best.distanceKm && p.row.id < best.row.id) ? p : best), null);
+  return [...groups.values()].map((pairs) => {
+    const orderable = pairs.filter((p) => p.reason === null);
+    if (orderable.length > 0) return { ...nearest(orderable).row, available: true, unavailable_reason: null };
+    const near = pairs.filter((p) => p.inRange);
+    if (near.length > 0) {
+      const reasons = near.map((p) => p.reason);
+      const unavailable_reason = reasons.every((r) => r === "kitchen_offline") ? "kitchen_offline" : reasons.every((r) => r !== "item_disabled") ? "kitchen_closed" : "item_disabled";
+      return { ...nearest(near).row, available: false, unavailable_reason };
+    }
+    return { ...nearest(pairs).row, available: false, unavailable_reason: "out_of_area" };
   });
 }
+
+// Orderable first, then unavailable near the customer, then not served in their area.
+const availabilityRank = (i) => (i.available ? 0 : i.unavailable_reason === "out_of_area" ? 2 : 1);
 
 async function getInRangeRestaurantIds(lat, lng, categoryId) {
   return (await getInRangeRestaurants(lat, lng, categoryId)).map((r) => r.id);
@@ -275,10 +300,10 @@ async function getCategoryDetail(req, res) {
   const itemsWithRatings = (await attachRatings(items)).map((i) => ({ ...presentCatalogItem(i), available: i.available, unavailable_reason: i.unavailable_reason }));
   const byPopularity = (a, b) => (b.ratingCount - a.ratingCount) || (b.avgRating || 0) - (a.avgRating || 0);
   const availableItems = itemsWithRatings.filter((i) => i.available).sort(byPopularity);
-  const unavailableItems = itemsWithRatings.filter((i) => !i.available).sort(byPopularity);
+  const unavailableItems = itemsWithRatings.filter((i) => !i.available).sort((a, b) => availabilityRank(a) - availabilityRank(b) || byPopularity(a, b));
   const popular = availableItems.slice(0, 3); // only dishes that can be ordered are "Popular"
   const popularIds = new Set(popular.map((i) => i.id));
-  const more = [...availableItems.filter((i) => !popularIds.has(i.id)), ...unavailableItems]; // available first, the faded ones after
+  const more = [...availableItems.filter((i) => !popularIds.has(i.id)), ...unavailableItems]; // orderable, then unavailable nearby, then out_of_area
 
   res.json({
     category: serializeCategory(category, {
@@ -309,7 +334,7 @@ async function listItemsForCategory(req, res) {
   const { closed, opens_at } = openStatus(await getInRangeRestaurants(lat, lng, categoryId));
   const items = await getCategoryItemsWithAvailability(lat, lng, categoryId);
   const presented = (await attachRatings(items)).map((i) => ({ ...presentCatalogItem(i), available: i.available, unavailable_reason: i.unavailable_reason }));
-  res.json({ items: [...presented.filter((i) => i.available), ...presented.filter((i) => !i.available)], closed, opens_at }); // available first
+  res.json({ items: [...presented].sort((a, b) => availabilityRank(a) - availabilityRank(b)), closed, opens_at }); // orderable, then unavailable nearby, then out_of_area (stable)
 }
 
 /**

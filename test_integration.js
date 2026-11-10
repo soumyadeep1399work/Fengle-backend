@@ -6102,19 +6102,19 @@ async function main() {
 
       // --- situation 3 (item disabled), situation 1 (kitchen offline), dishes that can be ordered
       let list = by(await items());
-      check("every dish an in-range kitchen carries is listed; inactive, out-of-range and unapproved-kitchen-only dishes are not", Object.keys(list).sort().join() === "Flag Dish A,Flag Dish B,Flag Dish C,Flag Dish D,Flag Dish E" && !list["Flag Dish Inactive"] && !list["Flag Dish Far"]);
+      check("every dish an approved kitchen carries is listed (the far one flagged out_of_area); inactive and unapproved-kitchen-only dishes are not", Object.keys(list).sort().join() === "Flag Dish A,Flag Dish B,Flag Dish C,Flag Dish D,Flag Dish E,Flag Dish Far" && !list["Flag Dish Inactive"] && state(list["Flag Dish Far"]) === "false/out_of_area");
       check("dishes an online, open kitchen has switched on: available true, reason null (A even though the other kitchen is offline)", state(list["Flag Dish A"]) === "true/null" && state(list["Flag Dish B"]) === "true/null");
       check("the kitchen disabled the dish (situation 3) -> available false, item_disabled", state(list["Flag Dish C"]) === "false/item_disabled");
       check("only an OFFLINE kitchen carries it (situation 1) -> available false, kitchen_offline", state(list["Flag Dish D"]) === "false/kitchen_offline");
       check("disabled at the online kitchen + offline elsewhere (mixed) -> item_disabled", state(list["Flag Dish E"]) === "false/item_disabled");
       const flat = await items();
-      check("flat list: available dishes first, the faded ones after, every row carries both fields", flat.every((i) => typeof i.available === "boolean" && "unavailable_reason" in i) && flat.slice(0, 2).every((i) => i.available) && flat.slice(2).every((i) => !i.available));
+      check("flat list: available dishes first, the faded ones after, every row carries both fields", flat.every((i) => typeof i.available === "boolean" && "unavailable_reason" in i) && flat.slice(0, 2).every((i) => i.available) && flat.slice(2).every((i) => !i.available) && flat[flat.length - 1].unavailable_reason === "out_of_area");
       check("the usual item fields are untouched (price, effective_price, avgRating ...)", flat[0].price !== undefined && flat[0].effective_price !== undefined && "avgRating" in flat[0] && !("kitchen_id" in flat[0]) && !("restaurant_id" in flat[0]));
 
       // --- the sectioned detail
       const detail = await call(null, "GET", `/categories/${cat}?lat=${LAT}&lng=${LNG}`);
       const popular = detail.body.sections.find((s) => s.title === "Popular").items, more = detail.body.sections.find((s) => s.title === "More").items;
-      check("category detail: 'Popular' holds only dishes that can be ordered; 'More' lists available ones first, then the faded ones", detail.status === 200 && popular.length === 2 && popular.every((i) => i.available) && more.length === 3 && more.every((i) => !i.available) && detail.body.sections.flatMap((s) => s.items).every((i) => typeof i.available === "boolean"));
+      check("category detail: 'Popular' holds only dishes that can be ordered; 'More' lists available ones first, then the faded ones", detail.status === 200 && popular.length === 2 && popular.every((i) => i.available) && more.length === 4 && more.every((i) => !i.available) && more[3].unavailable_reason === "out_of_area" && detail.body.sections.flatMap((s) => s.items).every((i) => typeof i.available === "boolean"));
 
       // --- live: a kitchen's toggle shows on the very next read (no caching)
       const off = await call(k1Tok, "PATCH", "/restaurants/me/availability", { online: false });
@@ -6152,6 +6152,111 @@ async function main() {
       check("the quote still refuses a disabled dish and an offline-only dish (not valid, with a reason)", qOk.body.valid === false && qOffline.body.valid === false && (qOk.body.unavailable_reason || qOk.body.reason || qOk.body.error || qOk.text).toString().length > 0);
       const ordC = await call(custTok, "POST", "/orders", { items: [{ item_id: dC, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Flag Address", payment_method: "cod" });
       check("POST /orders still rejects a dish nobody can take", ordC.status >= 400 && ordC.status < 500);
+      check("no lat/lng -> 400 still", (await call(null, "GET", `/categories/${cat}/items`)).status === 400 && (await call(null, "GET", `/categories/${cat}`)).status === 400);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+
+  console.log("\n--- Test 73: Category menus list EVERY dish: out_of_area flag, one row per dish (dedupe), routing-correct id, ordering, never orderable from afar ---");
+  {
+    const http = require("http");
+    const { signToken } = require("./src/utils/jwt");
+    const app = require("./src/app");
+    const server = await new Promise((resolve) => { const s = http.createServer(app).listen(0, () => resolve(s)); });
+    const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const call = async (token, method, p, body) => {
+      const r = await fetch(base + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) }, body: body !== undefined ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* none */ }
+      return { status: r.status, body: json, text };
+    };
+    try {
+      const LAT = 23.45, LNG = 89.35;
+      const [cat] = await db("categories").insert({ name: "Area Category" });
+      const [emptyCat] = await db("categories").insert({ name: "Area Empty Category" });
+      const mkDish = async (name, extra = {}) => (await db("items").insert({ category_id: cat, name, price: 100, created_by_type: "admin", ...extra }))[0];
+      const mkKitchen = async (name, phone, dLat, extra = {}) => {
+        const [id] = await db("restaurants").insert({ name, phone, address: "Newtown", lat: LAT + dLat, lng: LNG, radius_km: 5, status: "active", ...extra });
+        await db("restaurant_categories").insert({ restaurant_id: id, category_id: cat });
+        return id;
+      };
+      const carry = (kitchen, item, on = true) => db("restaurant_items").insert({ restaurant_id: kitchen, item_id: item, is_available: on });
+      const kNear1 = await mkKitchen("Area Near 1", "8700073001", 0.004);
+      const kNear2 = await mkKitchen("Area Near 2", "8700073002", 0.008);
+      const kFar = await mkKitchen("Area Far", "8700073003", 0.3); // ~33 km
+      const kFar2 = await mkKitchen("Area Far 2", "8700073004", 0.35); // ~39 km
+      const kFarOffline = await mkKitchen("Area Far offline", "8700073005", 0.32, { is_online: false });
+      const kFarPending = await mkKitchen("Area Far pending", "8700073006", 0.31, { verification_status: "pending" });
+
+      // Same dish, three item rows (name differs only by case / spaces): near1 has it disabled, near2 enabled, far enabled.
+      const dB1 = await mkDish("Area Biryani"), dB2 = await mkDish("  area BIRYANI "), dB3 = await mkDish("AREA biryani");
+      await carry(kNear1, dB1, false); await carry(kNear2, dB2); await carry(kFar, dB3);
+      // Two orderable rows: the one at the NEAREST kitchen must win even though it has the higher id.
+      const dP1 = await mkDish("Area Pizza"), dP2 = await mkDish("Area Pizza");
+      await carry(kNear2, dP1); await carry(kNear1, dP2);
+      // In range but unavailable (disabled at near1), plus a far kitchen with it ON: still item_disabled here, id = the in-range row.
+      const dS1 = await mkDish("Area Soup"), dS2 = await mkDish("Area Soup");
+      await carry(kNear1, dS1, false); await carry(kFar, dS2);
+      // Only far kitchens: out_of_area; the id is the nearest kitchen's row.
+      const dN2 = await mkDish("Area Noodles"), dN1 = await mkDish("Area Noodles");
+      await carry(kFar2, dN2); await carry(kFar, dN1);
+      // A far kitchen that is offline still lists its dish as out_of_area (location wins over state); a pending kitchen's dish is not listed at all.
+      const dGhost = await mkDish("Area Ghost"); await carry(kFarOffline, dGhost);
+      const dHidden = await mkDish("Area Hidden"); await carry(kFarPending, dHidden);
+      const dInactive = await mkDish("Area Inactive", { is_active: false }); await carry(kFar, dInactive);
+      await mkDish("Area Nobody Carries"); // an admin dish no kitchen carries is not part of any menu
+
+      const [cust] = await db("users").insert({ name: "Area Customer", phone: "8000073001", wallet_balance: 0 });
+      const custTok = signToken({ id: cust, type: "customer" });
+      const flat = async (lat = LAT) => (await call(null, "GET", `/categories/${cat}/items?lat=${lat}&lng=${LNG}`)).body.items;
+      const by = (list) => Object.fromEntries(list.map((i) => [i.name.trim().toLowerCase(), i]));
+      const state = (i) => `${i.available}/${i.unavailable_reason}`;
+
+      let items = await flat();
+      let list = by(items);
+      check("every dish an approved kitchen carries is listed ONCE (Biryani x3 rows, Pizza x2, Soup x2, Noodles x2 each collapse); inactive, pending-kitchen-only and nobody-carries dishes are not listed", items.length === 5 && Object.keys(list).sort().join() === ["area biryani", "area ghost", "area noodles", "area pizza", "area soup"].join());
+      check("dedupe: the dish orderable at one kitchen wins over the disabled and far copies -> available, and the id is that kitchen's own row", state(list["area biryani"]) === "true/null" && list["area biryani"].id === dB2);
+      check("id selection: two orderable rows -> the NEAREST kitchen's row (not the lowest id)", state(list["area pizza"]) === "true/null" && list["area pizza"].id === dP2 && dP2 > dP1);
+      check("unavailable in range beats out_of_area: item_disabled, id = the in-range kitchen's row", state(list["area soup"]) === "false/item_disabled" && list["area soup"].id === dS1);
+      check("only far kitchens carry it -> out_of_area, id = the nearest kitchen's row", state(list["area noodles"]) === "false/out_of_area" && list["area noodles"].id === dN1);
+      check("a far OFFLINE kitchen's dish is out_of_area too", state(list["area ghost"]) === "false/out_of_area" && list["area ghost"].id === dGhost);
+      check("order inside the list: orderable first, then unavailable in range, then out_of_area", items.map((i) => state(i)).join() === ["true/null", "true/null", "false/item_disabled", "false/out_of_area", "false/out_of_area"].join());
+      check("the usual item fields are untouched and no kitchen identity leaks", items.every((i) => i.price !== undefined && i.effective_price !== undefined && "avgRating" in i && !("kitchen_id" in i) && !("restaurant_id" in i) && !("distance_km" in i)));
+
+      // --- the sectioned detail: Popular = orderable only; More = orderable rest, then in-range unavailable, then out_of_area
+      const detail = await call(null, "GET", `/categories/${cat}?lat=${LAT}&lng=${LNG}`);
+      const popular = detail.body.sections.find((s) => s.title === "Popular").items, more = detail.body.sections.find((s) => s.title === "More").items;
+      check("category detail: Popular holds the 2 orderable dishes only; More has soup (item_disabled) then the two out_of_area dishes", detail.status === 200 && popular.length === 2 && popular.every((i) => i.available) && more.length === 3 && more.map((i) => state(i)).join() === ["false/item_disabled", "false/out_of_area", "false/out_of_area"].join());
+      check("the detail lists every dish once", new Set(detail.body.sections.flatMap((s) => s.items).map((i) => i.id)).size === 5);
+
+      // --- the answer depends on where the customer is: standing by the far kitchens, the same dishes flip
+      const far = by(await flat(LAT + 0.3));
+      check("from next to the far kitchens: Noodles is orderable with the far kitchen's row; Biryani (far kitchen's own row dB3); the near-only dishes are out_of_area", state(far["area noodles"]) === "true/null" && far["area noodles"].id === dN1 && state(far["area biryani"]) === "true/null" && far["area biryani"].id === dB3 && state(far["area soup"]) === "true/null" && far["area soup"].id === dS2 && state(far["area pizza"]) === "false/out_of_area");
+
+      // --- an empty category keeps coming back empty (the app shows "Coming soon")
+      const empty = await call(null, "GET", `/categories/${emptyCat}?lat=${LAT}&lng=${LNG}`);
+      const emptyFlat = await call(null, "GET", `/categories/${emptyCat}/items?lat=${LAT}&lng=${LNG}`);
+      check("a category no kitchen has a dish in -> no dishes anywhere", empty.status === 200 && empty.body.sections.flatMap((s) => s.items).length === 0 && emptyFlat.status === 200 && emptyFlat.body.items.length === 0);
+
+      // --- everything else stays orderable-only
+      const search = await call(null, "GET", `/items/search?q=Area&lat=${LAT}&lng=${LNG}`);
+      const popularList = await call(null, "GET", `/items/popular?lat=${LAT}&lng=${LNG}`);
+      const deals = await call(null, "GET", `/items/deals?lat=${LAT}&lng=${LNG}`);
+      const names = (r) => (r.body.items || []).map((i) => i.name.trim().toLowerCase());
+      check("search / popular / deals never list an out_of_area or disabled dish", search.status === 200 && !names(search).includes("area noodles") && !names(search).includes("area ghost") && !names(search).includes("area soup") && !names(popularList).includes("area noodles") && !names(deals).includes("area noodles"));
+      const cats = (await call(null, "GET", `/categories?lat=${LAT}&lng=${LNG}`)).body.categories;
+      check("the location-filtered category list is unchanged (still has the category, near kitchens are online)", cats.some((c) => c.id === cat));
+
+      // --- checkout: an out_of_area dish can never be bought, even if a client sends its id
+      const ordersBefore = Number((await db("order_items").where({ item_id: dN1 }).count({ n: "*" }).first()).n);
+      const qFar = await call(custTok, "POST", "/cart/quote", { items: [{ item_id: dN1, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG });
+      const oFar = await call(custTok, "POST", "/orders", { items: [{ item_id: dN1, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Area Address", payment_method: "cod" });
+      const oFarGhost = await call(custTok, "POST", "/orders", { items: [{ item_id: dGhost, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG, delivery_address: "Area Address", payment_method: "cod" });
+      check("the quote refuses an out_of_area dish (valid false)", qFar.body.valid === false);
+      check("POST /orders rejects out_of_area dishes (4xx), and no order line was created", oFar.status >= 400 && oFar.status < 500 && oFarGhost.status >= 400 && oFarGhost.status < 500 && Number((await db("order_items").where({ item_id: dN1 }).count({ n: "*" }).first()).n) === ordersBefore);
+      const qOk = await call(custTok, "POST", "/cart/quote", { items: [{ item_id: list["area pizza"].id, quantity: 1 }], delivery_lat: LAT, delivery_lng: LNG });
+      check("the id the list returns for an orderable dish is accepted by the quote (routes to a kitchen)", qOk.status === 200 && qOk.body.clubbable === true);
       check("no lat/lng -> 400 still", (await call(null, "GET", `/categories/${cat}/items`)).status === 400 && (await call(null, "GET", `/categories/${cat}`)).status === 400);
     } finally {
       await new Promise((resolve) => server.close(resolve));

@@ -208,9 +208,12 @@ Brand name: **Fengle**. Palette: deep violet (#4B18A6-ish) + turmeric gold
   `restaurant_availability_history`.
   Offline also HIDES the kitchen's menu from the customer catalog lists, search, popular and deals (`getInRangeRestaurants`
   filters `is_online`); only a kitchen outside its hours still shows, as a closed category. The ONE exception (2026-11-10, client
-  request): a category's own dish lists (`GET /categories/:id`, `/categories/:id/items`) show every dish an in-range kitchen carries,
-  flagged `available` / `unavailable_reason` (`kitchen_offline` | `kitchen_closed` | `item_disabled`), uncached, so the app can fade them
-  (`getCategoryItemsWithAvailability`).
+  request): a category's own dish lists (`GET /categories/:id`, `/categories/:id/items`) show EVERY dish an active, approved kitchen
+  carries (2026-11-10 second step: kitchens beyond the 7 km ceiling too), flagged `available` / `unavailable_reason` (`kitchen_offline` |
+  `kitchen_closed` | `item_disabled` | `out_of_area`), uncached, so the app can fade them (`getCategoryItemsWithAvailability`). One row per
+  dish (category + lower(trim(name))), best status wins (orderable > unavailable in range > out_of_area); the returned id is the item row
+  routing would use (nearest orderable kitchen, then lowest id). Order: orderable, unavailable in range, out_of_area. Checkout is untouched
+  (routing's 7 km ceiling), so an out_of_area id can never be bought.
 - **Kitchen new-order alarm** (2026-11-08): every new-order push to a kitchen
   goes through `orderNotifications.newOrderForRestaurant` (loud Android channel
   `new-orders`, one notification per order via a tag). `services/kitchenAlert.service.js`
